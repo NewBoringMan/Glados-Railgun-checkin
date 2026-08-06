@@ -90,6 +90,40 @@ jobs:
             exit 1
           fi
 
+  account_332a23567057fbf5:
+    name: GLaDOS account 332A23567057FBF5
+    if: ${{ github.event_name == 'schedule' || inputs.account == 'all' || inputs.account == '332A23567057FBF5' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pypushdeer
+
+      - name: Run and verify check-in
+        shell: bash
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_332A23567057FBF5 }}
+          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+          GLADOS_VERBOSE: 'true'
+        run: |
+          set -o pipefail
+          python checkin.py 2>&1 | tee checkin.log
+          if ! grep -Eq '签到成功|重复签到' checkin.log; then
+            echo "::error::No successful or repeated check-in evidence was found."
+            exit 1
+          fi
+
   account_754d6e4fa3ac25d9:
     name: GLaDOS account 754D6E4FA3AC25D9
     if: ${{ github.event_name == 'schedule' || inputs.account == 'all' || inputs.account == '754D6E4FA3AC25D9' }}
