@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - id: matrix
-        run: echo "matrix=$(python3 scripts/v3_matrix.py --account all)" >> "$GITHUB_OUTPUT"
+        run: echo "matrix=$(python3 scripts/v3_matrix.py --lock all)" >> "$GITHUB_OUTPUT"
   canary:
     needs: prepare
     name: Read-only canary slot ${{ matrix.slot }}
