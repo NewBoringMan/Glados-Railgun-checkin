@@ -1,0 +1,2 @@
+requests>=2.32,<3
+pypushdeer>=0.0.3
