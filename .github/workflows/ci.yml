@@ -6,6 +6,7 @@ on:
     branches: [ master ]
     paths:
       - 'checkin.py'
+      - 'status.py'
       - 'logging_config.py'
       - 'requirements.txt'
       - 'tests/**'
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - 'checkin.py'
+      - 'status.py'
       - 'logging_config.py'
       - 'requirements.txt'
       - 'tests/**'
@@ -30,4 +32,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
+      - name: Compile Python modules
+        run: python -m py_compile checkin.py status.py logging_config.py
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
