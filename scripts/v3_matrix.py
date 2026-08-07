@@ -14,9 +14,14 @@ def lock_id(key: str) -> str:
     return hashlib.sha256(('glados-exchange-lock:' + key).encode()).hexdigest()[:16]
 
 
-def build_matrix(config: dict, lock_filter: str = 'all') -> dict:
-    """Build privacy-minimized matrix rows with a non-reversible exchange-lock id."""
+def build_matrix(config: dict, lock_filter: str = 'all', *, scheduled: bool = False) -> dict:
+    """Build privacy-minimized matrix rows with a non-reversible exchange-lock id.
+
+    Scheduled execution is additionally gated by `productionScheduleEnabled`; manual
+    Canary/primary/recovery runs remain available while the Release Candidate is disarmed.
+    """
     if bool(config.get('globalPaused', False)): return {'include': []}
+    if scheduled and not bool(config.get('productionScheduleEnabled', False)): return {'include': []}
     accounts = config.get('accounts') or {}
     if not isinstance(accounts, dict): raise SystemExit('accounts must be an object')
     all_rows = []
@@ -35,7 +40,11 @@ def build_matrix(config: dict, lock_filter: str = 'all') -> dict:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(); p.add_argument('--config', default='.github/glados/accounts.v3.json'); p.add_argument('--lock', default='all'); a=p.parse_args()
-    print(json.dumps(build_matrix(load_config(Path(a.config)), a.lock), separators=(',', ':')))
+    p = argparse.ArgumentParser()
+    p.add_argument('--config', default='.github/glados/accounts.v3.json')
+    p.add_argument('--lock', default='all')
+    p.add_argument('--scheduled', action='store_true')
+    a=p.parse_args()
+    print(json.dumps(build_matrix(load_config(Path(a.config)), a.lock, scheduled=a.scheduled), separators=(',', ':')))
 
 if __name__ == '__main__': main()
