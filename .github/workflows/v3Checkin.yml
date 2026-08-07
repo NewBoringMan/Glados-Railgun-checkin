@@ -44,13 +44,9 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
           INPUT_MODE: ${{ inputs.run_mode }}
         run: |
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            mode="${INPUT_MODE:-primary}"
-          elif [[ "$SCHEDULE" == "7 17 * * *" ]]; then
-            mode="recovery"
-          else
-            mode="primary"
-          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then mode="${INPUT_MODE:-primary}"
+          elif [[ "$SCHEDULE" == "7 17 * * *" ]]; then mode="recovery"
+          else mode="primary"; fi
           echo "run_mode=$mode" >> "$GITHUB_OUTPUT"
       - id: matrix
         shell: bash
@@ -95,10 +91,8 @@ jobs:
           from zoneinfo import ZoneInfo
           repo=os.environ['GH_REPO']; current=int(os.environ['CURRENT_RUN_ID']); slot=os.environ['SLOT']
           today=datetime.now(ZoneInfo('Asia/Taipei')).date()
-          try:
-              rows=json.loads(subprocess.check_output(['gh','run','list','--repo',repo,'--workflow','v3Checkin.yml','--event','schedule','--limit','12','--json','databaseId,createdAt,status'],text=True))
-          except Exception:
-              print('false'); raise SystemExit
+          try: rows=json.loads(subprocess.check_output(['gh','run','list','--repo',repo,'--workflow','v3Checkin.yml','--event','schedule','--limit','12','--json','databaseId,createdAt,status'],text=True))
+          except Exception: print('false'); raise SystemExit
           run_id=None
           for row in rows:
               if int(row.get('databaseId',0))==current or row.get('status')!='completed': continue
@@ -117,7 +111,7 @@ jobs:
         if: ${{ steps.recovery_gate.outputs.skip != 'true' }}
         env:
           GLADOS_COOKIES: ${{ secrets[matrix.secret_name] }}
-          GLADOS_ACCOUNT_KEY: ${{ matrix.account_key }}
+          GLADOS_SLOT: ${{ matrix.slot }}
           GLADOS_AUTO_EXCHANGE: ${{ matrix.auto_exchange }}
           GLADOS_RUN_MODE: ${{ needs.prepare.outputs.run_mode }}
           GLADOS_EXCHANGE_CATALOG: .github/glados/exchange_plans.json
