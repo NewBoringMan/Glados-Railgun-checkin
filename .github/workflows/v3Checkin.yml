@@ -62,7 +62,7 @@ jobs:
 
   checkin:
     needs: prepare
-    name: GLaDOS check-in slot ${{ matrix.slot }}
+    name: GLaDOS ${{ needs.prepare.outputs.run_mode }} slot ${{ matrix.slot }} · ${{ matrix.lock_id }}
     if: ${{ needs.prepare.outputs.has_accounts == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 6
