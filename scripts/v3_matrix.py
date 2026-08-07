@@ -12,6 +12,12 @@ def load_config(path: Path) -> dict:
 
 
 def build_matrix(config: dict, account_filter: str = 'all') -> dict:
+    """Build a privacy-minimized matrix.
+
+    The stable account key is used only inside this process to resolve the matching
+    Secret name. It is intentionally omitted from matrix output so scheduled job
+    metadata and environment dumps do not expose persistent account identifiers.
+    """
     if bool(config.get('globalPaused', False)):
         return {'include': []}
     accounts = config.get('accounts') or {}
@@ -27,7 +33,11 @@ def build_matrix(config: dict, account_filter: str = 'all') -> dict:
             continue
         if not isinstance(key, str) or len(key) != 16 or any(ch not in '0123456789ABCDEF' for ch in key):
             continue
-        include.append({'slot': len(include) + 1, 'account_key': key, 'secret_name': f'GLADOS_ACCOUNT_{key}', 'auto_exchange': bool(item.get('autoExchange', False))})
+        include.append({
+            'slot': len(include) + 1,
+            'secret_name': f'GLADOS_ACCOUNT_{key}',
+            'auto_exchange': bool(item.get('autoExchange', False)),
+        })
     return {'include': include}
 
 
