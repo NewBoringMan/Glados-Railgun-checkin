@@ -39,7 +39,7 @@ jobs:
       - name: GET-only account check
         env:
           GLADOS_COOKIES: ${{ secrets[matrix.secret_name] }}
-          GLADOS_ACCOUNT_KEY: ${{ matrix.account_key }}
+          GLADOS_SLOT: ${{ matrix.slot }}
           GLADOS_AUTO_EXCHANGE: 'false'
           GLADOS_RUN_MODE: read_only
           GLADOS_EXCHANGE_CATALOG: .github/glados/exchange_plans.json
