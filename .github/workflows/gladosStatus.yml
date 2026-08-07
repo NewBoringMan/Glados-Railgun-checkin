@@ -84,3 +84,4 @@ jobs:
           GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_754D6E4FA3AC25D9 }}
           GLADOS_ACCOUNT_KEY: '754D6E4FA3AC25D9'
         run: python status.py
+
