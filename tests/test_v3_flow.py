@@ -6,11 +6,8 @@ from unittest.mock import patch
 
 import v3_runtime as v
 
-
 def catalog_file(td):
-    p=Path(td)/'catalog.json'
-    p.write_text(json.dumps({'plans':[{'id':'plan500','points':500,'days':100,'verified':True}]}),encoding='utf-8')
-    return p
+    p=Path(td)/'catalog.json'; p.write_text(json.dumps({'plans':[{'id':'plan500','points':500,'days':100,'verified':True}]}),encoding='utf-8'); return p
 
 class FlowClient:
     def __init__(self, before_points=500, after_checkin_points=500, after_exchange_points=0, before_days=10, after_days=110, live=True):
@@ -21,20 +18,15 @@ class FlowClient:
         out={'points':points,'history':[]}
         if self.live: out['plans']={'plan500':{'points':500,'days':100}}
         return out
-    def points(self):
-        self.points_calls += 1
-        return self._payload(self.after_checkin_points if self.points_calls == 1 else self.after_exchange_points)
-    def status(self):
-        self.status_calls += 1
-        return {'leftDays': self.before_days if self.status_calls == 1 else self.after_days}
-    def checkin(self): self.checkin_calls += 1; return 'success'
+    def points(self): self.points_calls+=1; return self._payload(self.after_checkin_points if self.points_calls==1 else self.after_exchange_points)
+    def status(self): self.status_calls+=1; return {'leftDays':self.before_days if self.status_calls==1 else self.after_days}
+    def checkin(self): self.checkin_calls+=1; return 'success'
     def exchange(self, plan_id): self.exchange_calls.append(plan_id)
     def close(self): self.closed=True
 
 class FlowTests(unittest.TestCase):
-    def env(self, catalog, mode='primary', auto='false'):
-        return {'GLADOS_COOKIES':'secret','GLADOS_ACCOUNT_KEY':'AAAAAAAAAAAAAAAA','GLADOS_RUN_MODE':mode,
-                'GLADOS_AUTO_EXCHANGE':auto,'GLADOS_EXCHANGE_CATALOG':str(catalog)}
+    def env(self,catalog,mode='primary',auto='false'):
+        return {'GLADOS_COOKIES':'secret','GLADOS_SLOT':'1','GLADOS_RUN_MODE':mode,'GLADOS_AUTO_EXCHANGE':auto,'GLADOS_EXCHANGE_CATALOG':str(catalog)}
     def test_read_only_never_posts(self):
         with tempfile.TemporaryDirectory() as td:
             c=FlowClient(before_points=100)
