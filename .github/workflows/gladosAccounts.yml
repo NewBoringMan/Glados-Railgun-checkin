@@ -64,7 +64,7 @@ jobs:
         env:
           GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_28993337790302AC }}
           GLADOS_ACCOUNT_KEY: '28993337790302AC'
-          GLADOS_AUTO_EXCHANGE: 'false'
+          GLADOS_AUTO_EXCHANGE: 'true'
           GLADOS_EXCHANGE_CATALOG: '.github/glados/exchange_plans.json'
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
           GLADOS_VERBOSE: 'true'
@@ -117,3 +117,4 @@ jobs:
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
           GLADOS_VERBOSE: 'true'
         run: python checkin.py
+
