@@ -7,14 +7,16 @@ This document distinguishes machine-verifiable completion from the final real-Ma
 - privacy-minimized standalone Actions runtime
 - GitHub auth/network diagnostics separated in the desktop app
 - 05:07 primary and 17:07 recovery schedule (Asia/Taipei)
+- independent `productionScheduleEnabled` arm; Release Candidate is disarmed even if merged
 - recovery suppresses a second account task only when the matching morning primary slot succeeded
 - monthly scheduler heartbeat
 - official GitHub Actions pinned to immutable commit SHAs
-- exact V3 Python runtime dependency pin
+- complete V3 Python dependency closure pinned
+- manual account workflow input uses privacy-safe lock id rather than persistent account key
 
 ## Stage B — automated implementation complete
 
-The V3 desktop release-candidate package contains a formal Xcode/XcodeGen project with application, embedded Safari Web Extension, Native Messaging companion host and XCTest targets; macOS Keychain credential storage; durable local history/state; direct GLaDOS read-only refresh independent of GitHub; fixed bundle identifier for in-place upgrade; and backup/test/rollback-aware installation.
+The V3 desktop release-candidate package contains a formal Xcode/XcodeGen project with application, embedded Safari Web Extension, Native Messaging companion host and XCTest targets; macOS Keychain credential storage; durable local history/state; direct GLaDOS read-only refresh independent of GitHub; fixed bundle identifier for in-place upgrade; automatic RC→master branch following after production promotion; and backup/test/rollback-aware installation.
 
 ## Stage C — automated implementation complete
 
@@ -40,7 +42,7 @@ Implemented machine gates include:
 - mock GLaDOS HTTP integration test
 - mock GitHub recovery-gate tests
 - Secret/PII leak scans
-- immutable Action-pin policy checks
+- immutable Action-pin and dependency-pin policy checks
 - Swift source parse checks
 - desktop model/store type checks
 - browser/Safari/Native Messaging JS tests
@@ -49,11 +51,9 @@ Implemented machine gates include:
 
 ### Known real-account result
 
-The current five-slot GET-only Canary proved four independent existing account Secrets were readable. Slot 3 failed because the matching dedicated account Secret was empty/missing. No check-in or exchange POST was sent by that Canary. The account remains in configuration and is deliberately not silently skipped or deleted.
+The current five-slot GET-only Canary proves four independent existing account Secrets are readable. Slot 3 fails because the matching dedicated account Secret is empty/missing. No check-in or exchange POST is sent by that Canary. The account remains in configuration and is deliberately not silently skipped or deleted.
 
 ## Remaining human-only release gates
-
-The following are intentionally not represented as completed until executed on the user's Mac and live accounts:
 
 1. full Xcode Release build + XCTest + codesign
 2. V2 → V3 in-place install and legacy-copy cleanup
@@ -61,7 +61,9 @@ The following are intentionally not represented as completed until executed on t
 4. five-account Keychain re-capture and independent GitHub Secret health 5/5
 5. local GLaDOS direct read-only refresh 5/5
 6. GET-only cloud Canary 5/5
-7. one controlled primary + recovery live Canary with no duplicate side effect
-8. Draft PR promotion/merge; first production V3 primary success; only then retire V2 scheduled workflow
+7. one controlled RC primary + recovery live Canary with no duplicate side effect
+8. merge Draft PR while V3 production schedule remains disarmed
+9. verify one manual V3 primary on `master`
+10. retire V2 schedule and arm V3 schedule as the explicit final cutover
 
-Until those pass, PR #1 remains Draft and production `master` remains V2.
+Until those pass, PR #1 remains Draft and production `master` remains V2. A PR merge by itself cannot activate V3 scheduled sign-in while the production arm is false.
