@@ -53,9 +53,12 @@ jobs:
         shell: bash
         env:
           LOCK_FILTER: ${{ inputs.lock }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           lock="${LOCK_FILTER:-all}"
-          matrix="$(python3 scripts/v3_matrix.py --lock "$lock")"
+          args=(--lock "$lock")
+          [[ "$EVENT_NAME" == "schedule" ]] && args+=(--scheduled)
+          matrix="$(python3 scripts/v3_matrix.py "${args[@]}")"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("include", [])))' <<< "$matrix")"
           [[ "$count" -gt 0 ]] && echo "has_accounts=true" >> "$GITHUB_OUTPUT" || echo "has_accounts=false" >> "$GITHUB_OUTPUT"
