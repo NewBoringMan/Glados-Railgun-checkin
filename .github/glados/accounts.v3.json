@@ -1,0 +1,21 @@
+{
+  "version": 3,
+  "globalPaused": false,
+  "schedule": {
+    "timezone": "Asia/Taipei",
+    "primary": "05:07",
+    "recovery": "17:07",
+    "recoveryOnly": true
+  },
+  "defaults": {
+    "enabled": true,
+    "autoExchange": false
+  },
+  "accounts": {
+    "059502CEBB0D18D6": {"enabled": true, "autoExchange": true, "archived": false, "label": "GLaDOS 059502"},
+    "28993337790302AC": {"enabled": true, "autoExchange": true, "archived": false, "label": "GLaDOS 289933"},
+    "332A23567057FBF5": {"enabled": true, "autoExchange": false, "archived": false, "label": "GLaDOS 332A23"},
+    "6BA27F0D29BB2856": {"enabled": true, "autoExchange": true, "archived": false, "label": "GLaDOS 6BA27F"},
+    "754D6E4FA3AC25D9": {"enabled": true, "autoExchange": false, "archived": false, "label": "GLaDOS 754D6E"}
+  }
+}
