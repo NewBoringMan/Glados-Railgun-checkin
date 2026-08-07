@@ -24,11 +24,10 @@ def find_morning_run(rows:list[dict[str,Any]], current_run:int, now:datetime)->i
     return None
 
 def slot_succeeded(jobs:list[dict[str,Any]], slot:int)->bool:
-    target=f'GLaDOS check-in slot {slot}'
-    return any(j.get('name')==target and j.get('conclusion')=='success' for j in jobs)
+    prefix=f'GLaDOS primary slot {slot} · '
+    return any(str(j.get('name','')).startswith(prefix) and j.get('conclusion')=='success' for j in jobs)
 
-def gh_json(args:list[str])->Any:
-    return json.loads(subprocess.check_output(args,text=True))
+def gh_json(args:list[str])->Any: return json.loads(subprocess.check_output(args,text=True))
 
 def main()->None:
     p=argparse.ArgumentParser(); p.add_argument('--repo',required=True); p.add_argument('--current-run',type=int,required=True); p.add_argument('--slot',type=int,required=True); a=p.parse_args()
@@ -40,7 +39,6 @@ def main()->None:
         view=gh_json(['gh','run','view',str(rid),'--repo',a.repo,'--json','jobs'])
         print('true' if slot_succeeded(view.get('jobs',[]),a.slot) else 'false')
     except Exception:
-        # Fail open to recovery: uncertainty must not suppress a needed safety check.
         print('false')
 
 if __name__=='__main__': main()
