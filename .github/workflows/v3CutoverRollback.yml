@@ -1,0 +1,36 @@
+name: GLaDOS V3 Cutover Rollback
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type ROLLBACK_V3_CUTOVER exactly
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: glados-production-cutover
+  cancel-in-progress: false
+jobs:
+  rollback:
+    if: ${{ github.ref == 'refs/heads/master' && inputs.confirm == 'ROLLBACK_V3_CUTOVER' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Require the cutover commit to be current HEAD
+        run: |
+          subject="$(git log -1 --format=%s)"
+          [[ "$subject" == 'chore: cut over production scheduler from V2 to V3' ]] || {
+            echo "Refusing automatic rollback because master HEAD is no longer the cutover commit: $subject"
+            exit 1
+          }
+      - name: Revert cutover atomically
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git revert --no-edit HEAD
+          git push origin HEAD:master
