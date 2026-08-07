@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "schedule": {
+    "timezone": "Asia/Taipei",
+    "times": [
+      "05:00",
+      "17:00"
+    ]
+  },
+  "defaults": {
+    "enabled": true,
+    "autoExchange": false
+  },
+  "accounts": {
+    "059502CEBB0D18D6": {
+      "enabled": true,
+      "autoExchange": false,
+      "label": "GLaDOS 059502"
+    },
+    "28993337790302AC": {
+      "enabled": true,
+      "autoExchange": false,
+      "label": "GLaDOS 289933"
+    },
+    "332A23567057FBF5": {
+      "enabled": true,
+      "autoExchange": false,
+      "label": "GLaDOS 332A23"
+    },
+    "754D6E4FA3AC25D9": {
+      "enabled": true,
+      "autoExchange": false,
+      "label": "GLaDOS 754D6E"
+    }
+  }
+}
