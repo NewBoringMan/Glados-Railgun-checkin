@@ -1,233 +1,337 @@
 #!/usr/bin/env python3
-"""Privacy-minimized GLaDOS V3 orchestration.
+"""Privacy-minimized GLaDOS V3 runtime.
 
-The runtime intentionally emits only coarse operational state. It never writes
-email addresses, Cookie values, exact balances, account keys, or points history
-to public GitHub Actions logs.
+One invocation handles exactly one account secret. It supports:
+- read_only: GET-only account/capability canary
+- primary: one check-in POST, optional verified optimal exchange
+- recovery: same as primary, but first avoids a duplicate POST when reliable history confirms today
+
+Actions logs deliberately contain only coarse operational state. They never print Cookie,
+email, exact points balance, points history, or raw API payloads.
 """
 from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
-from typing import Any, Iterable
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from fractions import Fraction
+from pathlib import Path
+from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
-from checkin import (
-    AuthenticationError,
-    ChallengeError,
-    Config,
-    ExchangePlan,
-    GladosAPI,
-    NetworkError,
-    ProtocolError,
-    load_exchange_catalog,
-    run_one_account,
-)
-from status import build_checkin_history
+import requests
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+DEFAULT_DOMAINS = ("glados.cloud", "railgun.info")
+RETRYABLE = {429, 500, 502, 503, 504}
+CHALLENGE_HINTS = ("captcha", "challenge", "access denied", "cloudflare", "人机验证", "验证码")
 CHECKIN_MARKERS = ("checkin", "check-in", "checked in", "签到", "打卡", "observation", "logging")
 NON_CHECKIN_MARKERS = ("exchange", "redeem", "兑换", "invite", "referral", "邀请")
 
 
-def _to_positive_int(value: Any) -> int | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        number = int(float(value))
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
+class V3Error(RuntimeError): pass
+class AuthError(V3Error): pass
+class ChallengeError(V3Error): pass
+class NetworkError(V3Error): pass
+class ProtocolError(V3Error): pass
 
 
-def extract_live_plans(payload: dict[str, Any]) -> dict[str, tuple[int, int]] | None:
-    """Return live plan map when the API exposes a ``plans`` field.
+@dataclass(frozen=True)
+class Plan:
+    plan_id: str
+    points: int
+    days: int
+    verified: bool = True
 
-    ``None`` means the endpoint did not expose live plan metadata, so the trusted
-    fallback catalog may still be used. An empty dict means metadata was present
-    but could not be safely parsed, which is a fail-closed signal for exchange.
-    """
-    if "plans" not in payload:
-        return None
+    @property
+    def cost(self) -> Fraction:
+        return Fraction(self.points, self.days)
+
+
+class Client:
+    def __init__(self, domain: str, cookie: str, session: Optional[requests.Session] = None):
+        self.domain = domain
+        self.cookie = cookie
+        self.session = session or requests.Session()
+        self.base = f"https://{domain}"
+        self.headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json;charset=UTF-8",
+            "cookie": cookie,
+            "origin": self.base,
+            "referer": f"{self.base}/console/checkin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+        }
+
+    def close(self):
+        self.session.close()
+
+    def request(self, method: str, path: str, body: Optional[dict] = None, *, retry_get: bool = True) -> dict:
+        method = method.upper()
+        attempts = 3 if method == "GET" and retry_get else 1
+        for attempt in range(attempts):
+            try:
+                response = self.session.request(method, self.base + path, headers=self.headers,
+                                                json=body if method == "POST" else None, timeout=(5, 15))
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if attempt + 1 >= attempts:
+                    raise NetworkError("network") from exc
+                time.sleep(min(1.0 * (2 ** attempt), 4.0))
+                continue
+            except requests.RequestException as exc:
+                raise NetworkError("request") from exc
+
+            text = response.text or ""
+            lower = text.lower()
+            if response.status_code in {401, 403}:
+                if any(x in lower for x in CHALLENGE_HINTS):
+                    raise ChallengeError("challenge")
+                raise AuthError("auth")
+            if response.status_code in RETRYABLE:
+                if attempt + 1 >= attempts:
+                    raise NetworkError(f"http_{response.status_code}")
+                delay = 1.0 * (2 ** attempt)
+                if response.status_code == 429:
+                    try: delay = min(float(response.headers.get("Retry-After", "1")), 30.0)
+                    except ValueError: pass
+                time.sleep(max(0.0, delay))
+                continue
+            if response.status_code >= 400:
+                raise ProtocolError(f"http_{response.status_code}")
+            if any(x in lower for x in CHALLENGE_HINTS) and not text.lstrip().startswith("{"):
+                raise ChallengeError("challenge")
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise ProtocolError("non_json") from exc
+            if not isinstance(data, dict):
+                raise ProtocolError("non_object")
+            return data
+        raise NetworkError("exhausted")
+
+    def status(self) -> dict:
+        payload = self.request("GET", "/api/user/status")
+        data = payload.get("data")
+        if not isinstance(data, dict) or data.get("leftDays") is None:
+            raise ProtocolError("status_shape")
+        return data
+
+    def points(self) -> dict:
+        payload = self.request("GET", "/api/user/points")
+        if payload.get("points") is None:
+            raise ProtocolError("points_shape")
+        return payload
+
+    def checkin(self) -> str:
+        payload = self.request("POST", "/api/user/checkin", {"token": self.domain}, retry_get=False)
+        code = payload.get("code")
+        if code == 0: return "success"
+        if code == 1: return "already"
+        raise ProtocolError("checkin_rejected")
+
+    def exchange(self, plan_id: str) -> None:
+        payload = self.request("POST", "/api/user/exchange", {"planType": plan_id}, retry_get=False)
+        if payload.get("code") != 0:
+            raise ProtocolError("exchange_rejected")
+
+
+def _int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None: return None
+    try: return int(float(value))
+    except (TypeError, ValueError): return None
+
+
+def load_catalog(path: Path) -> list[Plan]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    rows = raw.get("plans") if isinstance(raw, dict) else None
+    if not isinstance(rows, list): raise ProtocolError("catalog_shape")
+    plans: list[Plan] = []
+    for row in rows:
+        if not isinstance(row, dict): continue
+        pid = str(row.get("id", "")).strip()
+        pts, days = _int(row.get("points")), _int(row.get("days"))
+        if re.fullmatch(r"plan[A-Za-z0-9_-]+", pid) and pts and days and bool(row.get("verified", False)):
+            plans.append(Plan(pid, pts, days, True))
+    if not plans: raise ProtocolError("catalog_empty")
+    return plans
+
+
+def parse_live_plans(payload: dict) -> Optional[list[Plan]]:
+    """Return live plans, or None when the API did not expose a usable plan list."""
     raw = payload.get("plans")
-    result: dict[str, tuple[int, int]] = {}
-
+    if raw is None: return None
+    items: Iterable[Any]
     if isinstance(raw, dict):
-        iterable: Iterable[tuple[str | None, Any]] = raw.items()
+        items = [dict(v, __key=k) if isinstance(v, dict) else v for k, v in raw.items()]
     elif isinstance(raw, list):
-        iterable = ((None, item) for item in raw)
+        items = raw
     else:
-        return result
-
-    for fallback_id, item in iterable:
-        if not isinstance(item, dict):
-            continue
-        plan_id = str(
-            item.get("id")
-            or item.get("planType")
-            or item.get("plan_type")
-            or fallback_id
-            or ""
-        ).strip()
-        points = _to_positive_int(item.get("points"))
-        days = _to_positive_int(item.get("days"))
-        if not plan_id or points is None or days is None:
-            continue
-        result[plan_id] = (points, days)
-    return result
+        return None
+    out: list[Plan] = []
+    for item in items:
+        if not isinstance(item, dict): continue
+        pid = str(item.get("id") or item.get("planType") or item.get("plan_type") or item.get("__key") or "").strip()
+        pts, days = _int(item.get("points")), _int(item.get("days"))
+        if re.fullmatch(r"plan[A-Za-z0-9_-]+", pid) and pts and days and pts > 0 and days > 0:
+            out.append(Plan(pid, pts, days, False))
+    return out or None
 
 
-def trusted_live_intersection(
-    trusted: Iterable[ExchangePlan],
-    live: dict[str, tuple[int, int]] | None,
-) -> list[ExchangePlan]:
-    trusted_list = [plan for plan in trusted if plan.verified]
-    if live is None:
-        return trusted_list
-    return [
-        plan
-        for plan in trusted_list
-        if live.get(plan.plan_id) == (plan.points, plan.days)
-    ]
+def trusted_live_intersection(trusted: list[Plan], live: Optional[list[Plan]]) -> list[Plan]:
+    if not live: return []
+    live_keys = {(p.plan_id, p.points, p.days) for p in live}
+    return [p for p in trusted if (p.plan_id, p.points, p.days) in live_keys]
 
 
-def _read_live_plans(cookie: str, domains: tuple[str, ...]) -> dict[str, tuple[int, int]] | None:
-    last_error: Exception | None = None
-    for domain in domains:
-        api = GladosAPI(domain, cookie)
-        try:
-            api.status()
-            payload = api._request_json("GET", "/api/user/points")
-            return extract_live_plans(payload)
-        except (NetworkError, ProtocolError) as exc:
-            last_error = exc
-            continue
-        except (AuthenticationError, ChallengeError):
-            raise
-        finally:
-            api.close()
-    if last_error:
-        raise last_error
+def best_plan(plans: Iterable[Plan]) -> Plan:
+    candidates = list(plans)
+    if not candidates: raise ProtocolError("no_verified_live_plan")
+    return min(candidates, key=lambda p: (p.cost, p.days, p.points, p.plan_id))
+
+
+def _history_datetime(item: dict) -> Optional[datetime]:
+    for key in ("time", "timestamp", "createdAt", "created_at", "date"):
+        value = item.get(key)
+        if value is None: continue
+        if isinstance(value, (int, float)):
+            raw = float(value)
+            while raw > 10_000_000_000: raw /= 1000.0
+            try: return datetime.fromtimestamp(raw, timezone.utc).astimezone(TAIPEI)
+            except (ValueError, OSError, OverflowError): continue
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            try:
+                if text.isdigit():
+                    raw = float(text)
+                    while raw > 10_000_000_000: raw /= 1000.0
+                    return datetime.fromtimestamp(raw, timezone.utc).astimezone(TAIPEI)
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if dt.tzinfo is None: dt = dt.replace(tzinfo=TAIPEI)
+                return dt.astimezone(TAIPEI)
+            except (ValueError, OSError, OverflowError): continue
     return None
 
 
-def _explicit_today_checkin(cookie: str, domains: tuple[str, ...]) -> bool:
-    """Conservative manual-recovery fallback.
+def reliable_today_checkin(points_payload: dict) -> bool:
+    """Only explicit check-in-labelled history suppresses a recovery POST.
 
-    Scheduled recovery primarily relies on the morning GitHub job conclusion.
-    This helper is only a second line of defense for manual recovery runs and
-    skips the POST only when GLaDOS history contains explicit check-in wording.
+    Positive point changes without a check-in label are deliberately *not* considered reliable,
+    avoiding invite/activity rewards being mistaken for a sign-in.
     """
-    today = datetime.now(TAIPEI).date().isoformat()
-    for domain in domains:
-        api = GladosAPI(domain, cookie)
-        try:
-            api.status()
-            payload = api._request_json("GET", "/api/user/points")
-            raw_history = payload.get("history")
-            if not isinstance(raw_history, list):
-                return False
-            history, _, _ = build_checkin_history(payload, today=datetime.now(TAIPEI).date(), window_days=2)
-            today_known = any(row.get("date") == today and row.get("state") == "checked" for row in history)
-            if not today_known:
-                return False
-            for row in raw_history:
-                if not isinstance(row, dict):
-                    continue
-                text = " ".join(
-                    str(row.get(key, "")).strip().lower()
-                    for key in ("type", "reason", "description", "source", "message", "remark", "title", "action", "name")
-                    if row.get(key) is not None
-                )
-                if any(marker in text for marker in NON_CHECKIN_MARKERS):
-                    continue
-                if any(marker in text for marker in CHECKIN_MARKERS):
-                    return True
-            return False
-        except (NetworkError, ProtocolError):
-            continue
-        finally:
-            api.close()
+    today = datetime.now(TAIPEI).date()
+    history = points_payload.get("history")
+    if not isinstance(history, list): return False
+    for item in history:
+        if not isinstance(item, dict): continue
+        when = _history_datetime(item)
+        if when is None or when.date() != today: continue
+        text = " ".join(str(item.get(k, "")).strip().lower() for k in
+                        ("type", "reason", "description", "source", "message", "remark", "title", "action", "name"))
+        if any(x in text for x in NON_CHECKIN_MARKERS): continue
+        if any(x in text for x in CHECKIN_MARKERS): return True
     return False
 
 
-def execute() -> dict[str, Any]:
-    config = Config()
-    if len(config.cookies) != 1:
-        raise ProtocolError("V3 requires exactly one account secret per matrix job")
-    cookie = config.cookies[0]
-    mode = os.environ.get("GLADOS_RUN_MODE", "primary").strip().lower()
-    if mode not in {"primary", "recovery", "read_only"}:
-        mode = "primary"
+def _client_for(cookie: str, domains: Iterable[str]) -> tuple[Client, dict, dict]:
+    last: Optional[V3Error] = None
+    for domain in domains:
+        client = Client(domain, cookie)
+        try:
+            status = client.status()
+            points = client.points()
+            return client, status, points
+        except (NetworkError, ProtocolError) as exc:
+            last = exc; client.close(); continue
+        except (AuthError, ChallengeError):
+            client.close(); raise
+    raise last or NetworkError("all_domains")
 
-    if mode == "read_only":
-        last_error = None
-        for domain in config.domains:
-            api = GladosAPI(domain, cookie)
-            try:
-                api.status()
-                api._request_json("GET", "/api/user/points")
-                return {"mode": mode, "checkin": "not-run", "exchange": "not-run", "exchange_policy": "not-run", "ok": True}
-            except (NetworkError, ProtocolError) as exc:
-                last_error = exc
-                continue
-            finally:
-                api.close()
-        if last_error:
-            raise last_error
-        raise NetworkError("No GLaDOS domain was reachable")
 
-    if mode == "recovery" and _explicit_today_checkin(cookie, config.domains):
-        return {"mode": mode, "checkin": "already-confirmed", "exchange": "not-needed", "ok": True}
+def _push(sendkey: str, title: str, body: str) -> None:
+    if not sendkey: return
+    try:
+        requests.post("https://api2.pushdeer.com/message/push",
+                      data={"pushkey": sendkey, "text": title, "desp": body, "type": "text"}, timeout=10)
+    except requests.RequestException:
+        pass
 
-    catalog = load_exchange_catalog(config.catalog_path)
-    effective_catalog = catalog
-    auto_exchange = config.auto_exchange
-    exchange_policy = "disabled" if not auto_exchange else "trusted-fallback"
 
-    if auto_exchange:
-        live = _read_live_plans(cookie, config.domains)
-        effective_catalog = trusted_live_intersection(catalog, live)
-        if live is None:
-            exchange_policy = "trusted-fallback"
-        elif effective_catalog:
-            exchange_policy = "trusted-live-intersection"
-        else:
-            # Live metadata exists but does not exactly match anything in the
-            # verified catalog. Check-in remains allowed; spending is blocked.
-            auto_exchange = False
-            effective_catalog = catalog
-            exchange_policy = "blocked-unverified-live-plans"
+def execute(env: Optional[dict[str, str]] = None) -> dict:
+    env = os.environ if env is None else env
+    cookie = env.get("GLADOS_COOKIES", "").strip()
+    account_key = env.get("GLADOS_ACCOUNT_KEY", "").strip()
+    mode = env.get("GLADOS_RUN_MODE", "primary").strip().lower()
+    auto_exchange = env.get("GLADOS_AUTO_EXCHANGE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    domains = tuple(x.strip().lower() for x in env.get("GLADOS_DOMAINS", ",".join(DEFAULT_DOMAINS)).split(",") if x.strip())
+    catalog_path = Path(env.get("GLADOS_EXCHANGE_CATALOG", ".github/glados/exchange_plans.json"))
+    if mode not in {"primary", "recovery", "read_only"}: mode = "primary"
+    if not cookie or not re.fullmatch(r"[A-F0-9]{16}", account_key): raise ProtocolError("configuration")
 
-    result = run_one_account(
-        cookie,
-        1,
-        account_key=config.account_key,
-        auto_exchange=auto_exchange,
-        catalog=effective_catalog,
-        domains=config.domains,
-    )
-    exchange_state = result.exchange
-    if config.auto_exchange and not auto_exchange:
-        exchange_state = "blocked-unverified-live-plans"
-    return {
-        "mode": mode,
-        "checkin": result.checkin,
-        "exchange": exchange_state,
-        "exchange_policy": exchange_policy,
-        "ok": result.success,
-        "error_type": "" if not result.error else "account_error",
-    }
+    client, before_status, before_points_payload = _client_for(cookie, domains)
+    try:
+        live = parse_live_plans(before_points_payload)
+        trusted = load_catalog(catalog_path)
+        compatible = trusted_live_intersection(trusted, live)
+        capability = "verified" if compatible else ("unavailable" if live is None else "changed")
+
+        if mode == "read_only":
+            return {"ok": True, "mode": mode, "status": "readable", "exchange_capability": capability}
+
+        if mode == "recovery" and reliable_today_checkin(before_points_payload):
+            return {"ok": True, "mode": mode, "checkin": "already-confirmed", "exchange": "not-needed", "exchange_capability": capability}
+
+        checkin = client.checkin()
+        points_payload = client.points()
+        exchange = "disabled"
+        if auto_exchange:
+            live_after = parse_live_plans(points_payload)
+            compatible_after = trusted_live_intersection(trusted, live_after)
+            if not compatible_after:
+                exchange = "held-unverified"
+            else:
+                plan = best_plan(compatible_after)
+                points_before = _int(points_payload.get("points"))
+                days_before = _int(before_status.get("leftDays"))
+                if points_before is None:
+                    exchange = "held-unknown-points"
+                elif points_before < plan.points:
+                    exchange = "waiting"
+                else:
+                    client.exchange(plan.plan_id)
+                    after_points = client.points()
+                    after_status = client.status()
+                    points_after = _int(after_points.get("points"))
+                    days_after = _int(after_status.get("leftDays"))
+                    points_ok = points_after is not None and points_after <= points_before - plan.points
+                    days_ok = days_before is not None and days_after is not None and days_after >= days_before + plan.days - 1
+                    if points_ok and days_ok:
+                        exchange = "success-verified"
+                    else:
+                        exchange = "verification-failed"
+        ok = checkin in {"success", "already"} and exchange != "verification-failed"
+        return {"ok": ok, "mode": mode, "checkin": checkin, "exchange": exchange, "exchange_capability": capability}
+    finally:
+        client.close()
 
 
 def main() -> int:
+    sendkey = os.environ.get("PUSHDEER_SENDKEY", "").strip()
+    account_hint = os.environ.get("GLADOS_ACCOUNT_KEY", "")[:6] or "account"
     try:
         result = execute()
         print("GLaDOS V3: " + json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        if result.get("exchange") == "success-verified":
+            _push(sendkey, "GLaDOS 自动兑换成功", f"账号 {account_hint}… 已完成兑换并通过积分/天数双重校验。")
+        elif not result.get("ok"):
+            _push(sendkey, "GLaDOS 自动任务异常", f"账号 {account_hint}… 需要检查，类型：{result.get('exchange') or result.get('checkin') or 'unknown'}。")
         return 0 if result.get("ok") else 1
-    except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
-        print("GLaDOS V3: " + json.dumps({"ok": False, "error_type": type(exc).__name__}, separators=(",", ":")))
+    except (AuthError, ChallengeError, NetworkError, ProtocolError) as exc:
+        error_type = type(exc).__name__
+        print("GLaDOS V3: " + json.dumps({"ok": False, "error_type": error_type}, separators=(",", ":")))
+        _push(sendkey, "GLaDOS 自动任务需要处理", f"账号 {account_hint}… · {error_type}")
         return 1
 
 
