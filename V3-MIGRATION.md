@@ -49,7 +49,7 @@ The macOS beta uses the existing bundle identifier `com.enoch.glados-account-cen
 - embedded Safari Web Extension inside the main app; no separate Safari Bridge app
 - verified legacy/duplicate app cleanup by Bundle ID
 
-Existing accounts need to be re-read once from an authenticated browser to establish their local Keychain copy. This does not create a duplicate account because the stable account key maps back to the existing GitHub secret.
+A source-complete `3.0.0-beta.1` macOS package has been prepared for the Mac-side Xcode build gate. Existing accounts need to be re-read once from an authenticated browser to establish their local Keychain copy. This does not create a duplicate account because the stable account key maps back to the existing GitHub secret.
 
 ## Promotion gate
 
