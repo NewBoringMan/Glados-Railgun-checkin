@@ -3,8 +3,8 @@ name: GLaDOS V3 Check-in
 on:
   workflow_dispatch:
     inputs:
-      account:
-        description: Account key to run, or all
+      lock:
+        description: Privacy-safe account lock id to run, or all
         required: false
         default: all
         type: string
@@ -26,7 +26,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: glados-v3-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.account || 'scheduled' }}
+  group: glados-v3-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.lock || 'scheduled' }}
   cancel-in-progress: false
 
 jobs:
@@ -52,10 +52,10 @@ jobs:
       - id: matrix
         shell: bash
         env:
-          ACCOUNT_FILTER: ${{ inputs.account }}
+          LOCK_FILTER: ${{ inputs.lock }}
         run: |
-          account="${ACCOUNT_FILTER:-all}"
-          matrix="$(python3 scripts/v3_matrix.py --account "$account")"
+          lock="${LOCK_FILTER:-all}"
+          matrix="$(python3 scripts/v3_matrix.py --lock "$lock")"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("include", [])))' <<< "$matrix")"
           [[ "$count" -gt 0 ]] && echo "has_accounts=true" >> "$GITHUB_OUTPUT" || echo "has_accounts=false" >> "$GITHUB_OUTPUT"
