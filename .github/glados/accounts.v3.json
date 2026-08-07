@@ -1,6 +1,7 @@
 {
   "version": 3,
   "globalPaused": false,
+  "productionScheduleEnabled": false,
   "schedule": {
     "timezone": "Asia/Taipei",
     "primary": "05:07",
