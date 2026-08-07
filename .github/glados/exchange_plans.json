@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "updatedAt": "2026-08-07",
+  "selectionPolicy": {
+    "primary": "lowest_points_per_day",
+    "tieBreakers": ["shorter_days", "lower_points", "plan_id"]
+  },
+  "plans": [
+    {"id": "plan100", "points": 100, "days": 10, "verified": true},
+    {"id": "plan200", "points": 200, "days": 30, "verified": true},
+    {"id": "plan500", "points": 500, "days": 100, "verified": true}
+  ]
+}
