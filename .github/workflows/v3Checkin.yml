@@ -1,0 +1,88 @@
+name: GLaDOS V3 Check-in
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: Account key to run, or all
+        required: false
+        default: all
+        type: string
+      run_mode:
+        description: primary or recovery
+        required: false
+        default: primary
+        type: choice
+        options: [primary, recovery]
+  schedule:
+    - cron: '7 5 * * *'
+      timezone: 'Asia/Taipei'
+    - cron: '7 17 * * *'
+      timezone: 'Asia/Taipei'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glados-v3-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.account || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      run_mode: ${{ steps.mode.outputs.run_mode }}
+      has_accounts: ${{ steps.matrix.outputs.has_accounts }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.run_mode }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            mode="${INPUT_MODE:-primary}"
+          elif [[ "$SCHEDULE" == "7 17 * * *" ]]; then
+            mode="recovery"
+          else
+            mode="primary"
+          fi
+          echo "run_mode=$mode" >> "$GITHUB_OUTPUT"
+      - id: matrix
+        shell: bash
+        env:
+          ACCOUNT_FILTER: ${{ inputs.account }}
+        run: |
+          account="${ACCOUNT_FILTER:-all}"
+          matrix="$(python3 scripts/v3_matrix.py --account "$account")"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("include", [])))' <<< "$matrix")"
+          if [[ "$count" -gt 0 ]]; then echo "has_accounts=true" >> "$GITHUB_OUTPUT"; else echo "has_accounts=false" >> "$GITHUB_OUTPUT"; fi
+
+  checkin:
+    needs: prepare
+    name: GLaDOS check-in slot ${{ matrix.slot }}
+    if: ${{ needs.prepare.outputs.has_accounts == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements-v3.txt
+      - name: Check in account
+        env:
+          GLADOS_COOKIES: ${{ secrets[matrix.secret_name] }}
+          GLADOS_ACCOUNT_KEY: ${{ matrix.account_key }}
+          GLADOS_AUTO_EXCHANGE: ${{ matrix.auto_exchange }}
+          GLADOS_RUN_MODE: ${{ needs.prepare.outputs.run_mode }}
+          GLADOS_EXCHANGE_CATALOG: .github/glados/exchange_plans.json
+        run: python v3_runtime.py
