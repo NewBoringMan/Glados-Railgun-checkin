@@ -1,0 +1,56 @@
+name: GLaDOS V3 Production Cutover
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type ARM_V3_AND_RETIRE_V2 exactly
+        required: true
+        type: string
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: glados-production-cutover
+  cancel-in-progress: false
+jobs:
+  cutover:
+    if: ${{ github.ref == 'refs/heads/master' && inputs.confirm == 'ARM_V3_AND_RETIRE_V2' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Require latest master read-only Canary success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow v3Canary.yml --branch master --limit 1 --json conclusion --jq '.[0].conclusion // ""')"
+          [[ "$conclusion" == "success" ]] || { echo "Latest master V3 read-only Canary is not successful."; exit 1; }
+      - name: Require latest manual master V3 task success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow v3Checkin.yml --branch master --event workflow_dispatch --limit 1 --json conclusion --jq '.[0].conclusion // ""')"
+          [[ "$conclusion" == "success" ]] || { echo "Latest manual master V3 workflow is not successful."; exit 1; }
+      - name: Atomically prepare V3 arm and V2 schedule retirement
+        run: |
+          python3 scripts/v3_cutover.py
+          python3 -m unittest tests.test_v3_cutover -v
+          python3 - <<'PY'
+          import json
+          cfg=json.load(open('.github/glados/accounts.v3.json'))
+          assert cfg['productionScheduleEnabled'] is True
+          text=open('.github/workflows/gladosAccounts.yml').read()
+          assert '\n  schedule:' not in text
+          assert '  workflow_dispatch:' in text
+          PY
+      - name: Commit overlap-free cutover
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/glados/accounts.v3.json .github/workflows/gladosAccounts.yml
+          git diff --cached --quiet && { echo 'No cutover changes found'; exit 1; }
+          git commit -m 'chore: cut over production scheduler from V2 to V3'
+          git push origin HEAD:master
