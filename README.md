@@ -1,83 +1,80 @@
-# Glados自动签到
+# GLaDOS 多账号自动签到 · Account Center V2
 
-## 食用方式：
+这是当前仓库的 V2 自动签到后端，面向多账号独立管理，并与 macOS `GLaDOS Account Center` 配套使用。
 
-### 注册一个GLaDOS的账号([注册地址](https://glados.space/landing/0A58E-NV28S-6U3QV-33VMG))
+## 当前策略
 
-#### 我的邀请码：([0A58E-NV28S-6U3QV-33VMG](https://0a58e-nv28s-6u3qv-33vmg.glados.space)) 
+- 定时：台湾时间每天 `05:00`、`17:00`
+- 时区：`Asia/Taipei`
+- 每个账号使用独立的 `GLADOS_ACCOUNT_<ACCOUNT_KEY>` GitHub Actions Secret
+- 现有账号自动积分兑换默认关闭
+- 自动兑换必须由账号级配置显式开启
+- 兑换仅使用经过验证的方案目录 `.github/glados/exchange_plans.json`
+- 当前已验证方案：100→10 天、200→30 天、500→100 天
+- 当前最优方案：500→100 天，即 5 积分/天
 
-### **Fork**本仓库
+## 最优兑换规则
 
-![图片加载失败](imgs/1.png)
+对所有 `verified: true` 的方案计算：
 
-### 添加**secret**
+`积分成本 = points / days`
 
-1. 跳转至自己的仓库的`Settings`->`Secrets and variables`->`Action`
+选择顺序：
 
-2. 添加1个`repository secret`，命名为`GLADOS_COOKIES`，其值对应GLaDOS账号的cookie值中的有效部分（获取方式如下）
+1. 每天积分成本最低；
+2. 成本相同，优先兑换天数更短；
+3. 再相同，优先所需积分更低；
+4. 再相同，按 plan ID 稳定排序。
 
-- 在GLaDOS的签到页面按`F12`
+例如未来出现 800→200 天，则 800/200=4，比 500/100=5 更划算，自动兑换门槛会改为 800；如果出现 900→180 天，则成本同为 5，仍优先 500→100 天，因为周期更短。
 
-- 切换到`Network`页面下，刷新
+未验证的新方案不会自动用于兑换。积分未达到最优方案门槛时，不调用兑换接口。
 
-![图片加载失败](imgs/2.png)
+## 多账号配置
 
-- 点击第一个选项卡后在`Request Headers`下找到`Cookie`，右键复制cookie的值即可
+非敏感配置位于：
 
-  > 参考格式：koa:sess=eyJ1c2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxAwMH0=; koa:sess.sig=xJkOxxxxxxxxxxxxxxxtnM;
+- `.github/glados/accounts.json`
+- `.github/glados/exchange_plans.json`
 
-![图片加载失败](imgs/3.png)
+Cookie 只保存在 GitHub Actions Secrets，不写入仓库文件。
 
-- 多账号请在 `COOKIES` 中 添加多个 `cookies` 中间使用 `&`连接即可。（例如： `c1&c3&c3...`）
+主要工作流：
 
-3. 配置积分兑换策略（非必须）
+- `.github/workflows/gladosAccounts.yml`：多账号定时/手动签到
+- `.github/workflows/gladosStatus.yml`：只读状态刷新，不签到、不兑换
+- `.github/workflows/gladosCheck.yml`：历史兼容工作流，自动兑换强制关闭
+- `.github/workflows/ci.yml`：回归测试
 
-- 添加1个`repository secret`，命名为`GLADOS_EXCHANGE_PLAN`，配置自动兑换积分策略：
+## 低干扰运行策略
 
-| 值 | 积分要求 | 兑换天数 |
-|---|---------|---------|
-| `plan100` | 100 积分 | 10 天 |
-| `plan200` | 200 积分 | 30 天 |
-| `plan500` | 500 积分 | 100 天 (默认) |
+- `glados.cloud` 为主域；主域成功后不再访问备用域
+- 仅在网络或协议故障时 fallback 到 `railgun.info`
+- 401/403 立即停止
+- 检测到 CAPTCHA / challenge / access denied 后停止
+- 429 按限流规则等待
+- GET 网络错误/5xx 仅有限重试
+- 签到 POST 和兑换 POST 不自动重试，避免重复副作用
+- 每个账号每次 Action 最多兑换一次
 
-> 不配置时默认为 `plan500`，即积分达到 500 时自动兑换 100 天
+本项目不实现验证码绕过、浏览器指纹伪装、代理轮换或其他反机器人机制规避。
 
-4. 手机推送（非必须）
+## 手动兼容账号
 
-- 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
+历史 `GLADOS_COOKIES` 仍由 `gladosCheck.yml` 支持。V2 对该历史入口强制关闭自动积分兑换。建议后续通过 Account Center 将账号逐个迁移到独立 Secret，便于单账号开关和状态管理。
 
-### **star**自己的仓库
+## 测试
 
-![图片加载失败](imgs/4.png)
-
-## 文件结构
-
-```shell
-│  checkin.py	# 签到脚本
-│
-├─.github
-│  └─workflows
-│          gladosCheck.yml	# Actions 配置文件
+```bash
+pip install -r requirements.txt
+python -m py_compile checkin.py status.py logging_config.py
+python -m unittest discover -s tests -v
 ```
 
-## 更新日志
+## 回滚
 
-- **2026-01**: 重构代码，添加log输出方便定位，支持新版网址，支持配置积分兑换策略。
-- **2026-04**: 优化代码逻辑，优化日志输出，支持[新版域名](https://railgun.info) ，在 GLADOS_COOKIES 中添加新版域名下的 cookies 即可使用。
+V2 升级前快照已保留在分支：
 
+`backup/pre-v2-account-center-20260807`
 
-## 问题排查与定位
-- 大家可以通过查询 actions 中的 running checkin 日志快速定位问题，有其他问题提交issue。
-
-  <img width="1684" height="844" alt="image" src="https://github.com/user-attachments/assets/45348a5f-43e4-45f5-8fdf-ce84d343b30d" />
-
-## 声明
-
-本项目不保证稳定运行与更新, 因GitHub相关规定可能会删库, 请注意备份
-
-
-
-
-
-
-
+该分支用于恢复代码状态；GitHub Secrets 不会以明文形式写入备份分支。
