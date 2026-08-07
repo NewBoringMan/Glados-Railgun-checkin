@@ -23,6 +23,7 @@ on:
 permissions:
   contents: read
   actions: read
+  issues: write
 
 concurrency:
   group: glados-v3-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.account || 'scheduled' }}
@@ -64,7 +65,7 @@ jobs:
     name: GLaDOS check-in slot ${{ matrix.slot }}
     if: ${{ needs.prepare.outputs.has_accounts == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -85,35 +86,46 @@ jobs:
           CURRENT_RUN_ID: ${{ github.run_id }}
           SLOT: ${{ matrix.slot }}
         run: |
-          skip="$(python3 - <<'PY2'
-          import json, os, subprocess
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-          repo=os.environ['GH_REPO']; current=int(os.environ['CURRENT_RUN_ID']); slot=os.environ['SLOT']
-          today=datetime.now(ZoneInfo('Asia/Taipei')).date()
-          try: rows=json.loads(subprocess.check_output(['gh','run','list','--repo',repo,'--workflow','v3Checkin.yml','--event','schedule','--limit','12','--json','databaseId,createdAt,status'],text=True))
-          except Exception: print('false'); raise SystemExit
-          run_id=None
-          for row in rows:
-              if int(row.get('databaseId',0))==current or row.get('status')!='completed': continue
-              try: created=datetime.fromisoformat(row['createdAt'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Taipei'))
-              except Exception: continue
-              if created.date()==today and created.hour<12: run_id=str(row['databaseId']); break
-          if not run_id: print('false'); raise SystemExit
-          try: view=json.loads(subprocess.check_output(['gh','run','view',run_id,'--repo',repo,'--json','jobs'],text=True))
-          except Exception: print('false'); raise SystemExit
-          target=f'GLaDOS check-in slot {slot}'
-          print('true' if any(j.get('name')==target and j.get('conclusion')=='success' for j in view.get('jobs',[])) else 'false')
-          PY2
-          )"
+          skip="$(python3 scripts/v3_recovery_gate.py --repo "$GH_REPO" --current-run "$CURRENT_RUN_ID" --slot "$SLOT")"
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
+      - name: Check durable exchange safety lock
+        id: exchange_lock
+        if: ${{ matrix.auto_exchange == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LOCK_ID: ${{ matrix.lock_id }}
+        run: |
+          count="$(gh issue list --repo "$GH_REPO" --state open --search "GLaDOS exchange lock $LOCK_ID in:title" --json number --jq 'length' 2>/dev/null || echo 0)"
+          [[ "$count" -gt 0 ]] && echo "locked=true" >> "$GITHUB_OUTPUT" || echo "locked=false" >> "$GITHUB_OUTPUT"
       - name: Run account task
+        id: account_task
         if: ${{ steps.recovery_gate.outputs.skip != 'true' }}
+        shell: bash
         env:
           GLADOS_COOKIES: ${{ secrets[matrix.secret_name] }}
           GLADOS_SLOT: ${{ matrix.slot }}
-          GLADOS_AUTO_EXCHANGE: ${{ matrix.auto_exchange }}
+          GLADOS_AUTO_EXCHANGE: ${{ matrix.auto_exchange == true && steps.exchange_lock.outputs.locked != 'true' }}
           GLADOS_RUN_MODE: ${{ needs.prepare.outputs.run_mode }}
           GLADOS_EXCHANGE_CATALOG: .github/glados/exchange_plans.json
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
-        run: python v3_runtime.py
+        run: |
+          set +e
+          python v3_runtime.py 2>&1 | tee v3-runtime.log
+          status=${PIPESTATUS[0]}
+          if grep -Fq '"exchange":"verification-failed"' v3-runtime.log; then echo "freeze=true" >> "$GITHUB_OUTPUT"; else echo "freeze=false" >> "$GITHUB_OUTPUT"; fi
+          exit "$status"
+      - name: Freeze automatic exchange after ambiguous verification
+        if: ${{ always() && steps.account_task.outputs.freeze == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LOCK_ID: ${{ matrix.lock_id }}
+          SLOT: ${{ matrix.slot }}
+        run: |
+          existing="$(gh issue list --repo "$GH_REPO" --state open --search "GLaDOS exchange lock $LOCK_ID in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+          if [[ -z "$existing" ]]; then
+            gh issue create --repo "$GH_REPO" --title "GLaDOS exchange lock $LOCK_ID" --body "Account Center V3 automatically froze automatic exchange for slot $SLOT because an exchange POST could not be confirmed by both points decrease and membership-days increase. Check the account in Account Center, refresh its GLaDOS state, then explicitly clear the lock before re-enabling automatic exchange. No Cookie, email, balance, or persistent account key is stored in this issue."
+          fi
