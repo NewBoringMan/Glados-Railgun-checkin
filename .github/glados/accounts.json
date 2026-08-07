@@ -15,6 +15,11 @@
       "enabled" : true,
       "label" : "GLaDOS 332A23"
     },
+    "6BA27F0D29BB2856" : {
+      "autoExchange" : true,
+      "enabled" : true,
+      "label" : "GLaDOS 6BA27F"
+    },
     "754D6E4FA3AC25D9" : {
       "autoExchange" : false,
       "enabled" : true,
