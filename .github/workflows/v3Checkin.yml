@@ -36,7 +36,7 @@ jobs:
       run_mode: ${{ steps.mode.outputs.run_mode }}
       has_accounts: ${{ steps.matrix.outputs.has_accounts }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - id: mode
         shell: bash
         env:
@@ -61,7 +61,7 @@ jobs:
           matrix="$(python3 scripts/v3_matrix.py --account "$account")"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("include", [])))' <<< "$matrix")"
-          if [[ "$count" -gt 0 ]]; then echo "has_accounts=true" >> "$GITHUB_OUTPUT"; else echo "has_accounts=false" >> "$GITHUB_OUTPUT"; fi
+          [[ "$count" -gt 0 ]] && echo "has_accounts=true" >> "$GITHUB_OUTPUT" || echo "has_accounts=false" >> "$GITHUB_OUTPUT"
 
   checkin:
     needs: prepare
@@ -74,8 +74,8 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.13'
       - run: pip install -r requirements-v3.txt
@@ -89,46 +89,31 @@ jobs:
           CURRENT_RUN_ID: ${{ github.run_id }}
           SLOT: ${{ matrix.slot }}
         run: |
-          skip="$(python3 - <<'PY'
+          skip="$(python3 - <<'PY2'
           import json, os, subprocess
           from datetime import datetime
           from zoneinfo import ZoneInfo
-
-          repo = os.environ['GH_REPO']
-          current = int(os.environ['CURRENT_RUN_ID'])
-          slot = os.environ['SLOT']
-          today = datetime.now(ZoneInfo('Asia/Taipei')).date()
+          repo=os.environ['GH_REPO']; current=int(os.environ['CURRENT_RUN_ID']); slot=os.environ['SLOT']
+          today=datetime.now(ZoneInfo('Asia/Taipei')).date()
           try:
-              rows = json.loads(subprocess.check_output([
-                  'gh','run','list','--repo',repo,'--workflow','v3Checkin.yml','--event','schedule','--limit','12',
-                  '--json','databaseId,createdAt,status'
-              ], text=True))
+              rows=json.loads(subprocess.check_output(['gh','run','list','--repo',repo,'--workflow','v3Checkin.yml','--event','schedule','--limit','12','--json','databaseId,createdAt,status'],text=True))
           except Exception:
               print('false'); raise SystemExit
-          run_id = None
+          run_id=None
           for row in rows:
-              if int(row.get('databaseId', 0)) == current or row.get('status') != 'completed':
-                  continue
-              try:
-                  created = datetime.fromisoformat(row['createdAt'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Taipei'))
-              except Exception:
-                  continue
-              if created.date() == today and created.hour < 12:
-                  run_id = str(row['databaseId']); break
-          if not run_id:
-              print('false'); raise SystemExit
-          try:
-              view = json.loads(subprocess.check_output(['gh','run','view',run_id,'--repo',repo,'--json','jobs'], text=True))
-          except Exception:
-              print('false'); raise SystemExit
-          target = f'GLaDOS check-in slot {slot}'
-          ok = any(job.get('name') == target and job.get('conclusion') == 'success' for job in view.get('jobs', []))
-          print('true' if ok else 'false')
-          PY
+              if int(row.get('databaseId',0))==current or row.get('status')!='completed': continue
+              try: created=datetime.fromisoformat(row['createdAt'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Taipei'))
+              except Exception: continue
+              if created.date()==today and created.hour<12: run_id=str(row['databaseId']); break
+          if not run_id: print('false'); raise SystemExit
+          try: view=json.loads(subprocess.check_output(['gh','run','view',run_id,'--repo',repo,'--json','jobs'],text=True))
+          except Exception: print('false'); raise SystemExit
+          target=f'GLaDOS check-in slot {slot}'
+          print('true' if any(j.get('name')==target and j.get('conclusion')=='success' for j in view.get('jobs',[])) else 'false')
+          PY2
           )"
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
-          if [[ "$skip" == "true" ]]; then echo "Morning slot already succeeded; recovery POST is skipped."; fi
-      - name: Check in account
+      - name: Run account task
         if: ${{ steps.recovery_gate.outputs.skip != 'true' }}
         env:
           GLADOS_COOKIES: ${{ secrets[matrix.secret_name] }}
@@ -136,4 +121,5 @@ jobs:
           GLADOS_AUTO_EXCHANGE: ${{ matrix.auto_exchange }}
           GLADOS_RUN_MODE: ${{ needs.prepare.outputs.run_mode }}
           GLADOS_EXCHANGE_CATALOG: .github/glados/exchange_plans.json
+          PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         run: python v3_runtime.py
