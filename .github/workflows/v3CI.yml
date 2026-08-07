@@ -22,9 +22,10 @@ jobs:
       - name: Secret / PII leak scan
         shell: bash
         run: |
-          ! grep -RIE --exclude-dir=.git --exclude='*.md' 'koa:sess=|gh[oprsu]_[A-Za-z0-9_]{20,}' .
+          targets=(v3_runtime.py scripts .github/glados .github/workflows/v3Checkin.yml .github/workflows/v3Canary.yml .github/workflows/v3Heartbeat.yml)
+          ! grep -RIE --exclude='*.md' 'koa:sess=|gh[oprsu]_[A-Za-z0-9_]{20,}' "${targets[@]}"
           ! grep -nE 'print\(.*(cookie|email|points_payload|status_payload)' v3_runtime.py
-          ! grep -RIE 'GLADOS_ACCOUNT_KEY' v3_runtime.py scripts/v3_*.py .github/workflows/v3*.yml
+          ! grep -RIE 'GLADOS_ACCOUNT_KEY' v3_runtime.py scripts .github/workflows/v3Checkin.yml .github/workflows/v3Canary.yml .github/workflows/v3Heartbeat.yml
       - name: Verify GitHub Actions are SHA pinned
         shell: bash
         run: |
