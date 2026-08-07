@@ -40,7 +40,7 @@ jobs:
         env:
           GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_059502CEBB0D18D6 }}
           GLADOS_ACCOUNT_KEY: '059502CEBB0D18D6'
-          GLADOS_AUTO_EXCHANGE: 'false'
+          GLADOS_AUTO_EXCHANGE: 'true'
           GLADOS_EXCHANGE_CATALOG: '.github/glados/exchange_plans.json'
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
           GLADOS_VERBOSE: 'true'
