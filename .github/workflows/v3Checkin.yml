@@ -9,11 +9,11 @@ on:
         default: all
         type: string
       run_mode:
-        description: primary or recovery
+        description: primary, recovery, or read_only
         required: false
         default: primary
         type: choice
-        options: [primary, recovery]
+        options: [primary, recovery, read_only]
   schedule:
     - cron: '7 5 * * *'
       timezone: 'Asia/Taipei'
@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: glados-v3-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.account || 'scheduled' }}
@@ -78,7 +79,57 @@ jobs:
         with:
           python-version: '3.13'
       - run: pip install -r requirements-v3.txt
+      - name: Skip when primary slot already succeeded
+        id: recovery_gate
+        if: ${{ needs.prepare.outputs.run_mode == 'recovery' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          SLOT: ${{ matrix.slot }}
+        run: |
+          skip="$(python3 - <<'PY'
+          import json, os, subprocess
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          repo = os.environ['GH_REPO']
+          current = int(os.environ['CURRENT_RUN_ID'])
+          slot = os.environ['SLOT']
+          today = datetime.now(ZoneInfo('Asia/Taipei')).date()
+          try:
+              rows = json.loads(subprocess.check_output([
+                  'gh','run','list','--repo',repo,'--workflow','v3Checkin.yml','--event','schedule','--limit','12',
+                  '--json','databaseId,createdAt,status'
+              ], text=True))
+          except Exception:
+              print('false'); raise SystemExit
+          run_id = None
+          for row in rows:
+              if int(row.get('databaseId', 0)) == current or row.get('status') != 'completed':
+                  continue
+              try:
+                  created = datetime.fromisoformat(row['createdAt'].replace('Z','+00:00')).astimezone(ZoneInfo('Asia/Taipei'))
+              except Exception:
+                  continue
+              if created.date() == today and created.hour < 12:
+                  run_id = str(row['databaseId']); break
+          if not run_id:
+              print('false'); raise SystemExit
+          try:
+              view = json.loads(subprocess.check_output(['gh','run','view',run_id,'--repo',repo,'--json','jobs'], text=True))
+          except Exception:
+              print('false'); raise SystemExit
+          target = f'GLaDOS check-in slot {slot}'
+          ok = any(job.get('name') == target and job.get('conclusion') == 'success' for job in view.get('jobs', []))
+          print('true' if ok else 'false')
+          PY
+          )"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          if [[ "$skip" == "true" ]]; then echo "Morning slot already succeeded; recovery POST is skipped."; fi
       - name: Check in account
+        if: ${{ steps.recovery_gate.outputs.skip != 'true' }}
         env:
           GLADOS_COOKIES: ${{ secrets[matrix.secret_name] }}
           GLADOS_ACCOUNT_KEY: ${{ matrix.account_key }}
