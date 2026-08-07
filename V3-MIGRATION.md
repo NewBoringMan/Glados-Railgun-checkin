@@ -8,6 +8,7 @@ V3 is developed on `v3/account-center`. Production remains on `master` until the
 - Existing `GLADOS_ACCOUNT_<ACCOUNT_KEY>` secrets are reused; V3 never reads their plaintext back from GitHub.
 - V3 account configuration lives in `.github/glados/accounts.v3.json`, separate from the V2 production configuration.
 - V3 runtime is standalone and emits coarse operational state only. It does not intentionally log email addresses, Cookie values, exact point balances, point history, or persistent account keys.
+- Manual single-account workflow inputs use a non-reversible lock id rather than the stable Account Key.
 - Dynamic matrix rows expose an ephemeral slot, Secret name, and a non-reversible exchange-lock identifier; job metadata does not expose the stable account key.
 - One matrix job handles one account and `max-parallel` is `1`.
 - GET operations have bounded retry. Check-in and exchange POST operations are sent at most once per runtime invocation and are never automatically retried.
@@ -18,11 +19,12 @@ V3 is developed on `v3/account-center`. Production remains on `master` until the
 
 - Primary: `05:07` Asia/Taipei.
 - Recovery: `17:07` Asia/Taipei.
+- `productionScheduleEnabled` is a separate production-arming gate and is `false` in the Release Candidate. A scheduled event therefore produces an empty matrix until explicit cutover; manual read-only/primary/recovery Canary runs remain available.
 - Scheduled recovery checks GitHub's corresponding morning **primary slot** first. A successful morning slot suppresses the afternoon account task entirely.
 - If GitHub history cannot prove the morning slot succeeded, Recovery remains available rather than suppressing a potentially needed fallback.
 - Runtime recovery also treats only explicit GLaDOS check-in-labelled history as reliable evidence; positive reward points alone never suppress recovery.
 
-Scheduled V3 workflows become production-active only after the V3 workflow is merged to the default branch.
+This gate prevents a PR merge from accidentally running V2 and V3 schedules in parallel. Final cutover explicitly retires the V2 scheduled workflow and arms the V3 schedule only after live validation.
 
 ## Exchange safety
 
@@ -40,6 +42,7 @@ After a successful exchange POST V3 re-reads points and membership days. The exc
 - autoExchange
 - generic label
 - global pause state
+- production schedule armed/disarmed state
 - schedule metadata
 
 Local display names and notes are not encoded into the public repository. Cookie values remain in independent GitHub Actions Secrets and, after user-approved migration, the macOS Keychain used by Account Center V3.
@@ -59,16 +62,15 @@ The macOS V3 RC uses bundle identifier `com.enoch.glados-account-center`, so V2 
 - embedded Safari Web Extension inside the main app
 - optional Chromium-family and Firefox Companion Extension with a local Native Messaging Host
 - verified legacy/duplicate-app cleanup, pre-install backup, test-before-overwrite and rollback path
+- automatic branch following: RC branch before production, then `master` automatically once the V3 workflow exists there
 
 ## Automated acceptance completed before human gate
 
-Machine-verifiable acceptance includes V3 Python unit/flow tests, mock GLaDOS HTTP integration, mock GitHub recovery-gate tests, Swift source parsing, app model/store type checks, browser/Native Messaging JS tests, package/static privacy checks, Secret/PII scan, Action SHA-pin policy, installer/rollback invariants, and a GET-only GitHub Canary.
+Machine-verifiable acceptance includes V3 Python unit/flow tests, mock GLaDOS HTTP integration, mock GitHub recovery-gate tests, Swift source parsing, app model/store type checks, browser/Native Messaging JS tests, package/static privacy checks, Secret/PII scan, Action SHA-pin policy, dependency-closure pin policy, installer/rollback invariants, and a GET-only GitHub Canary.
 
-A previous five-slot GET-only Canary confirmed 4/5 existing independent Secrets. Slot 3 failed because its dedicated `GLADOS_ACCOUNT_...` Secret was empty/missing; the other four were readable. This is intentionally left as a visible migration blocker rather than silently dropping the account. Re-reading that account from the authenticated browser will repair the dedicated Secret and simultaneously establish its local Keychain copy.
+The five-slot GET-only Canary confirms 4/5 existing independent Secrets. Slot 3 fails because its dedicated `GLADOS_ACCOUNT_...` Secret is empty/missing; the other four are readable. This is intentionally left as a visible migration blocker rather than silently dropping the account. Re-reading that account from the authenticated browser will repair the dedicated Secret and simultaneously establish its local Keychain copy.
 
 ## Final human promotion gate
-
-Before merging to `master`:
 
 1. Full Xcode Release build, XCTest, embedded Safari extension and codesign checks pass on the user's Mac.
 2. V2 → V3 installs in place and old Assistant/Bridge/duplicate copies are gone.
@@ -76,7 +78,9 @@ Before merging to `master`:
 4. Each of the five managed accounts is re-read once so macOS Keychain and independent GitHub Secret health are 5/5.
 5. Direct local read-only refresh is 5/5 and the visible plan/points/days/punch data matches GLaDOS.
 6. GET-only V3 Canary is 5/5.
-7. One controlled Primary Canary and the corresponding Recovery Canary are verified without duplicate side effects.
-8. The Draft PR is then promoted/merged. V2 schedule remains enabled until the first successful production V3 primary run; only then is the V2 scheduled workflow retired.
+7. One controlled RC Primary Canary and corresponding Recovery Canary are verified without duplicate side effects.
+8. The Draft PR is promoted/merged while `productionScheduleEnabled=false`, so V3 schedule remains disarmed and V2 keeps production coverage.
+9. One manual Primary run is verified on `master`.
+10. Final cutover retires the V2 schedule and arms `productionScheduleEnabled=true`; the first scheduled V3 primary/recovery cycle is then observed.
 
-No human-gate failure causes automatic production promotion.
+No human-gate failure causes automatic production promotion, and no merge alone can activate the V3 production schedule.
