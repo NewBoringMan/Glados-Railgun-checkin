@@ -1,0 +1,86 @@
+name: GLaDOS Account Status
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: Account key to refresh, or all
+        required: false
+        default: all
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glados-status-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  account_059502cebb0d18d6:
+    name: GLaDOS status 059502CEBB0D18D6
+    if: ${{ inputs.account == 'all' || inputs.account == '059502CEBB0D18D6' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Read account status
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_059502CEBB0D18D6 }}
+          GLADOS_ACCOUNT_KEY: '059502CEBB0D18D6'
+        run: python status.py
+
+  account_28993337790302ac:
+    name: GLaDOS status 28993337790302AC
+    if: ${{ inputs.account == 'all' || inputs.account == '28993337790302AC' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Read account status
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_28993337790302AC }}
+          GLADOS_ACCOUNT_KEY: '28993337790302AC'
+        run: python status.py
+
+  account_332a23567057fbf5:
+    name: GLaDOS status 332A23567057FBF5
+    if: ${{ inputs.account == 'all' || inputs.account == '332A23567057FBF5' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Read account status
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_332A23567057FBF5 }}
+          GLADOS_ACCOUNT_KEY: '332A23567057FBF5'
+        run: python status.py
+
+  account_754d6e4fa3ac25d9:
+    name: GLaDOS status 754D6E4FA3AC25D9
+    if: ${{ inputs.account == 'all' || inputs.account == '754D6E4FA3AC25D9' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Read account status
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_754D6E4FA3AC25D9 }}
+          GLADOS_ACCOUNT_KEY: '754D6E4FA3AC25D9'
+        run: python status.py
