@@ -1,24 +1,16 @@
-name: auto check (legacy)
+# Legacy fallback only. Scheduled check-ins are managed by gladosAccounts.yml.
+name: auto check (legacy fallback)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ master ]
-    paths-ignore:
-      - 'README.md'
-      - 'imgs/**'
-  schedule:
-    - cron: '0 5,17 * * *'
-      timezone: 'Asia/Taipei'
 
 jobs:
   build:
-    name: glados/railgun legacy checkin
+    name: glados/railgun legacy fallback
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: write
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -28,7 +20,7 @@ jobs:
           python-version: '3.13'
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Running checkin
+      - name: Running legacy fallback check-in
         env:
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
           GLADOS_AUTO_EXCHANGE: 'false'
@@ -36,13 +28,3 @@ jobs:
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
           GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
         run: python checkin.py
-      - name: Keep alive
-        uses: liskin/gh-workflow-keepalive@v1
-      - name: Delete workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          retain_days: 7
-          keep_minimum_runs: 7
-          delete_run_by_conclusion_pattern: success
