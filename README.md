@@ -7,7 +7,6 @@
 - 定时：台湾时间每天 `05:00`、`17:00`
 - 时区：`Asia/Taipei`
 - 每个账号使用独立的 `GLADOS_ACCOUNT_<ACCOUNT_KEY>` GitHub Actions Secret
-- 现有账号自动积分兑换默认关闭
 - 自动兑换必须由账号级配置显式开启
 - 兑换仅使用经过验证的方案目录 `.github/glados/exchange_plans.json`
 - 当前已验证方案：100→10 天、200→30 天、500→100 天
@@ -43,8 +42,24 @@ Cookie 只保存在 GitHub Actions Secrets，不写入仓库文件。
 
 - `.github/workflows/gladosAccounts.yml`：多账号定时/手动签到
 - `.github/workflows/gladosStatus.yml`：只读状态刷新，不签到、不兑换
-- `.github/workflows/gladosCheck.yml`：历史兼容工作流，自动兑换强制关闭
+- `.github/workflows/gladosCheck.yml`：旧版手动应急 fallback；不再定时、也不随 push 自动执行
 - `.github/workflows/ci.yml`：回归测试
+
+当前所有已迁移账号统一由 `gladosAccounts.yml` 管理。历史 `GLADOS_COOKIES` Secret 暂时保留用于回滚或手动应急，但不会自动执行，因此不会与 V2 定时任务重复签到。
+
+## 套餐状态
+
+GLaDOS 当前状态接口可能通过数值 `vip` 表示会员套餐。`status.py` 会优先兼容已有文本字段，并在没有文本套餐名时映射 `vip`：
+
+- `11` → `Edu`
+- `21` → `Basic`
+- `31` → `Pro`
+- `41` → `Team`
+- `51` → `Enterprise`
+
+同时兼容 Free / Expired / Reset / Overlimit / Spam 等状态。未知数值不会被隐藏，而会显示为 `VIP <数字>`，便于后续补充映射。
+
+Account Center 中旧缓存如果套餐仍显示 `—`，执行一次“只读刷新”即可用新的状态结果覆盖。
 
 ## 低干扰运行策略
 
@@ -58,10 +73,6 @@ Cookie 只保存在 GitHub Actions Secrets，不写入仓库文件。
 - 每个账号每次 Action 最多兑换一次
 
 本项目不实现验证码绕过、浏览器指纹伪装、代理轮换或其他反机器人机制规避。
-
-## 手动兼容账号
-
-历史 `GLADOS_COOKIES` 仍由 `gladosCheck.yml` 支持。V2 对该历史入口强制关闭自动积分兑换。建议后续通过 Account Center 将账号逐个迁移到独立 Secret，便于单账号开关和状态管理。
 
 ## 测试
 
