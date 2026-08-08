@@ -72,20 +72,12 @@ jobs:
           print('RC5_PATCH_GZIP_SHA256='+actual)
           PY
 
-          # The historic RC4 CI fixture predates a few packaging-only files. BSD
-          # patch therefore reports those absent documentation/script paths, but
-          # continues applying every source-code hunk. We verify the complete
-          # Xcode input closure byte-for-byte below, so a failed source hunk can
-          # never be hidden by this compatibility handling.
           set +e
           (cd "$work" && patch --batch -p1 < "$RUNNER_TEMP/rc5.patch")
           patch_status=$?
           set -e
-          echo "compatibility patch status=$patch_status (packaging-only misses are expected)"
+          echo "compatibility patch status=$patch_status (historic fixture lacks packaging-only files)"
 
-          # The original RC4 CI fixture also predates the final XcodeGen test-host
-          # normalization. Materialize exactly the same project/test settings as
-          # the RC5 package before the byte-for-byte aggregate gate.
           python3 - <<'PY'
           from pathlib import Path
           import os
@@ -101,19 +93,24 @@ jobs:
               t.write_text(ts.replace('@testable import GLaDOSAccountCenter','@testable import GLaDOS_Account_Center'))
           PY
 
+          # Compare exactly the source/config closure that Xcode builds. Semantic
+          # stubs under Scripts/ are release-verifier helpers, not Xcode inputs.
           python3 - <<'PY'
           from pathlib import Path
           import hashlib, os
           root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
-          files=list(root.rglob('*.swift'))+[root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
+          roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']
+          files=[]
+          for d in roots: files += list((root/d).rglob('*.swift'))
+          files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
           files=sorted(set(files), key=lambda p:p.relative_to(root).as_posix())
           h=hashlib.sha256()
           for p in files:
               rel=p.relative_to(root).as_posix().encode()
               h.update(rel); h.update(b'\0'); h.update(p.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='46ca932c0f864e27fc0db6de3a8c2fb4da8dc231ee0f5d49a55909eb44739d3d'
+          actual=h.hexdigest(); expected='d363b321363f7052f09940956d65879ddb346fd12d3fd14e9584ba1bd556a5af'
           print(f'RC5_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
-          if len(files)!=29 or actual!=expected:
+          if len(files)!=23 or actual!=expected:
               raise SystemExit('RC5 Xcode input closure differs from the release package')
           PY
 
