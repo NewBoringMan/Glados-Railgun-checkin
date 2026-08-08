@@ -61,21 +61,29 @@ jobs:
         run: xcodegen generate --spec project.yml
       - name: Release build
         working-directory: ${{ runner.temp }}/gac-rc4
+        shell: bash
         run: |
-          set -o pipefail
-          xcodebuild \
+          set -euo pipefail
+          log="$RUNNER_TEMP/xcodebuild-release.log"
+          if ! xcodebuild \
             -project GLaDOSAccountCenter.xcodeproj \
             -scheme GLaDOSAccountCenter \
             -configuration Release \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build | tee "$RUNNER_TEMP/xcodebuild-release.log"
+            build >"$log" 2>&1; then
+            tail -n 250 "$log"
+            exit 1
+          fi
+          tail -n 40 "$log"
       - name: Build tests
         working-directory: ${{ runner.temp }}/gac-rc4
+        shell: bash
         run: |
-          set -o pipefail
-          xcodebuild \
+          set -euo pipefail
+          log="$RUNNER_TEMP/xcodebuild-tests.log"
+          if ! xcodebuild \
             -project GLaDOSAccountCenter.xcodeproj \
             -scheme GLaDOSAccountCenter \
             -configuration Debug \
@@ -83,4 +91,9 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build-for-testing | tee "$RUNNER_TEMP/xcodebuild-tests.log"
+            build-for-testing >"$log" 2>&1; then
+            echo '--- xcodebuild test failure (last 250 lines) ---'
+            tail -n 250 "$log"
+            exit 1
+          fi
+          tail -n 60 "$log"
