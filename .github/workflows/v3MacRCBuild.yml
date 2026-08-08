@@ -29,7 +29,7 @@ jobs:
           sw_vers
           xcodebuild -version
           swift --version
-      - name: Restore exact RC5 build input
+      - name: Restore exact final RC5 Xcode input
         shell: bash
         run: |
           set -euo pipefail
@@ -40,7 +40,6 @@ jobs:
           import base64, hashlib, os, pathlib
           tmp=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((tmp/'gac-rc4.b64').read_text().strip(), validate=True)
           actual=hashlib.sha256(raw).hexdigest(); expected='c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55'
-          print('RC4_BASE_SHA256='+actual)
           if actual != expected: raise SystemExit('RC4 base checksum mismatch')
           (tmp/'gac-rc4.tar.xz').write_bytes(raw)
           PY
@@ -50,42 +49,122 @@ jobs:
           import base64, hashlib, os, pathlib
           tmp=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((tmp/'gac-rc5-exact.b64').read_text().strip(), validate=True)
           actual=hashlib.sha256(raw).hexdigest(); expected='d23f5a1e086081bd3101c666eb517333902d0148ecf741e7837627840efb6584'
-          print('RC5_EXACT_TAR_SHA256='+actual)
+          print('RC5_PREBRIDGE_TAR_SHA256='+actual)
           if actual != expected: raise SystemExit('RC5 exact input checksum mismatch')
           (tmp/'gac-rc5-exact.tar.xz').write_bytes(raw)
           PY
           tar -xJf "$RUNNER_TEMP/gac-rc5-exact.tar.xz" -C "$work"
 
-          # RC5 API-name correction discovered by the first real Xcode 26.6 build.
-          # Immediately after this deterministic correction, the full 23-file Xcode
-          # input closure must byte-match the final local RC5 package.
+          cat > "$work/Services/SafariExtensionBridge.h" <<'EOF'
+          #import <Foundation/Foundation.h>
+
+          NS_ASSUME_NONNULL_BEGIN
+
+          typedef void (^GACSafariStatusCompletion)(BOOL enabled, NSString *detail);
+          typedef void (^GACSafariMessageCompletion)(NSString *detail);
+
+          FOUNDATION_EXPORT void GACGetSafariExtensionStatus(NSString *identifier, GACSafariStatusCompletion completion);
+          FOUNDATION_EXPORT void GACOpenSafariExtensionPreferences(NSString *identifier, GACSafariMessageCompletion completion);
+
+          NS_ASSUME_NONNULL_END
+          EOF
+
+          cat > "$work/Services/SafariExtensionBridge.m" <<'EOF'
+          #import "SafariExtensionBridge.h"
+          @import SafariServices;
+
+          static void GACDispatchMain(dispatch_block_t block) {
+              if ([NSThread isMainThread]) {
+                  block();
+              } else {
+                  dispatch_async(dispatch_get_main_queue(), block);
+              }
+          }
+
+          void GACGetSafariExtensionStatus(NSString *identifier, GACSafariStatusCompletion completion) {
+              [SFSafariExtensionManager getStateOfSafariExtensionWithIdentifier:identifier
+                                                             completionHandler:^(SFSafariExtensionState *state, NSError *error) {
+                  BOOL enabled = (error == nil && state != nil && state.enabled);
+                  NSString *detail = error != nil
+                      ? error.localizedDescription
+                      : (state == nil ? @"系统未返回 Safari 扩展状态" : (state.enabled ? @"已启用" : @"未启用"));
+                  GACDispatchMain(^{ completion(enabled, detail); });
+              }];
+          }
+
+          void GACOpenSafariExtensionPreferences(NSString *identifier, GACSafariMessageCompletion completion) {
+              [SFSafariApplication showPreferencesForExtensionWithIdentifier:identifier
+                                                           completionHandler:^(NSError *error) {
+                  NSString *detail = error != nil
+                      ? [NSString stringWithFormat:@"无法打开 Safari 扩展设置：%@", error.localizedDescription]
+                      : @"已打开 Safari 扩展设置。";
+                  GACDispatchMain(^{ completion(detail); });
+              }];
+          }
+          EOF
+
+          cat > "$work/Services/SafariExtensionService.swift" <<'EOF'
+          import Foundation
+
+          /// SafariServices calls back on a private NSXPC queue. Swift 6 can attach an
+          /// executor precondition to a Swift closure before its body begins, so merely
+          /// marking that closure `@Sendable` is insufficient. The Objective-C bridge
+          /// receives Safari's reply first and dispatches to the main queue before any
+          /// Swift closure is invoked.
+          @MainActor
+          enum SafariExtensionService {
+              static let bundleIdentifier = "com.enoch.glados-account-center.safari-extension"
+
+              static func openPreferencesAsync() async -> String {
+                  await withCheckedContinuation { continuation in
+                      GACOpenSafariExtensionPreferences(bundleIdentifier) { detail in
+                          continuation.resume(returning: detail)
+                      }
+                  }
+              }
+
+              static func statusAsync() async -> (Bool, String) {
+                  await withCheckedContinuation { continuation in
+                      GACGetSafariExtensionStatus(bundleIdentifier) { enabled, detail in
+                          continuation.resume(returning: (enabled, detail))
+                      }
+                  }
+              }
+          }
+          EOF
+
           python3 - <<'PY'
           from pathlib import Path
           import hashlib, json, os
           root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
-          p=root/'Services/SafariExtensionService.swift'
-          s=p.read_text()
-          old='SFSafariExtensionManager.getStateOfExtension(withIdentifier: bundleIdentifier)'
-          new='SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: bundleIdentifier)'
-          if old not in s: raise SystemExit('expected pre-fix Safari API call not found')
-          p.write_text(s.replace(old,new))
+          p=root/'project.yml'; s=p.read_text()
+          if 'SWIFT_OBJC_BRIDGING_HEADER' not in s:
+              needle='        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n'
+              if needle not in s: raise SystemExit('project bridging-header insertion point missing')
+              s=s.replace(needle, needle+'        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Services/SafariExtensionBridge.h"\n',1)
+              p.write_text(s)
+          t=root/'AppTests/ModelTests.swift'; ts=t.read_text()
+          old='    func testSafariExtensionStatusCallbackIsExecutorSafe() async {'
+          new='    @MainActor\n    func testSafariExtensionObjectiveCBridgeIsExecutorSafe() async {'
+          if old not in ts: raise SystemExit('Safari regression test normalization point missing')
+          t.write_text(ts.replace(old,new,1))
           if json.loads((root/'RELEASE-CANDIDATE-MANIFEST.json').read_text()).get('candidate') != 5: raise SystemExit('not RC5')
           roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']; files=[]
-          for d in roots: files += list((root/d).rglob('*.swift'))
+          for d in roots:
+              for ext in ('*.swift','*.h','*.m'): files += list((root/d).rglob(ext))
           files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
-          files=sorted(set(files),key=lambda p:p.relative_to(root).as_posix()); h=hashlib.sha256()
+          files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix()); h=hashlib.sha256()
           for f in files:
               h.update(f.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(f.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='89ba82ad27250acdf577d84bfc44ef61285993329f567b4e2e31ba9049e28e56'
+          actual=h.hexdigest(); expected='a0118db99efbb76b1e37531fce917e53971f387c95b583114445c271e143433d'
           print(f'RC5_FINAL_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
-          if len(files)!=23 or actual!=expected: raise SystemExit('RC5 final Xcode input closure mismatch')
-          safari_hash=hashlib.sha256(p.read_bytes()).hexdigest()
-          if safari_hash!='6d1d4557d867bc2d262fff775c65ba152560c380e5b3832dbe4b7e16ba35f700': raise SystemExit('Safari service differs from final RC5')
+          if len(files)!=25 or actual!=expected: raise SystemExit('RC5 Objective-C bridge input closure differs from final local package')
           PY
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
-          grep -F 'getStateOfSafariExtension' "$work/Services/SafariExtensionService.swift"
-          grep -F '@Sendable state, error in' "$work/Services/SafariExtensionService.swift"
-          grep -F 'testSafariExtensionStatusCallbackIsExecutorSafe' "$work/AppTests/ModelTests.swift"
+          grep -F 'SWIFT_OBJC_BRIDGING_HEADER' "$work/project.yml"
+          grep -F 'dispatch_get_main_queue' "$work/Services/SafariExtensionBridge.m"
+          grep -F '@MainActor' "$work/Services/SafariExtensionService.swift"
+          grep -F 'testSafariExtensionObjectiveCBridgeIsExecutorSafe' "$work/AppTests/ModelTests.swift"
           ! grep -F 'Dictionary(uniqueKeysWithValues:' "$work/Services/LocalStore.swift"
       - name: Validate changed macOS command scripts
         working-directory: ${{ runner.temp }}/gac-rc5
@@ -104,15 +183,15 @@ jobs:
       - name: Generate Xcode project
         working-directory: ${{ runner.temp }}/gac-rc5
         run: xcodegen generate --spec project.yml
-      - name: XCTest exactly as installer
+      - name: XCTest with SafariServices XPC regression
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-tests.log"
           if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1; then
-            echo '--- XCTest failure ---'; tail -n 320 "$log"
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 220 {} \; 2>/dev/null || true
+            echo '--- XCTest failure ---'; tail -n 360 "$log"
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 260 {} \; 2>/dev/null || true
             exit 1
           fi
           grep -E 'Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 30 || true
@@ -122,7 +201,7 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-release.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES build >"$log" 2>&1; then tail -n 320 "$log"; exit 1; fi
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES build >"$log" 2>&1; then tail -n 360 "$log"; exit 1; fi
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
           test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
           codesign --verify --deep --strict "$app"
@@ -136,24 +215,19 @@ jobs:
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
           exe="$app/Contents/MacOS/GLaDOS Account Center"
           smoke="$RUNNER_TEMP/rc5-startup-smoke.log"
-          before="$RUNNER_TEMP/crashes-before.txt"
-          during="$RUNNER_TEMP/crashes-during.txt"
+          before="$RUNNER_TEMP/crashes-before.txt"; during="$RUNNER_TEMP/crashes-during.txt"
           find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
           "$exe" >"$smoke" 2>&1 &
           pid=$!
           sleep 15
           if ! kill -0 "$pid" 2>/dev/null; then
             echo 'RC5 process exited during startup smoke.'; cat "$smoke" || true
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 240 {} \; 2>/dev/null || true
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 260 {} \; 2>/dev/null || true
             exit 1
           fi
           find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$during" || true
           new_reports=$(comm -13 "$before" "$during" || true)
-          if [[ -n "$new_reports" ]]; then
-            echo 'A new GLaDOS crash report appeared while RC5 was alive:'; printf '%s\n' "$new_reports"
-            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1
-          fi
-          echo 'RC5 remained alive for 15 seconds with no new DiagnosticReports.'
+          if [[ -n "$new_reports" ]]; then echo 'New GLaDOS crash report appeared:'; printf '%s\n' "$new_reports"; kill "$pid" 2>/dev/null || true; exit 1; fi
           /usr/bin/osascript -e 'tell application id "com.enoch.glados-account-center" to quit' >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
           for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
           kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
