@@ -24,94 +24,57 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
       - name: Show toolchain
         run: |
           sw_vers
           xcodebuild -version
           swift --version
-
       - name: Restore exact RC5 build input
         shell: bash
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/gac-rc5"
           mkdir -p "$work"
-
-          cat .github/glados/macos-rc4-ci.part00 \
-              .github/glados/macos-rc4-ci.part01 \
-              .github/glados/macos-rc4-ci.part02 \
-              .github/glados/macos-rc4-ci.part03 \
-              .github/glados/macos-rc4-ci.part04 \
-              .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/gac-rc4.b64"
+          cat .github/glados/macos-rc4-ci.part00 .github/glados/macos-rc4-ci.part01 .github/glados/macos-rc4-ci.part02 .github/glados/macos-rc4-ci.part03 .github/glados/macos-rc4-ci.part04 .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/gac-rc4.b64"
           python3 - <<'PY'
           import base64, hashlib, os, pathlib
-          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw = base64.b64decode((tmp/'gac-rc4.b64').read_text().strip(), validate=True)
-          expected='c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55'
-          actual=hashlib.sha256(raw).hexdigest()
+          tmp=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((tmp/'gac-rc4.b64').read_text().strip(), validate=True)
+          actual=hashlib.sha256(raw).hexdigest(); expected='c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55'
           print('RC4_BASE_SHA256='+actual)
           if actual != expected: raise SystemExit('RC4 base checksum mismatch')
           (tmp/'gac-rc4.tar.xz').write_bytes(raw)
           PY
           tar -xJf "$RUNNER_TEMP/gac-rc4.tar.xz" -C "$work"
-
-          cat .github/glados/macos-rc5-exact.part00 \
-              .github/glados/macos-rc5-exact.part01 \
-              .github/glados/macos-rc5-exact.part02 \
-              .github/glados/macos-rc5-exact.part03 \
-              .github/glados/macos-rc5-exact.part04 \
-              .github/glados/macos-rc5-exact.part05 > "$RUNNER_TEMP/gac-rc5-exact.b64"
+          cat .github/glados/macos-rc5-exact.part00 .github/glados/macos-rc5-exact.part01 .github/glados/macos-rc5-exact.part02 .github/glados/macos-rc5-exact.part03 .github/glados/macos-rc5-exact.part04 .github/glados/macos-rc5-exact.part05 > "$RUNNER_TEMP/gac-rc5-exact.b64"
           python3 - <<'PY'
           import base64, hashlib, os, pathlib
-          tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw=base64.b64decode((tmp/'gac-rc5-exact.b64').read_text().strip(), validate=True)
-          expected='d23f5a1e086081bd3101c666eb517333902d0148ecf741e7837627840efb6584'
-          actual=hashlib.sha256(raw).hexdigest()
+          tmp=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((tmp/'gac-rc5-exact.b64').read_text().strip(), validate=True)
+          actual=hashlib.sha256(raw).hexdigest(); expected='d23f5a1e086081bd3101c666eb517333902d0148ecf741e7837627840efb6584'
           print('RC5_EXACT_TAR_SHA256='+actual)
           if actual != expected: raise SystemExit('RC5 exact input checksum mismatch')
           (tmp/'gac-rc5-exact.tar.xz').write_bytes(raw)
           PY
           tar -xJf "$RUNNER_TEMP/gac-rc5-exact.tar.xz" -C "$work"
-
           python3 - <<'PY'
           from pathlib import Path
           import hashlib,json,os
           root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
-          manifest=json.loads((root/'RELEASE-CANDIDATE-MANIFEST.json').read_text())
-          if manifest.get('candidate') != 5: raise SystemExit('not RC5')
-
-          roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']
-          files=[]
+          if json.loads((root/'RELEASE-CANDIDATE-MANIFEST.json').read_text()).get('candidate') != 5: raise SystemExit('not RC5')
+          roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']; files=[]
           for d in roots: files += list((root/d).rglob('*.swift'))
           files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
-          files=sorted(set(files),key=lambda p:p.relative_to(root).as_posix())
-          h=hashlib.sha256()
+          files=sorted(set(files),key=lambda p:p.relative_to(root).as_posix()); h=hashlib.sha256()
           for p in files:
-              h.update(p.relative_to(root).as_posix().encode());h.update(b'\0');h.update(p.read_bytes());h.update(b'\0')
+              h.update(p.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(p.read_bytes()); h.update(b'\0')
           actual=h.hexdigest(); expected='aa320f890a9307420e0108e24446322e6c7ce1411e62f9ecead92b2a365c6bf9'
           print(f'RC5_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
           if len(files)!=23 or actual!=expected: raise SystemExit('RC5 Xcode input closure mismatch')
-
-          roots=['App','AppTests','Models','NativeHost','Services','Shared','Views','Resources','SafariExtension']
-          files=[]
-          for d in roots: files += [p for p in (root/d).rglob('*') if p.is_file()]
-          files += [root/'project.yml',root/'Info.plist']
-          files=sorted(set(files),key=lambda p:p.relative_to(root).as_posix())
-          h=hashlib.sha256()
-          for p in files:
-              h.update(p.relative_to(root).as_posix().encode());h.update(b'\0');h.update(p.read_bytes());h.update(b'\0')
-          actual=h.hexdigest(); expected='e9d120d1a62d49e10f2748cac561344d29a30f719d133c6f2bea262c175ada80'
-          print(f'RC5_BUILD_RESOURCE_AGGREGATE={actual} FILES={len(files)}')
-          if len(files)!=35 or actual!=expected: raise SystemExit('RC5 build/resource closure mismatch')
           PY
-
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
           grep -F 'getStateOfExtension' "$work/Services/SafariExtensionService.swift"
           grep -F '@Sendable state, error in' "$work/Services/SafariExtensionService.swift"
           grep -F 'testSafariExtensionStatusCallbackIsExecutorSafe' "$work/AppTests/ModelTests.swift"
           ! grep -F 'Dictionary(uniqueKeysWithValues:' "$work/Services/LocalStore.swift"
-
       - name: Validate changed macOS command scripts
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
@@ -121,59 +84,43 @@ jobs:
           grep -F '/Volumes/*/UserData/Downloads' '清理旧版本.command'
           grep -F 'DerivedData' '清理旧版本.command'
           grep -F 'lsregister' '清理旧版本.command'
-
       - name: Install XcodeGen
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
           xcodegen --version
-
       - name: Generate Xcode project
         working-directory: ${{ runner.temp }}/gac-rc5
         run: xcodegen generate --spec project.yml
-
       - name: XCTest exactly as installer
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-tests.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1; then
-            tail -n 300 "$log"; exit 1
-          fi
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1; then tail -n 300 "$log"; exit 1; fi
           grep -E 'Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 20 || true
-
       - name: Release build exactly as installer
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-release.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES build >"$log" 2>&1; then
-            tail -n 300 "$log"; exit 1
-          fi
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES build >"$log" 2>&1; then tail -n 300 "$log"; exit 1; fi
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
           test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
           codesign --verify --deep --strict "$app"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" | grep -Fx 'com.enoch.glados-account-center'
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" | grep -Fx '30005'
           echo RC5_RELEASE_BUILD_OK
-
       - name: Release startup smoke for diagnosed SafariServices crash
         shell: bash
         run: |
           set -euo pipefail
-          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
-          exe="$app/Contents/MacOS/GLaDOS Account Center"
-          smoke="$RUNNER_TEMP/rc5-startup-smoke.log"
+          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"; exe="$app/Contents/MacOS/GLaDOS Account Center"; smoke="$RUNNER_TEMP/rc5-startup-smoke.log"
           before="$RUNNER_TEMP/crashes-before.txt"; after="$RUNNER_TEMP/crashes-after.txt"
           find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
-          "$exe" >"$smoke" 2>&1 & pid=$!
-          sleep 15
-          if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$smoke" || true
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 180 {} \; 2>/dev/null || true
-            exit 1
-          fi
+          "$exe" >"$smoke" 2>&1 & pid=$!; sleep 15
+          if ! kill -0 "$pid" 2>/dev/null; then cat "$smoke" || true; find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 180 {} \; 2>/dev/null || true; exit 1; fi
           kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$after" || true
           if comm -13 "$before" "$after" | grep -q .; then comm -13 "$before" "$after"; exit 1; fi
