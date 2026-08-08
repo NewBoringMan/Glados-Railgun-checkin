@@ -6,15 +6,13 @@ on:
     branches: [v3/account-center]
     paths:
       - '.github/glados/macos-rc4-ci.part*'
-      - '.github/glados/macos-rc5.patch.part*'
-      - '.github/glados/macos-rc5-safari-hotfix.b64'
+      - '.github/glados/macos-rc5-overlay.part*'
       - '.github/workflows/v3MacRCBuild.yml'
   pull_request:
     branches: [master]
     paths:
       - '.github/glados/macos-rc4-ci.part*'
-      - '.github/glados/macos-rc5.patch.part*'
-      - '.github/glados/macos-rc5-safari-hotfix.b64'
+      - '.github/glados/macos-rc5-overlay.part*'
       - '.github/workflows/v3MacRCBuild.yml'
 
 permissions:
@@ -23,7 +21,7 @@ permissions:
 jobs:
   xcode-build:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -33,7 +31,7 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: Restore CI base and materialize exact RC5 Xcode inputs
+      - name: Restore exact RC5 source bundle
         shell: bash
         run: |
           set -euo pipefail
@@ -48,90 +46,69 @@ jobs:
               .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/gac-rc4.b64"
           python3 - <<'PY'
           import base64, hashlib, os, pathlib
-          tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw=base64.b64decode((tmp/'gac-rc4.b64').read_text().strip(), validate=True)
-          expected='c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55'
-          actual=hashlib.sha256(raw).hexdigest()
-          if actual != expected: raise SystemExit(f'RC4 base checksum mismatch: {actual}')
-          (tmp/'gac-rc4.tar.xz').write_bytes(raw)
-          print('RC4_SOURCE_SHA256='+actual)
+          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          raw = base64.b64decode((tmp / 'gac-rc4.b64').read_text().strip(), validate=True)
+          expected = 'c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55'
+          actual = hashlib.sha256(raw).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'RC4 base checksum mismatch: {actual}')
+          (tmp / 'gac-rc4.tar.xz').write_bytes(raw)
+          print('RC4_SOURCE_SHA256=' + actual)
           PY
           tar -xJf "$RUNNER_TEMP/gac-rc4.tar.xz" -C "$work"
 
-          cat .github/glados/macos-rc5.patch.part00 \
-              .github/glados/macos-rc5.patch.part01 \
-              .github/glados/macos-rc5.patch.part02 \
-              .github/glados/macos-rc5.patch.part03 \
-              .github/glados/macos-rc5.patch.part04 > "$RUNNER_TEMP/rc5-patch.b64"
+          cat .github/glados/macos-rc5-overlay.part00 \
+              .github/glados/macos-rc5-overlay.part01 \
+              .github/glados/macos-rc5-overlay.part02 \
+              .github/glados/macos-rc5-overlay.part03 \
+              .github/glados/macos-rc5-overlay.part04 \
+              .github/glados/macos-rc5-overlay.part05 > "$RUNNER_TEMP/gac-rc5-overlay.b64"
           python3 - <<'PY'
-          import base64, gzip, hashlib, os, pathlib
-          tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw=base64.b64decode((tmp/'rc5-patch.b64').read_text().strip(), validate=True)
-          expected='f6868fe3619833f16d82bb99f2ebe3ae57d5d68ff399478f621d7969e4b4c97c'
-          actual=hashlib.sha256(raw).hexdigest()
-          if actual != expected: raise SystemExit(f'RC5 patch checksum mismatch: {actual}')
-          (tmp/'rc5.patch').write_bytes(gzip.decompress(raw))
-          print('RC5_PATCH_GZIP_SHA256='+actual)
+          import base64, hashlib, os, pathlib
+          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          raw = base64.b64decode((tmp / 'gac-rc5-overlay.b64').read_text().strip(), validate=True)
+          expected = 'bee8ea2d48b822e7e180c303b0715ff15e2af7c543c4742042871546986ff90c'
+          actual = hashlib.sha256(raw).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'RC5 overlay checksum mismatch: {actual}')
+          (tmp / 'gac-rc5-overlay.tar.xz').write_bytes(raw)
+          print('RC5_OVERLAY_SHA256=' + actual)
           PY
-
-          set +e
-          (cd "$work" && patch --batch -p1 < "$RUNNER_TEMP/rc5.patch")
-          patch_status=$?
-          set -e
-          echo "compatibility patch status=$patch_status (historic fixture lacks packaging-only files)"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import os
-          root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
-          p=root/'project.yml'; s=p.read_text()
-          if 'TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GLaDOS Account Center.app/Contents/MacOS/GLaDOS Account Center"' not in s:
-              needle='''        PRODUCT_BUNDLE_IDENTIFIER: com.enoch.glados-account-center.tests\n        GENERATE_INFOPLIST_FILE: YES\n        CODE_SIGN_STYLE: Manual\n        CODE_SIGN_IDENTITY: "-"\n'''
-              repl=needle+'''        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GLaDOS Account Center.app/Contents/MacOS/GLaDOS Account Center"\n        BUNDLE_LOADER: "$(TEST_HOST)"\n'''
-              if needle not in s: raise SystemExit('test target normalization pattern missing')
-              p.write_text(s.replace(needle,repl))
-          t=root/'AppTests/ModelTests.swift'; ts=t.read_text()
-          if '@testable import GLaDOSAccountCenter' in ts:
-              t.write_text(ts.replace('@testable import GLaDOSAccountCenter','@testable import GLaDOS_Account_Center'))
-          PY
+          tar -xJf "$RUNNER_TEMP/gac-rc5-overlay.tar.xz" -C "$work"
+          if [[ -f "$work/.rc5-delete-list" ]]; then
+            while IFS= read -r rel; do
+              [[ -z "$rel" ]] && continue
+              rm -f "$work/$rel"
+            done < "$work/.rc5-delete-list"
+            rm -f "$work/.rc5-delete-list"
+          fi
 
           python3 - <<'PY'
-          import base64, gzip, hashlib, os, pathlib
-          tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw=base64.b64decode(pathlib.Path('.github/glados/macos-rc5-safari-hotfix.b64').read_text().strip(), validate=True)
-          expected='6e5e0620ea657b023dbbbbc2fbf9ebc26dfd1cf42fc634b63baa513c82d4de6f'
-          actual=hashlib.sha256(raw).hexdigest()
-          if actual != expected: raise SystemExit(f'RC5 Safari hotfix checksum mismatch: {actual}')
-          (tmp/'rc5-safari-hotfix.patch').write_bytes(gzip.decompress(raw))
-          print('RC5_SAFARI_HOTFIX_GZIP_SHA256='+actual)
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gac-rc5'
+          manifest = json.loads((root / 'RELEASE-CANDIDATE-MANIFEST.json').read_text())
+          if manifest.get('candidate') != 5:
+              raise SystemExit(f"expected RC5 manifest, got {manifest.get('candidate')!r}")
+          print('RC5_MANIFEST_OK')
           PY
-          (cd "$work" && patch --batch -p1 < "$RUNNER_TEMP/rc5-safari-hotfix.patch")
-
-          # Compare exactly the source/config closure that Xcode builds.
-          python3 - <<'PY'
-          from pathlib import Path
-          import hashlib, os
-          root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
-          roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']
-          files=[]
-          for d in roots: files += list((root/d).rglob('*.swift'))
-          files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
-          files=sorted(set(files), key=lambda p:p.relative_to(root).as_posix())
-          h=hashlib.sha256()
-          for p in files:
-              rel=p.relative_to(root).as_posix().encode()
-              h.update(rel); h.update(b'\0'); h.update(p.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='aa320f890a9307420e0108e24446322e6c7ce1411e62f9ecead92b2a365c6bf9'
-          print(f'RC5_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
-          if len(files)!=23 or actual!=expected:
-              raise SystemExit('RC5 Xcode input closure differs from the release package')
-          PY
-
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
           grep -F 'getStateOfExtension' "$work/Services/SafariExtensionService.swift"
           grep -F '@Sendable state, error in' "$work/Services/SafariExtensionService.swift"
           grep -F 'testSafariExtensionStatusCallbackIsExecutorSafe' "$work/AppTests/ModelTests.swift"
           ! grep -F 'Dictionary(uniqueKeysWithValues:' "$work/Services/LocalStore.swift"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
+
+      - name: Validate command scripts and static release gates
+        working-directory: ${{ runner.temp }}/gac-rc5
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' f; do
+            echo "zsh -n: $f"
+            zsh -n "$f"
+          done < <(find . -type f -name '*.command' -print0)
+          python3 Scripts/verify_release.py
+          python3 Scripts/semantic_swift6_check.py
+          node --test Tests/*.test.js
 
       - name: Install XcodeGen
         run: |
@@ -142,7 +119,7 @@ jobs:
         working-directory: ${{ runner.temp }}/gac-rc5
         run: xcodegen generate --spec project.yml
 
-      - name: XCTest including SafariServices crash regression
+      - name: XCTest exactly as installer
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
@@ -155,11 +132,12 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" \
             CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES \
             test >"$log" 2>&1; then
-            echo '--- XCTest failure (last 300 lines) ---'; tail -n 300 "$log"
+            echo '--- XCTest failure (last 300 lines) ---'
+            tail -n 300 "$log"
             find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 160 {} \; 2>/dev/null || true
             exit 1
           fi
-          grep -E 'Test Suite .* passed|Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 30 || true
+          grep -E 'Test Suite .* passed|Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 40 || true
           tail -n 60 "$log"
 
       - name: Release build exactly as installer
@@ -175,7 +153,9 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" \
             CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES \
             build >"$log" 2>&1; then
-            echo '--- Release failure (last 300 lines) ---'; tail -n 300 "$log"; exit 1
+            echo '--- Release failure (last 300 lines) ---'
+            tail -n 300 "$log"
+            exit 1
           fi
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
           test -d "$app"
@@ -185,22 +165,31 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" | grep -Fx '30005'
           tail -n 50 "$log"
 
-      - name: Release startup smoke
+      - name: Release startup smoke for diagnosed SafariServices crash
         shell: bash
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
           exe="$app/Contents/MacOS/GLaDOS Account Center"
           smoke="$RUNNER_TEMP/rc5-startup-smoke.log"
+          before="$RUNNER_TEMP/crashes-before.txt"
+          after="$RUNNER_TEMP/crashes-after.txt"
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
           "$exe" >"$smoke" 2>&1 &
           pid=$!
-          sleep 12
+          sleep 15
           if ! kill -0 "$pid" 2>/dev/null; then
-            echo 'RC5 exited/crashed during 12-second startup smoke:'
+            echo 'RC5 exited/crashed during 15-second startup smoke:'
             cat "$smoke" || true
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 160 {} \; 2>/dev/null || true
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 180 {} \; 2>/dev/null || true
             exit 1
           fi
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$after" || true
+          if comm -13 "$before" "$after" | grep -q .; then
+            echo 'A new GLaDOS crash report appeared during smoke test:'
+            comm -13 "$before" "$after"
+            exit 1
+          fi
           echo 'RC5_STARTUP_SMOKE_OK'
