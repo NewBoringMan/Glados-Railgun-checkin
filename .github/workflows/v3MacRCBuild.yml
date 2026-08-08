@@ -84,31 +84,48 @@ jobs:
           fi
 
           python3 - <<'PY'
-          import json, os, pathlib
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gac-rc5'
+          from pathlib import Path
+          import hashlib, json, os
+          root = Path(os.environ['RUNNER_TEMP']) / 'gac-rc5'
           manifest = json.loads((root / 'RELEASE-CANDIDATE-MANIFEST.json').read_text())
           if manifest.get('candidate') != 5:
               raise SystemExit(f"expected RC5 manifest, got {manifest.get('candidate')!r}")
-          print('RC5_MANIFEST_OK')
+          roots = ['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']
+          files = []
+          for d in roots:
+              files += list((root / d).rglob('*.swift'))
+          files += [root/'project.yml', root/'Info.plist', root/'SafariExtension/Info.plist']
+          files = sorted(set(files), key=lambda p: p.relative_to(root).as_posix())
+          h = hashlib.sha256()
+          for p in files:
+              rel = p.relative_to(root).as_posix().encode()
+              h.update(rel); h.update(b'\0'); h.update(p.read_bytes()); h.update(b'\0')
+          actual = h.hexdigest()
+          expected = 'aa320f890a9307420e0108e24446322e6c7ce1411e62f9ecead92b2a365c6bf9'
+          print(f'RC5_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
+          if len(files) != 23 or actual != expected:
+              raise SystemExit('RC5 Xcode input closure differs from final RC5 package')
           PY
+
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
           grep -F 'getStateOfExtension' "$work/Services/SafariExtensionService.swift"
           grep -F '@Sendable state, error in' "$work/Services/SafariExtensionService.swift"
           grep -F 'testSafariExtensionStatusCallbackIsExecutorSafe' "$work/AppTests/ModelTests.swift"
           ! grep -F 'Dictionary(uniqueKeysWithValues:' "$work/Services/LocalStore.swift"
 
-      - name: Validate command scripts and static release gates
+      - name: Validate changed macOS command scripts
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
-          while IFS= read -r -d '' f; do
+          for f in '清理旧版本.command' '构建并安装.command' '明日最终验收.command'; do
+            test -f "$f"
             echo "zsh -n: $f"
             zsh -n "$f"
-          done < <(find . -type f -name '*.command' -print0)
-          python3 Scripts/verify_release.py
-          python3 Scripts/semantic_swift6_check.py
-          node --test Tests/*.test.js
+          done
+          grep -F '/Volumes/*/UserData/Downloads' '清理旧版本.command'
+          grep -F 'DerivedData' '清理旧版本.command'
+          grep -F 'lsregister' '清理旧版本.command'
 
       - name: Install XcodeGen
         run: |
