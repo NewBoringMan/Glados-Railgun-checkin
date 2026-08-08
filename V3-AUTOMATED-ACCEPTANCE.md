@@ -49,21 +49,20 @@ Implemented machine gates include:
 - package structure/privacy/installer/rollback invariants
 - GET-only GitHub Canary
 
-### Known real-account result
+### Current real-account result
 
-The current five-slot GET-only Canary proves four independent existing account Secrets are readable. Slot 3 fails because the matching dedicated account Secret is empty/missing. No check-in or exchange POST is sent by that Canary. The account remains in configuration and is deliberately not silently skipped or deleted.
+The managed account set was synchronized after the old `332A23567057FBF5` account was replaced by `69B9338D952FEE8D`. The subsequent five-slot GET-only Canary completed successfully for slots 1–5. All five current independent GitHub account Secrets are therefore readable by the V3 RC workflow. The Canary sent no check-in or exchange POSTs.
 
 ## Remaining human-only release gates
 
 1. full Xcode Release build + XCTest + codesign
 2. V2 → V3 in-place install and legacy-copy cleanup
 3. Safari extension enablement / optional companion extension loading
-4. five-account Keychain re-capture and independent GitHub Secret health 5/5
-5. local GLaDOS direct read-only refresh 5/5
-6. GET-only cloud Canary 5/5
-7. one controlled RC primary + recovery live Canary with no duplicate side effect
-8. merge Draft PR while V3 production schedule remains disarmed
-9. verify one manual V3 primary on `master`
-10. retire V2 schedule and arm V3 schedule as the explicit final cutover
+4. five-account Keychain health 5/5
+5. local GLaDOS direct read-only refresh 5/5 and visible data sanity check
+6. one controlled RC primary + recovery live Canary with no duplicate side effect
+7. merge Draft PR while V3 production schedule remains disarmed
+8. verify one manual V3 primary on `master`
+9. retire V2 schedule and arm V3 schedule as the explicit final cutover
 
 Until those pass, PR #1 remains Draft and production `master` remains V2. A PR merge by itself cannot activate V3 scheduled sign-in while the production arm is false.
