@@ -1,0 +1,58 @@
+name: GLaDOS V3 RC5 XCTest Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v3/account-center]
+    paths:
+      - '.github/workflows/v3MacRC5Diag.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Restore exact RC5 input
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/gac-rc5"; mkdir -p "$work"
+          cat .github/glados/macos-rc4-ci.part00 .github/glados/macos-rc4-ci.part01 .github/glados/macos-rc4-ci.part02 .github/glados/macos-rc4-ci.part03 .github/glados/macos-rc4-ci.part04 .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/base.b64"
+          python3 - <<'PY'
+          import base64,os,pathlib
+          t=pathlib.Path(os.environ['RUNNER_TEMP']); (t/'base.tar.xz').write_bytes(base64.b64decode((t/'base.b64').read_text().strip(),validate=True))
+          PY
+          tar -xJf "$RUNNER_TEMP/base.tar.xz" -C "$work"
+          cat .github/glados/macos-rc5-exact.part00 .github/glados/macos-rc5-exact.part01 .github/glados/macos-rc5-exact.part02 .github/glados/macos-rc5-exact.part03 .github/glados/macos-rc5-exact.part04 .github/glados/macos-rc5-exact.part05 > "$RUNNER_TEMP/rc5.b64"
+          python3 - <<'PY'
+          import base64,hashlib,os,pathlib
+          t=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((t/'rc5.b64').read_text().strip(),validate=True)
+          actual=hashlib.sha256(raw).hexdigest(); expected='d23f5a1e086081bd3101c666eb517333902d0148ecf741e7837627840efb6584'
+          print('RC5_EXACT_TAR_SHA256='+actual)
+          if actual!=expected: raise SystemExit('RC5 exact checksum mismatch')
+          (t/'rc5.tar.xz').write_bytes(raw)
+          PY
+          tar -xJf "$RUNNER_TEMP/rc5.tar.xz" -C "$work"
+      - name: Generate project
+        working-directory: ${{ runner.temp }}/gac-rc5
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen >/dev/null
+          xcodegen generate --spec project.yml
+      - name: Run XCTest with compact failure report
+        working-directory: ${{ runner.temp }}/gac-rc5
+        shell: bash
+        run: |
+          set +e
+          log="$RUNNER_TEMP/test.log"
+          xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1
+          rc=$?
+          echo "XCODEBUILD_RC=$rc"
+          echo '--- error/failure summary ---'
+          grep -Ei 'error:|failed|failure|fatal|assert|signal|sigtrap|crash|test case|test suite|executed [0-9]+ tests|TEST (SUCCEEDED|FAILED)' "$log" | tail -n 140 || true
+          echo '--- recent GLaDOS crash reports ---'
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -10 -print | while IFS= read -r f; do echo "--- $f ---"; grep -E 'exception|termination|triggered|SafariExtensionService|swift_task|dispatch|SIG|abort|assert' "$f" | head -n 100 || true; done
+          exit "$rc"
