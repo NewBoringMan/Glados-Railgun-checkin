@@ -5,12 +5,12 @@ on:
   push:
     branches: [v3/account-center]
     paths:
-      - '.github/glados/macos-rc4-ci.tar.gz.b64'
+      - '.github/glados/macos-rc4-ci.part*'
       - '.github/workflows/v3MacRCBuild.yml'
   pull_request:
     branches: [master]
     paths:
-      - '.github/glados/macos-rc4-ci.tar.gz.b64'
+      - '.github/glados/macos-rc4-ci.part*'
       - '.github/workflows/v3MacRCBuild.yml'
 
 permissions:
@@ -30,13 +30,28 @@ jobs:
       - name: Restore RC4 source bundle
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/gac-rc4"
+          cat .github/glados/macos-rc4-ci.part00 \
+              .github/glados/macos-rc4-ci.part01 \
+              .github/glados/macos-rc4-ci.part02 \
+              .github/glados/macos-rc4-ci.part03 \
+              .github/glados/macos-rc4-ci.part04 \
+              .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/gac-rc4.b64"
           python3 - <<'PY'
-          import base64, pathlib
-          src=pathlib.Path('.github/glados/macos-rc4-ci.tar.gz.b64').read_text().strip()
-          pathlib.Path('/tmp/gac-rc4.tar.gz').write_bytes(base64.b64decode(src))
+          import base64, hashlib, os, pathlib
+          src = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gac-rc4.b64'
+          raw = base64.b64decode(src.read_text().strip(), validate=True)
+          expected = 'c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55'
+          actual = hashlib.sha256(raw).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'RC4 source bundle checksum mismatch: {actual}')
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'gac-rc4.tar.xz').write_bytes(raw)
+          print('RC4_SOURCE_SHA256=' + actual)
           PY
-          tar -xzf /tmp/gac-rc4.tar.gz -C "$RUNNER_TEMP/gac-rc4"
+          tar -xJf "$RUNNER_TEMP/gac-rc4.tar.xz" -C "$RUNNER_TEMP/gac-rc4"
+          test -f "$RUNNER_TEMP/gac-rc4/project.yml"
+          test -f "$RUNNER_TEMP/gac-rc4/Views/SecondaryViews.swift"
       - name: Install XcodeGen
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
