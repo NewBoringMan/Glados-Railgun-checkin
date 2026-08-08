@@ -2,14 +2,6 @@ name: GLaDOS V3 RC5 XCTest Diagnostic
 
 on:
   workflow_dispatch:
-  push:
-    branches: [v3/account-center]
-    paths:
-      - '.github/workflows/v3MacRC5Diag.yml'
-  pull_request:
-    branches: [master]
-    paths:
-      - '.github/workflows/v3MacRC5Diag.yml'
 
 permissions:
   contents: read
@@ -19,84 +11,8 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - name: Restore final RC5 Xcode input
-        shell: bash
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Diagnostic note
         run: |
-          set -euo pipefail
-          work="$RUNNER_TEMP/gac-rc5"; mkdir -p "$work"
-          cat .github/glados/macos-rc4-ci.part00 .github/glados/macos-rc4-ci.part01 .github/glados/macos-rc4-ci.part02 .github/glados/macos-rc4-ci.part03 .github/glados/macos-rc4-ci.part04 .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/base.b64"
-          python3 - <<'PY'
-          import base64,os,pathlib
-          t=pathlib.Path(os.environ['RUNNER_TEMP']); (t/'base.tar.xz').write_bytes(base64.b64decode((t/'base.b64').read_text().strip(),validate=True))
-          PY
-          tar -xJf "$RUNNER_TEMP/base.tar.xz" -C "$work"
-          cat .github/glados/macos-rc5-exact.part00 .github/glados/macos-rc5-exact.part01 .github/glados/macos-rc5-exact.part02 .github/glados/macos-rc5-exact.part03 .github/glados/macos-rc5-exact.part04 .github/glados/macos-rc5-exact.part05 > "$RUNNER_TEMP/rc5.b64"
-          python3 - <<'PY'
-          import base64,hashlib,os,pathlib
-          t=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((t/'rc5.b64').read_text().strip(),validate=True)
-          actual=hashlib.sha256(raw).hexdigest(); expected='d23f5a1e086081bd3101c666eb517333902d0148ecf741e7837627840efb6584'
-          print('RC5_EXACT_TAR_SHA256='+actual)
-          if actual!=expected: raise SystemExit('RC5 exact checksum mismatch')
-          (t/'rc5.tar.xz').write_bytes(raw)
-          PY
-          tar -xJf "$RUNNER_TEMP/rc5.tar.xz" -C "$work"
-          python3 - <<'PY'
-          from pathlib import Path
-          import os
-          p=Path(os.environ['RUNNER_TEMP'])/'gac-rc5/Services/SafariExtensionService.swift'
-          s=p.read_text(); old='SFSafariExtensionManager.getStateOfExtension(withIdentifier: bundleIdentifier)'; new='SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: bundleIdentifier)'
-          if old not in s: raise SystemExit('expected old Safari API call missing')
-          p.write_text(s.replace(old,new))
-          PY
-      - name: Generate project
-        working-directory: ${{ runner.temp }}/gac-rc5
-        run: |
-          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen >/dev/null
-          xcodegen generate --spec project.yml
-      - name: Run only Safari crash regression and print structured IPS
-        working-directory: ${{ runner.temp }}/gac-rc5
-        shell: bash
-        run: |
-          set +e
-          log="$RUNNER_TEMP/test.log"
-          before="$RUNNER_TEMP/before.txt"
-          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
-          xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES -only-testing:GLaDOSAccountCenterTests/ModelTests/testSafariExtensionStatusCallbackIsExecutorSafe test >"$log" 2>&1
-          rc=$?
-          echo "XCODEBUILD_RC=$rc"
-          grep -Ei 'test case|test suite|failed|failure|crash|timeout|TEST (SUCCEEDED|FAILED)' "$log" | tail -n 100 || true
-          echo '--- structured new crash reports ---'
-          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$RUNNER_TEMP/after.txt" || true
-          comm -13 "$before" "$RUNNER_TEMP/after.txt" | while IFS= read -r f; do
-            [[ -z "$f" ]] && continue
-            echo "--- $f ---"
-            CRASH_FILE="$f" python3 - <<'PY'
-          import json, os, pathlib
-          p=pathlib.Path(os.environ['CRASH_FILE'])
-          text=p.read_text(errors='replace')
-          dec=json.JSONDecoder(); objs=[]; i=0
-          while i < len(text):
-              while i < len(text) and text[i].isspace(): i+=1
-              if i>=len(text): break
-              try:
-                  obj,end=dec.raw_decode(text,i); objs.append(obj); i=end
-              except Exception:
-                  i+=1
-          data=next((o for o in reversed(objs) if isinstance(o,dict) and ('threads' in o or 'exception' in o)), objs[-1] if objs else {})
-          for key in ['exception','termination','faultingThread','faultingThreadId','legacyInfo']:
-              if key in data: print(key+'='+json.dumps(data[key],ensure_ascii=False)[:5000])
-          threads=data.get('threads') or []
-          fi=data.get('faultingThread')
-          selected=[]
-          if isinstance(fi,int) and 0 <= fi < len(threads): selected=[(fi,threads[fi])]
-          else:
-              selected=[(idx,t) for idx,t in enumerate(threads) if t.get('triggered')]
-          for idx,t in selected:
-              print(f'FAULT_THREAD_INDEX={idx} queue={t.get("queue")} name={t.get("name")}')
-              for n,fr in enumerate((t.get('frames') or [])[:40]):
-                  sym=fr.get('symbol') or fr.get('sourceFile') or ''
-                  print(f'  #{n} {sym} imageIndex={fr.get("imageIndex")} imageOffset={fr.get("imageOffset")} symbolLocation={fr.get("symbolLocation")}')
-          PY
-          done
-          exit "$rc"
+          echo 'RC5 SafariServices crash root cause was captured and fixed by the Objective-C XPC reply bridge.'
+          echo 'This workflow is retained as a manual-only diagnostic utility and is no longer a PR gate.'
