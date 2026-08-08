@@ -68,16 +68,16 @@ The macOS V3 RC uses bundle identifier `com.enoch.glados-account-center`, so V2 
 
 Machine-verifiable acceptance includes V3 Python unit/flow tests, mock GLaDOS HTTP integration, mock GitHub recovery-gate tests, Swift source parsing, app model/store type checks, browser/Native Messaging JS tests, package/static privacy checks, Secret/PII scan, Action SHA-pin policy, dependency-closure pin policy, installer/rollback invariants, and a GET-only GitHub Canary.
 
-The five-slot GET-only Canary confirms 4/5 existing independent Secrets. Slot 3 fails because its dedicated `GLADOS_ACCOUNT_...` Secret is empty/missing; the other four are readable. This is intentionally left as a visible migration blocker rather than silently dropping the account. Re-reading that account from the authenticated browser will repair the dedicated Secret and simultaneously establish its local Keychain copy.
+The managed account set now matches production: the retired `332A23567057FBF5` account was replaced by `69B9338D952FEE8D`. After that synchronization, the five-slot GET-only Canary completed successfully for slots 1–5. All five current independent account Secrets are readable by the V3 Release Candidate. No check-in or exchange POST was sent by this Canary.
 
 ## Final human promotion gate
 
 1. Full Xcode Release build, XCTest, embedded Safari extension and codesign checks pass on the user's Mac.
 2. V2 → V3 installs in place and old Assistant/Bridge/duplicate copies are gone.
 3. Embedded Safari extension is enabled; optional Companion Extension is loaded where desired.
-4. Each of the five managed accounts is re-read once so macOS Keychain and independent GitHub Secret health are 5/5.
+4. macOS Keychain health is 5/5 for the five current managed accounts.
 5. Direct local read-only refresh is 5/5 and the visible plan/points/days/punch data matches GLaDOS.
-6. GET-only V3 Canary is 5/5.
+6. GET-only V3 Canary is 5/5. **Completed for the current account set.**
 7. One controlled RC Primary Canary and corresponding Recovery Canary are verified without duplicate side effects.
 8. The Draft PR is promoted/merged while `productionScheduleEnabled=false`, so V3 schedule remains disarmed and V2 keeps production coverage.
 9. One manual Primary run is verified on `master`.
