@@ -52,7 +52,7 @@ jobs:
           tar -xJf "$RUNNER_TEMP/gac-rc4.tar.xz" -C "$RUNNER_TEMP/gac-rc4"
           test -f "$RUNNER_TEMP/gac-rc4/project.yml"
           test -f "$RUNNER_TEMP/gac-rc4/Views/SecondaryViews.swift"
-      - name: Apply RC4 test-host project fix
+      - name: Apply RC4 project/test fixes
         working-directory: ${{ runner.temp }}/gac-rc4
         shell: bash
         run: |
@@ -65,8 +65,14 @@ jobs:
           if needle not in s:
               raise SystemExit('RC4 project.yml test target pattern not found')
           p.write_text(s.replace(needle,replacement))
+          t=Path('AppTests/ModelTests.swift')
+          ts=t.read_text()
+          if '@testable import GLaDOSAccountCenter' not in ts:
+              raise SystemExit('RC4 test import pattern not found')
+          t.write_text(ts.replace('@testable import GLaDOSAccountCenter','@testable import GLaDOS_Account_Center'))
           PY
           grep -F 'TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GLaDOS Account Center.app/Contents/MacOS/GLaDOS Account Center"' project.yml
+          grep -F '@testable import GLaDOS_Account_Center' AppTests/ModelTests.swift
       - name: Install XcodeGen
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
@@ -80,16 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-release.log"
-          if ! xcodebuild \
-            -project GLaDOSAccountCenter.xcodeproj \
-            -scheme GLaDOSAccountCenter \
-            -configuration Release \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build >"$log" 2>&1; then
-            tail -n 250 "$log"
-            exit 1
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build >"$log" 2>&1; then
+            tail -n 250 "$log"; exit 1
           fi
           tail -n 40 "$log"
       - name: Build tests
@@ -98,17 +96,7 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-tests.log"
-          if ! xcodebuild \
-            -project GLaDOSAccountCenter.xcodeproj \
-            -scheme GLaDOSAccountCenter \
-            -configuration Debug \
-            -destination 'platform=macOS' \
-            -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            build-for-testing >"$log" 2>&1; then
-            echo '--- xcodebuild test failure (last 250 lines) ---'
-            tail -n 250 "$log"
-            exit 1
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -destination 'platform=macOS' -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build-for-testing >"$log" 2>&1; then
+            echo '--- xcodebuild test failure (last 250 lines) ---'; tail -n 250 "$log"; exit 1
           fi
           tail -n 60 "$log"
