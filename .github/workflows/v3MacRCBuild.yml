@@ -80,8 +80,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in '清理旧版本.command' '构建并安装.command' '明日最终验收.command'; do zsh -n "$f"; done
-          grep -F '/Volumes/*/UserData/Downloads' '清理旧版本.command'
+          for f in '清理旧版本.command' '构建并安装.command' '明日最终验收.command'; do echo "zsh -n: $f"; zsh -n "$f"; done
+          grep -F '/usr/bin/find /Volumes' '清理旧版本.command'
+          grep -F 'UserData/Downloads' '清理旧版本.command'
           grep -F 'DerivedData' '清理旧版本.command'
           grep -F 'lsregister' '清理旧版本.command'
       - name: Install XcodeGen
