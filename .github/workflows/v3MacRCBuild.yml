@@ -156,7 +156,7 @@ jobs:
           files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix()); h=hashlib.sha256()
           for f in files:
               h.update(f.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(f.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='a0118db99efbb76b1e37531fce917e53971f387c95b583114445c271e143433d'
+          actual=h.hexdigest(); expected='77430e8ec3a954f2bf6b497532fc38094977ac7ff72679de04a3647712119a4c'
           print(f'RC5_FINAL_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
           if len(files)!=25 or actual!=expected: raise SystemExit('RC5 Objective-C bridge input closure differs from final local package')
           PY
