@@ -145,21 +145,32 @@ jobs:
           s=s.replace(app_old,app_new,1)
           ext_old='''        APPLICATION_EXTENSION_API_ONLY: YES\n'''; ext_new='''        APPLICATION_EXTENSION_API_ONLY: YES\n        CURRENT_PROJECT_VERSION: 30005\n        MARKETING_VERSION: 3.0.0\n'''
           if ext_old not in s: raise SystemExit('extension target insertion point missing')
-          p.write_text(s.replace(ext_old,ext_new,1))
+          s=s.replace(ext_old,ext_new,1)
+
+          main_info='''    info:\n      path: Info.plist\n'''
+          ext_info='''    info:\n      path: SafariExtension/Info.plist\n'''
+          if main_info not in s or ext_info not in s: raise SystemExit('XcodeGen info generation blocks missing')
+          s=s.replace(main_info,'',1).replace(ext_info,'',1)
+          main_settings='''        GENERATE_INFOPLIST_FILE: NO\n        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n'''
+          main_repl='''        GENERATE_INFOPLIST_FILE: NO\n        INFOPLIST_FILE: Info.plist\n        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n'''
+          ext_settings='''        GENERATE_INFOPLIST_FILE: NO\n        SKIP_INSTALL: YES\n'''
+          ext_repl='''        GENERATE_INFOPLIST_FILE: NO\n        INFOPLIST_FILE: SafariExtension/Info.plist\n        SKIP_INSTALL: YES\n'''
+          if main_settings not in s or ext_settings not in s: raise SystemExit('INFOPLIST insertion points missing')
+          s=s.replace(main_settings,main_repl,1).replace(ext_settings,ext_repl,1)
+          p.write_text(s)
+
           t=root/'AppTests/ModelTests.swift'; ts=t.read_text(); old='    func testSafariExtensionStatusCallbackIsExecutorSafe() async {'; new='    @MainActor\n    func testSafariExtensionObjectiveCBridgeIsExecutorSafe() async {'
           if old not in ts: raise SystemExit('test normalization point missing')
           t.write_text(ts.replace(old,new,1))
 
           expected={}
           for line in Path('.github/glados/macos-rc5-final-hashes.txt').read_text().splitlines():
-              if line.strip():
-                  digest,path=line.split(' ',1); expected[path]=digest
+              if line.strip(): digest,path=line.split(' ',1); expected[path]=digest
           roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']; files=[]
           for d in roots:
               for ext in ('*.swift','*.h','*.m'): files += list((root/d).rglob(ext))
           files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
-          files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix())
-          bad=[]
+          files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix()); bad=[]
           for f in files:
               rel=f.relative_to(root).as_posix(); actual=hashlib.sha256(f.read_bytes()).hexdigest(); want=expected.get(rel)
               if actual!=want: bad.append((rel,want,actual))
@@ -178,9 +189,19 @@ jobs:
       - name: Install XcodeGen
         run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
 
-      - name: Generate project
+      - name: Generate project without rewriting plist
         working-directory: ${{ runner.temp }}/gac-rc5
-        run: xcodegen generate --spec project.yml
+        shell: bash
+        run: |
+          set -euo pipefail
+          before_main=$(shasum -a 256 Info.plist | awk '{print $1}')
+          before_ext=$(shasum -a 256 SafariExtension/Info.plist | awk '{print $1}')
+          xcodegen generate --spec project.yml
+          after_main=$(shasum -a 256 Info.plist | awk '{print $1}')
+          after_ext=$(shasum -a 256 SafariExtension/Info.plist | awk '{print $1}')
+          [[ "$before_main" == "$after_main" && "$before_ext" == "$after_ext" ]] || { echo 'XcodeGen rewrote an RC5 plist'; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist | grep -Fx '30005'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist | grep -Fx '3.0.0'
 
       - name: XCTest
         working-directory: ${{ runner.temp }}/gac-rc5
