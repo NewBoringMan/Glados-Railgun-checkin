@@ -79,7 +79,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: pip install -r requirements-v3.txt
-      - name: Skip when primary slot already succeeded
+      - name: Skip when matching primary already succeeded
         id: recovery_gate
         if: ${{ needs.prepare.outputs.run_mode == 'recovery' }}
         shell: bash
@@ -88,8 +88,15 @@ jobs:
           GH_REPO: ${{ github.repository }}
           CURRENT_RUN_ID: ${{ github.run_id }}
           SLOT: ${{ matrix.slot }}
+          LOCK_ID: ${{ matrix.lock_id }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          skip="$(python3 scripts/v3_recovery_gate.py --repo "$GH_REPO" --current-run "$CURRENT_RUN_ID" --slot "$SLOT")"
+          skip="$(python3 scripts/v3_recovery_gate.py \
+            --repo "$GH_REPO" \
+            --current-run "$CURRENT_RUN_ID" \
+            --slot "$SLOT" \
+            --lock-id "$LOCK_ID" \
+            --event-name "$EVENT_NAME")"
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
       - name: Check durable exchange safety lock
         id: exchange_lock
