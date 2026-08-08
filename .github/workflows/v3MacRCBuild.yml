@@ -52,6 +52,21 @@ jobs:
           tar -xJf "$RUNNER_TEMP/gac-rc4.tar.xz" -C "$RUNNER_TEMP/gac-rc4"
           test -f "$RUNNER_TEMP/gac-rc4/project.yml"
           test -f "$RUNNER_TEMP/gac-rc4/Views/SecondaryViews.swift"
+      - name: Apply RC4 test-host project fix
+        working-directory: ${{ runner.temp }}/gac-rc4
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('project.yml')
+          s=p.read_text()
+          needle='''        PRODUCT_BUNDLE_IDENTIFIER: com.enoch.glados-account-center.tests\n        GENERATE_INFOPLIST_FILE: YES\n        CODE_SIGN_STYLE: Manual\n        CODE_SIGN_IDENTITY: "-"\n'''
+          replacement='''        PRODUCT_BUNDLE_IDENTIFIER: com.enoch.glados-account-center.tests\n        GENERATE_INFOPLIST_FILE: YES\n        CODE_SIGN_STYLE: Manual\n        CODE_SIGN_IDENTITY: "-"\n        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GLaDOS Account Center.app/Contents/MacOS/GLaDOS Account Center"\n        BUNDLE_LOADER: "$(TEST_HOST)"\n'''
+          if needle not in s:
+              raise SystemExit('RC4 project.yml test target pattern not found')
+          p.write_text(s.replace(needle,replacement))
+          PY
+          grep -F 'TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GLaDOS Account Center.app/Contents/MacOS/GLaDOS Account Center"' project.yml
       - name: Install XcodeGen
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
