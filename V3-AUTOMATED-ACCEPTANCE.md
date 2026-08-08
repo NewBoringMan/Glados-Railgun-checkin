@@ -1,4 +1,4 @@
-# V3 automated acceptance
+# V3 automated acceptance — RC5
 
 This document distinguishes machine-verifiable completion from the final user-Mac / live-account release gate.
 
@@ -7,16 +7,21 @@ This document distinguishes machine-verifiable completion from the final user-Ma
 - privacy-minimized standalone Actions runtime
 - GitHub auth/network diagnostics separated in the desktop app
 - 05:07 primary and 17:07 recovery schedule (Asia/Taipei)
-- independent `productionScheduleEnabled` arm; Release Candidate is disarmed even if merged
-- recovery suppresses a second account task only when the matching morning primary slot succeeded
+- independent `productionScheduleEnabled` arm; the Release Candidate is disarmed even if merged
+- recovery suppresses a second account task only when the matching primary already succeeded
 - monthly scheduler heartbeat
 - official GitHub Actions pinned to immutable commit SHAs
 - complete V3 Python dependency closure pinned
 - manual account workflow input uses privacy-safe lock id rather than persistent account key
+- guarded atomic V2→V3 cutover and rollback workflows
 
 ## Stage B — automated implementation complete
 
-The V3 desktop release-candidate package contains a formal Xcode/XcodeGen project with application, embedded Safari Web Extension, Native Messaging companion host and XCTest targets; macOS Keychain credential storage; durable local history/state; direct GLaDOS read-only refresh independent of GitHub; fixed bundle identifier for in-place upgrade; automatic RC→master branch following after production promotion; and backup/test/rollback-aware installation.
+The desktop RC contains a formal Xcode/XcodeGen project with the application, embedded Safari Web Extension, Native Messaging companion host and XCTest targets; macOS Keychain credential storage; durable local history/state; direct GLaDOS read-only refresh independent of GitHub; fixed bundle identifier for in-place upgrade; and backup/test/rollback-aware installation.
+
+RC5 additionally fixes the real crash diagnosed from three user `.ips` reports. SafariServices replies arrived on its private NSXPC reply queue and Swift 6 trapped in `_swift_task_checkIsolatedSwift` / `_dispatch_assert_queue_fail` before the Swift closure body could run. RC5 receives those SafariServices reply blocks in Objective-C, dispatches to the main queue, and only then invokes the `@MainActor` Swift facade. Status lookup and opening Safari extension preferences use the same bridge.
+
+RC5 also makes local-history merge duplicate-safe and preserves corrupt local state as a diagnostic copy rather than trapping on startup.
 
 ## Stage C — automated implementation complete
 
@@ -33,44 +38,48 @@ The V3 desktop release-candidate package contains a formal Xcode/XcodeGen projec
 
 The desktop RC contains Health Center, notifications, Menu Bar controls, global pause, archive/restore, search/filter/bulk management, local configuration rollback, redacted diagnostics, embedded Safari capture, optional Chromium-family/Firefox companion capture, and unified installation/update/rollback tooling.
 
-## Stage E — machine gates
+RC5 cleanup additionally covers `/Volumes/*/UserData/Downloads`, scoped GLaDOS Xcode DerivedData, and stale LaunchServices registrations. Candidate apps are revalidated by known bundle identifier before removal; current V3 data, Keychain and ordinary ZIP files are not part of cleanup.
 
-Implemented machine gates include:
+## Stage E — machine gates passed
 
-- Python V3 unit tests
-- end-to-end exchange flow tests
-- mock GLaDOS HTTP integration test
-- mock GitHub recovery-gate tests
-- Secret/PII leak scans
-- immutable Action-pin and dependency-pin policy checks
-- Swift source parse and Swift 6 strict-concurrency semantic checks
-- browser/Safari/Native Messaging JS tests
-- package structure/privacy/installer/rollback invariants
-- GET-only GitHub Canary
-- real GitHub-hosted macOS/Xcode build gate
+Machine gates include Python V3/unit/integration/flow tests, V2 regression tests, mock GLaDOS/GitHub tests, Secret/PII leak scans, immutable Action/dependency policy checks, Swift 6 strict-concurrency semantic checks, browser/Safari/Native Messaging JS tests, package structure/privacy/installer/rollback invariants, GET-only account Canary, and a real GitHub-hosted macOS/Xcode gate.
 
-### RC4 real macOS/Xcode gate
+### RC5 authoritative macOS/Xcode gate
 
-RC4 was rebuilt after fixing the SwiftUI formatting error reported from RC3. GitHub Actions run `31239860667` used a real `macos-latest` runner with Xcode 26.6 and Swift 6.3.3. The workflow executed the same two authoritative commands used by `构建并安装.command`:
+Successful workflow run: `31250096151`, job `93084986641`.
 
-1. `xcodebuild ... -configuration Debug ... CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES test`
-2. `xcodebuild ... -configuration Release ... CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES build`
+Environment: macOS 26.5.2 arm64, Xcode 26.6 (17F113), Swift 6.3.3, XcodeGen 2.46.0.
 
-Both completed successfully. The gate also verified the embedded Safari Web Extension, `codesign --verify --deep --strict`, and main bundle identifier `com.enoch.glados-account-center`.
+The gate verified:
+
+- 25 final Xcode input files byte-match the RC5 delivery source by SHA-256
+- XcodeGen does not rewrite the shipping `Info.plist` files
+- `xcodebuild test`: 11 tests, 0 failures, `TEST SUCCEEDED`
+- SafariServices XPC/Objective-C bridge regression test passes without SIGTRAP
+- Release build succeeds with ad-hoc signing
+- embedded Safari extension exists
+- `codesign --verify --deep --strict` passes
+- main bundle ID is `com.enoch.glados-account-center`
+- built `CFBundleVersion` is `30005`
+- built `CFBundleShortVersionString` is `3.0.0`
+- Release application stays alive for 15 seconds with no new DiagnosticReports (`RC5_STARTUP_SMOKE_OK`)
+
+The final packaged RC5 additionally passed 122/122 local static release checks, Swift 6 semantic acceptance, 25/25 browser/Safari/Native Messaging tests, SHA256SUMS verification after a fresh ZIP extraction, and executable-bit checks for all `.command` scripts.
 
 ### Current real-account result
 
-The managed account set matches production after replacing the retired `332A23567057FBF5` account with `69B9338D952FEE8D`. The five-slot GET-only Canary completed successfully for slots 1–5. All five current independent GitHub account Secrets are readable by the V3 RC workflow. The Canary sent no check-in or exchange POSTs.
+The managed account set matches production after replacing the retired `332A23567057FBF5` account with `69B9338D952FEE8D`. The five-slot GET-only Canary passes 5/5 and sends no check-in or exchange POSTs.
 
 ## Remaining human-only release gates
 
-1. install RC4 on the user's Mac and confirm V2 → V3 in-place upgrade / legacy-copy cleanup
-2. enable/confirm the embedded Safari extension where needed
-3. five-account Keychain health 5/5
-4. local GLaDOS direct read-only refresh 5/5 and visible-data sanity check
-5. one controlled RC primary + recovery live Canary with no duplicate side effect
-6. merge Draft PR while V3 production schedule remains disarmed
-7. verify one manual V3 primary on `master`
-8. retire V2 schedule and arm V3 schedule as the explicit final cutover
+1. install RC5 on the user's actual Mac and confirm V2→V3 in-place upgrade with no startup crash
+2. run the scoped old-version cleanup and confirm the real external Downloads / DerivedData / stale LaunchServices results
+3. enable/confirm the embedded Safari extension where needed
+4. five-account Keychain health 5/5
+5. local GLaDOS direct read-only refresh 5/5 and visible-data sanity check
+6. one controlled RC primary + recovery live Canary with no duplicate side effect
+7. merge Draft PR while V3 production schedule remains disarmed
+8. verify one manual V3 primary on `master`
+9. retire V2 schedule and arm V3 schedule through the guarded atomic cutover
 
 Until those pass, PR #1 remains Draft and production `master` remains V2. A PR merge by itself cannot activate V3 scheduled sign-in while the production arm is false.
