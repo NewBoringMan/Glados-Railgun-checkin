@@ -138,11 +138,15 @@ jobs:
           import hashlib, json, os
           root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
           p=root/'project.yml'; s=p.read_text()
+          if 'CURRENT_PROJECT_VERSION:' not in s:
+              needle='    SWIFT_STRICT_CONCURRENCY: complete\n'
+              if needle not in s: raise SystemExit('build metadata insertion point missing')
+              s=s.replace(needle, needle+'    CURRENT_PROJECT_VERSION: 30005\n    MARKETING_VERSION: 3.0.0\n',1)
           if 'SWIFT_OBJC_BRIDGING_HEADER' not in s:
               needle='        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n'
               if needle not in s: raise SystemExit('project bridging-header insertion point missing')
               s=s.replace(needle, needle+'        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Services/SafariExtensionBridge.h"\n',1)
-              p.write_text(s)
+          p.write_text(s)
           t=root/'AppTests/ModelTests.swift'; ts=t.read_text()
           old='    func testSafariExtensionStatusCallbackIsExecutorSafe() async {'
           new='    @MainActor\n    func testSafariExtensionObjectiveCBridgeIsExecutorSafe() async {'
@@ -156,11 +160,12 @@ jobs:
           files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix()); h=hashlib.sha256()
           for f in files:
               h.update(f.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(f.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='77430e8ec3a954f2bf6b497532fc38094977ac7ff72679de04a3647712119a4c'
+          actual=h.hexdigest(); expected='fffdcf695bf97fe75377efe34885094ce5f823b39f48806787bf445a09ef0426'
           print(f'RC5_FINAL_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
           if len(files)!=25 or actual!=expected: raise SystemExit('RC5 Objective-C bridge input closure differs from final local package')
           PY
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
+          grep -F 'CURRENT_PROJECT_VERSION: 30005' "$work/project.yml"
           grep -F 'SWIFT_OBJC_BRIDGING_HEADER' "$work/project.yml"
           grep -F 'dispatch_get_main_queue' "$work/Services/SafariExtensionBridge.m"
           grep -F '@MainActor' "$work/Services/SafariExtensionService.swift"
@@ -206,7 +211,9 @@ jobs:
           test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
           codesign --verify --deep --strict "$app"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" | grep -Fx 'com.enoch.glados-account-center'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" | grep -Fx '30005'
+          actual_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
+          echo "RC5_BUILT_CFBundleVersion=$actual_version"
+          [[ "$actual_version" == '30005' ]]
           echo RC5_RELEASE_BUILD_OK
       - name: Release startup smoke for diagnosed SafariServices crash
         shell: bash
