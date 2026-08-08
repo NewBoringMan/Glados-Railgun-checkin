@@ -55,23 +55,35 @@ jobs:
           (tmp/'gac-rc5-exact.tar.xz').write_bytes(raw)
           PY
           tar -xJf "$RUNNER_TEMP/gac-rc5-exact.tar.xz" -C "$work"
+
+          # RC5 API-name correction discovered by the first real Xcode 26.6 build.
+          # Immediately after this deterministic correction, the full 23-file Xcode
+          # input closure must byte-match the final local RC5 package.
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib,json,os
+          import hashlib, json, os
           root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
+          p=root/'Services/SafariExtensionService.swift'
+          s=p.read_text()
+          old='SFSafariExtensionManager.getStateOfExtension(withIdentifier: bundleIdentifier)'
+          new='SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: bundleIdentifier)'
+          if old not in s: raise SystemExit('expected pre-fix Safari API call not found')
+          p.write_text(s.replace(old,new))
           if json.loads((root/'RELEASE-CANDIDATE-MANIFEST.json').read_text()).get('candidate') != 5: raise SystemExit('not RC5')
           roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']; files=[]
           for d in roots: files += list((root/d).rglob('*.swift'))
           files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
           files=sorted(set(files),key=lambda p:p.relative_to(root).as_posix()); h=hashlib.sha256()
-          for p in files:
-              h.update(p.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(p.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='aa320f890a9307420e0108e24446322e6c7ce1411e62f9ecead92b2a365c6bf9'
-          print(f'RC5_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
-          if len(files)!=23 or actual!=expected: raise SystemExit('RC5 Xcode input closure mismatch')
+          for f in files:
+              h.update(f.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(f.read_bytes()); h.update(b'\0')
+          actual=h.hexdigest(); expected='89ba82ad27250acdf577d84bfc44ef61285993329f567b4e2e31ba9049e28e56'
+          print(f'RC5_FINAL_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
+          if len(files)!=23 or actual!=expected: raise SystemExit('RC5 final Xcode input closure mismatch')
+          safari_hash=hashlib.sha256(p.read_bytes()).hexdigest()
+          if safari_hash!='6d1d4557d867bc2d262fff775c65ba152560c380e5b3832dbe4b7e16ba35f700': raise SystemExit('Safari service differs from final RC5')
           PY
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
-          grep -F 'getStateOfExtension' "$work/Services/SafariExtensionService.swift"
+          grep -F 'getStateOfSafariExtension' "$work/Services/SafariExtensionService.swift"
           grep -F '@Sendable state, error in' "$work/Services/SafariExtensionService.swift"
           grep -F 'testSafariExtensionStatusCallbackIsExecutorSafe' "$work/AppTests/ModelTests.swift"
           ! grep -F 'Dictionary(uniqueKeysWithValues:' "$work/Services/LocalStore.swift"
@@ -98,15 +110,19 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-tests.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1; then tail -n 300 "$log"; exit 1; fi
-          grep -E 'Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 20 || true
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1; then
+            echo '--- XCTest failure ---'; tail -n 320 "$log"
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 220 {} \; 2>/dev/null || true
+            exit 1
+          fi
+          grep -E 'Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 30 || true
       - name: Release build exactly as installer
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-release.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES build >"$log" 2>&1; then tail -n 300 "$log"; exit 1; fi
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES build >"$log" 2>&1; then tail -n 320 "$log"; exit 1; fi
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
           test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
           codesign --verify --deep --strict "$app"
@@ -127,31 +143,18 @@ jobs:
           pid=$!
           sleep 15
           if ! kill -0 "$pid" 2>/dev/null; then
-            echo 'RC5 process exited during startup smoke.'
-            cat "$smoke" || true
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 220 {} \; 2>/dev/null || true
+            echo 'RC5 process exited during startup smoke.'; cat "$smoke" || true
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 240 {} \; 2>/dev/null || true
             exit 1
           fi
           find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$during" || true
           new_reports=$(comm -13 "$before" "$during" || true)
           if [[ -n "$new_reports" ]]; then
-            echo 'A new GLaDOS crash report appeared while RC5 was still alive:'
-            printf '%s\n' "$new_reports"
-            while IFS= read -r report; do
-              [[ -z "$report" ]] && continue
-              echo "--- $report ---"
-              tail -n 240 "$report" || true
-            done <<< "$new_reports"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            exit 1
+            echo 'A new GLaDOS crash report appeared while RC5 was alive:'; printf '%s\n' "$new_reports"
+            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1
           fi
           echo 'RC5 remained alive for 15 seconds with no new DiagnosticReports.'
           /usr/bin/osascript -e 'tell application id "com.enoch.glados-account-center" to quit' >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
-          for _ in 1 2 3 4 5; do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 1
-          done
-          kill "$pid" 2>/dev/null || true
-          wait "$pid" 2>/dev/null || true
+          for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           echo RC5_STARTUP_SMOKE_OK
