@@ -117,12 +117,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"; exe="$app/Contents/MacOS/GLaDOS Account Center"; smoke="$RUNNER_TEMP/rc5-startup-smoke.log"
-          before="$RUNNER_TEMP/crashes-before.txt"; after="$RUNNER_TEMP/crashes-after.txt"
+          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
+          exe="$app/Contents/MacOS/GLaDOS Account Center"
+          smoke="$RUNNER_TEMP/rc5-startup-smoke.log"
+          before="$RUNNER_TEMP/crashes-before.txt"
+          during="$RUNNER_TEMP/crashes-during.txt"
           find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
-          "$exe" >"$smoke" 2>&1 & pid=$!; sleep 15
-          if ! kill -0 "$pid" 2>/dev/null; then cat "$smoke" || true; find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 180 {} \; 2>/dev/null || true; exit 1; fi
-          kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$after" || true
-          if comm -13 "$before" "$after" | grep -q .; then comm -13 "$before" "$after"; exit 1; fi
+          "$exe" >"$smoke" 2>&1 &
+          pid=$!
+          sleep 15
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo 'RC5 process exited during startup smoke.'
+            cat "$smoke" || true
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 220 {} \; 2>/dev/null || true
+            exit 1
+          fi
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$during" || true
+          new_reports=$(comm -13 "$before" "$during" || true)
+          if [[ -n "$new_reports" ]]; then
+            echo 'A new GLaDOS crash report appeared while RC5 was still alive:'
+            printf '%s\n' "$new_reports"
+            while IFS= read -r report; do
+              [[ -z "$report" ]] && continue
+              echo "--- $report ---"
+              tail -n 240 "$report" || true
+            done <<< "$new_reports"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          echo 'RC5 remained alive for 15 seconds with no new DiagnosticReports.'
+          /usr/bin/osascript -e 'tell application id "com.enoch.glados-account-center" to quit' >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
+          for _ in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
           echo RC5_STARTUP_SMOKE_OK
