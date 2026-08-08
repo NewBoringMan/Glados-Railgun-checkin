@@ -1,4 +1,5 @@
 name: GLaDOS V3 macOS RC Build
+# final-rc5-gate
 
 on:
   workflow_dispatch:
@@ -161,11 +162,9 @@ jobs:
           bad=[]
           for f in files:
               rel=f.relative_to(root).as_posix(); actual=hashlib.sha256(f.read_bytes()).hexdigest(); want=expected.get(rel)
-              print(actual,rel)
               if actual!=want: bad.append((rel,want,actual))
           if len(files)!=25 or len(expected)!=25: bad.append(('COUNT','25',f'files={len(files)} expected={len(expected)}'))
           if bad:
-              print('--- RC5 BYTE MISMATCHES ---')
               for rel,want,actual in bad: print(rel,'expected=',want,'actual=',actual)
               raise SystemExit('RC5 Xcode inputs do not byte-match final local package')
           print('RC5_XCODE_INPUTS_BYTE_MATCH_OK')
