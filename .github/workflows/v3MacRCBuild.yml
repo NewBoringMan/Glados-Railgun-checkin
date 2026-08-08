@@ -71,8 +71,6 @@ jobs:
               raise SystemExit('RC4 test import pattern not found')
           t.write_text(ts.replace('@testable import GLaDOSAccountCenter','@testable import GLaDOS_Account_Center'))
           PY
-          grep -F 'TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GLaDOS Account Center.app/Contents/MacOS/GLaDOS Account Center"' project.yml
-          grep -F '@testable import GLaDOS_Account_Center' AppTests/ModelTests.swift
       - name: Install XcodeGen
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
@@ -80,23 +78,40 @@ jobs:
       - name: Generate Xcode project
         working-directory: ${{ runner.temp }}/gac-rc4
         run: xcodegen generate --spec project.yml
-      - name: Release build
-        working-directory: ${{ runner.temp }}/gac-rc4
-        shell: bash
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/xcodebuild-release.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build >"$log" 2>&1; then
-            tail -n 250 "$log"; exit 1
-          fi
-          tail -n 40 "$log"
-      - name: Build tests
+      - name: XCTest exactly as installer
         working-directory: ${{ runner.temp }}/gac-rc4
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/xcodebuild-tests.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -destination 'platform=macOS' -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build-for-testing >"$log" 2>&1; then
-            echo '--- xcodebuild test failure (last 250 lines) ---'; tail -n 250 "$log"; exit 1
+          if ! xcodebuild \
+            -project GLaDOSAccountCenter.xcodeproj \
+            -scheme GLaDOSAccountCenter \
+            -configuration Debug \
+            -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES \
+            test >"$log" 2>&1; then
+            echo '--- XCTest failure (last 250 lines) ---'; tail -n 250 "$log"; exit 1
           fi
+          tail -n 80 "$log"
+      - name: Release build exactly as installer
+        working-directory: ${{ runner.temp }}/gac-rc4
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/xcodebuild-release.log"
+          if ! xcodebuild \
+            -project GLaDOSAccountCenter.xcodeproj \
+            -scheme GLaDOSAccountCenter \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES \
+            build >"$log" 2>&1; then
+            echo '--- Release failure (last 250 lines) ---'; tail -n 250 "$log"; exit 1
+          fi
+          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
+          test -d "$app"
+          test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
+          codesign --verify --deep --strict "$app"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" | grep -Fx 'com.enoch.glados-account-center'
           tail -n 60 "$log"
