@@ -51,7 +51,7 @@ Implemented machine gates include:
 
 ### Current real-account result
 
-The managed account set was synchronized after the old `332A23567057FBF5` account was replaced by `69B9338D952FEE8D`. The subsequent five-slot GET-only Canary completed successfully for slots 1–5. All five current independent GitHub account Secrets are therefore readable by the V3 RC workflow. The Canary sent no check-in or exchange POSTs.
+The managed account set now matches production after replacing the retired `332A23567057FBF5` account with `69B9338D952FEE8D`. The subsequent five-slot GET-only Canary completed successfully for slots 1–5. All five current independent GitHub account Secrets are readable by the V3 RC workflow. The Canary sent no check-in or exchange POSTs.
 
 ## Remaining human-only release gates
 
@@ -59,7 +59,7 @@ The managed account set was synchronized after the old `332A23567057FBF5` accoun
 2. V2 → V3 in-place install and legacy-copy cleanup
 3. Safari extension enablement / optional companion extension loading
 4. five-account Keychain health 5/5
-5. local GLaDOS direct read-only refresh 5/5 and visible data sanity check
+5. local GLaDOS direct read-only refresh 5/5 and visible-data sanity check
 6. one controlled RC primary + recovery live Canary with no duplicate side effect
 7. merge Draft PR while V3 production schedule remains disarmed
 8. verify one manual V3 primary on `master`
