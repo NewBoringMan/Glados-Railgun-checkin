@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - name: Restore exact RC5 input
+      - name: Restore final RC5 Xcode input
         shell: bash
         run: |
           set -euo pipefail
@@ -41,23 +41,62 @@ jobs:
           (t/'rc5.tar.xz').write_bytes(raw)
           PY
           tar -xJf "$RUNNER_TEMP/rc5.tar.xz" -C "$work"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          p=Path(os.environ['RUNNER_TEMP'])/'gac-rc5/Services/SafariExtensionService.swift'
+          s=p.read_text(); old='SFSafariExtensionManager.getStateOfExtension(withIdentifier: bundleIdentifier)'; new='SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: bundleIdentifier)'
+          if old not in s: raise SystemExit('expected old Safari API call missing')
+          p.write_text(s.replace(old,new))
+          PY
       - name: Generate project
         working-directory: ${{ runner.temp }}/gac-rc5
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen >/dev/null
           xcodegen generate --spec project.yml
-      - name: Run XCTest with compact failure report
+      - name: Run only Safari crash regression and print structured IPS
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set +e
           log="$RUNNER_TEMP/test.log"
-          xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES test >"$log" 2>&1
+          before="$RUNNER_TEMP/before.txt"
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
+          xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES -only-testing:GLaDOSAccountCenterTests/ModelTests/testSafariExtensionStatusCallbackIsExecutorSafe test >"$log" 2>&1
           rc=$?
           echo "XCODEBUILD_RC=$rc"
-          echo '--- error/failure summary ---'
-          grep -Ei 'error:|failed|failure|fatal|assert|signal|sigtrap|crash|test case|test suite|executed [0-9]+ tests|TEST (SUCCEEDED|FAILED)' "$log" | tail -n 140 || true
-          echo '--- recent GLaDOS crash reports ---'
-          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -10 -print | while IFS= read -r f; do echo "--- $f ---"; grep -E 'exception|termination|triggered|SafariExtensionService|swift_task|dispatch|SIG|abort|assert' "$f" | head -n 100 || true; done
+          grep -Ei 'test case|test suite|failed|failure|crash|timeout|TEST (SUCCEEDED|FAILED)' "$log" | tail -n 100 || true
+          echo '--- structured new crash reports ---'
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$RUNNER_TEMP/after.txt" || true
+          comm -13 "$before" "$RUNNER_TEMP/after.txt" | while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            echo "--- $f ---"
+            CRASH_FILE="$f" python3 - <<'PY'
+          import json, os, pathlib
+          p=pathlib.Path(os.environ['CRASH_FILE'])
+          text=p.read_text(errors='replace')
+          dec=json.JSONDecoder(); objs=[]; i=0
+          while i < len(text):
+              while i < len(text) and text[i].isspace(): i+=1
+              if i>=len(text): break
+              try:
+                  obj,end=dec.raw_decode(text,i); objs.append(obj); i=end
+              except Exception:
+                  i+=1
+          data=next((o for o in reversed(objs) if isinstance(o,dict) and ('threads' in o or 'exception' in o)), objs[-1] if objs else {})
+          for key in ['exception','termination','faultingThread','faultingThreadId','legacyInfo']:
+              if key in data: print(key+'='+json.dumps(data[key],ensure_ascii=False)[:5000])
+          threads=data.get('threads') or []
+          fi=data.get('faultingThread')
+          selected=[]
+          if isinstance(fi,int) and 0 <= fi < len(threads): selected=[(fi,threads[fi])]
+          else:
+              selected=[(idx,t) for idx,t in enumerate(threads) if t.get('triggered')]
+          for idx,t in selected:
+              print(f'FAULT_THREAD_INDEX={idx} queue={t.get("queue")} name={t.get("name")}')
+              for n,fr in enumerate((t.get('frames') or [])[:40]):
+                  sym=fr.get('symbol') or fr.get('sourceFile') or ''
+                  print(f'  #{n} {sym} imageIndex={fr.get("imageIndex")} imageOffset={fr.get("imageOffset")} symbolLocation={fr.get("symbolLocation")}')
+          PY
+          done
           exit "$rc"
-      # PR diagnostic trigger 2026-08-08
