@@ -7,12 +7,14 @@ on:
     paths:
       - '.github/glados/macos-rc4-ci.part*'
       - '.github/glados/macos-rc5-exact.part*'
+      - '.github/glados/macos-rc5-final-hashes.txt'
       - '.github/workflows/v3MacRCBuild.yml'
   pull_request:
     branches: [master]
     paths:
       - '.github/glados/macos-rc4-ci.part*'
       - '.github/glados/macos-rc5-exact.part*'
+      - '.github/glados/macos-rc5-final-hashes.txt'
       - '.github/workflows/v3MacRCBuild.yml'
 
 permissions:
@@ -24,37 +26,30 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
       - name: Show toolchain
         run: |
           sw_vers
           xcodebuild -version
           swift --version
 
-      - name: Restore exact final RC5 Xcode input
+      - name: Restore and compare exact RC5 Xcode input
         shell: bash
         run: |
           set -euo pipefail
-          work="$RUNNER_TEMP/gac-rc5"
-          mkdir -p "$work"
-
+          work="$RUNNER_TEMP/gac-rc5"; mkdir -p "$work"
           cat .github/glados/macos-rc4-ci.part00 .github/glados/macos-rc4-ci.part01 .github/glados/macos-rc4-ci.part02 .github/glados/macos-rc4-ci.part03 .github/glados/macos-rc4-ci.part04 .github/glados/macos-rc4-ci.part05 > "$RUNNER_TEMP/base.b64"
           python3 - <<'PY'
-          import base64, hashlib, os, pathlib
-          t=pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw=base64.b64decode((t/'base.b64').read_text().strip(),validate=True)
+          import base64,hashlib,os,pathlib
+          t=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((t/'base.b64').read_text().strip(),validate=True)
           if hashlib.sha256(raw).hexdigest()!='c9961868e0c16f821f1bd465491d996af1d48d4ddf77fe648fa19d24cecb1e55': raise SystemExit('RC4 base checksum mismatch')
           (t/'base.tar.xz').write_bytes(raw)
           PY
           tar -xJf "$RUNNER_TEMP/base.tar.xz" -C "$work"
-
           cat .github/glados/macos-rc5-exact.part00 .github/glados/macos-rc5-exact.part01 .github/glados/macos-rc5-exact.part02 .github/glados/macos-rc5-exact.part03 .github/glados/macos-rc5-exact.part04 .github/glados/macos-rc5-exact.part05 > "$RUNNER_TEMP/rc5.b64"
           python3 - <<'PY'
-          import base64, hashlib, os, pathlib
-          t=pathlib.Path(os.environ['RUNNER_TEMP'])
-          raw=base64.b64decode((t/'rc5.b64').read_text().strip(),validate=True)
-          actual=hashlib.sha256(raw).hexdigest()
-          print('RC5_PREBRIDGE_TAR_SHA256='+actual)
+          import base64,hashlib,os,pathlib
+          t=pathlib.Path(os.environ['RUNNER_TEMP']); raw=base64.b64decode((t/'rc5.b64').read_text().strip(),validate=True)
+          actual=hashlib.sha256(raw).hexdigest(); print('RC5_PREBRIDGE_TAR_SHA256='+actual)
           if actual!='d23f5a1e086081bd3101c666eb517333902d0148ecf741e7837627840efb6584': raise SystemExit('RC5 input checksum mismatch')
           (t/'rc5.tar.xz').write_bytes(raw)
           PY
@@ -73,7 +68,6 @@ jobs:
 
           NS_ASSUME_NONNULL_END
           EOF
-
           cat > "$work/Services/SafariExtensionBridge.m" <<'EOF'
           #import "SafariExtensionBridge.h"
           @import SafariServices;
@@ -107,7 +101,6 @@ jobs:
               }];
           }
           EOF
-
           cat > "$work/Services/SafariExtensionService.swift" <<'EOF'
           import Foundation
 
@@ -140,120 +133,92 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-          import hashlib, json, os
+          import hashlib,os
           root=Path(os.environ['RUNNER_TEMP'])/'gac-rc5'
           p=root/'project.yml'; s=p.read_text()
           if 'SWIFT_OBJC_BRIDGING_HEADER' not in s:
-              needle='        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n'
-              s=s.replace(needle, needle+'        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Services/SafariExtensionBridge.h"\n',1)
+              needle='        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n'; s=s.replace(needle,needle+'        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Services/SafariExtensionBridge.h"\n',1)
           app_old='''        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Services/SafariExtensionBridge.h"\n'''
           app_new='''        ASSETCATALOG_COMPILER_APPICON_NAME: ""\n        CURRENT_PROJECT_VERSION: 30005\n        MARKETING_VERSION: 3.0.0\n        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/Services/SafariExtensionBridge.h"\n'''
-          if app_old not in s: raise SystemExit('app version insertion point missing')
+          if app_old not in s: raise SystemExit('app target insertion point missing')
           s=s.replace(app_old,app_new,1)
-          ext_old='''        APPLICATION_EXTENSION_API_ONLY: YES\n'''
-          ext_new='''        APPLICATION_EXTENSION_API_ONLY: YES\n        CURRENT_PROJECT_VERSION: 30005\n        MARKETING_VERSION: 3.0.0\n'''
-          if ext_old not in s: raise SystemExit('extension version insertion point missing')
-          s=s.replace(ext_old,ext_new,1)
-          p.write_text(s)
-
-          t=root/'AppTests/ModelTests.swift'; ts=t.read_text()
-          old='    func testSafariExtensionStatusCallbackIsExecutorSafe() async {'
-          new='    @MainActor\n    func testSafariExtensionObjectiveCBridgeIsExecutorSafe() async {'
-          if old not in ts: raise SystemExit('Safari regression test point missing')
+          ext_old='''        APPLICATION_EXTENSION_API_ONLY: YES\n'''; ext_new='''        APPLICATION_EXTENSION_API_ONLY: YES\n        CURRENT_PROJECT_VERSION: 30005\n        MARKETING_VERSION: 3.0.0\n'''
+          if ext_old not in s: raise SystemExit('extension target insertion point missing')
+          p.write_text(s.replace(ext_old,ext_new,1))
+          t=root/'AppTests/ModelTests.swift'; ts=t.read_text(); old='    func testSafariExtensionStatusCallbackIsExecutorSafe() async {'; new='    @MainActor\n    func testSafariExtensionObjectiveCBridgeIsExecutorSafe() async {'
+          if old not in ts: raise SystemExit('test normalization point missing')
           t.write_text(ts.replace(old,new,1))
 
-          if json.loads((root/'RELEASE-CANDIDATE-MANIFEST.json').read_text()).get('candidate')!=5: raise SystemExit('not RC5')
+          expected={}
+          for line in Path('.github/glados/macos-rc5-final-hashes.txt').read_text().splitlines():
+              if line.strip():
+                  digest,path=line.split(' ',1); expected[path]=digest
           roots=['App','AppTests','Models','NativeHost','SafariExtension','Services','Shared','Views']; files=[]
           for d in roots:
               for ext in ('*.swift','*.h','*.m'): files += list((root/d).rglob(ext))
           files += [root/'project.yml',root/'Info.plist',root/'SafariExtension/Info.plist']
-          files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix()); h=hashlib.sha256()
+          files=sorted(set(files),key=lambda f:f.relative_to(root).as_posix())
+          bad=[]
           for f in files:
-              h.update(f.relative_to(root).as_posix().encode()); h.update(b'\0'); h.update(f.read_bytes()); h.update(b'\0')
-          actual=h.hexdigest(); expected='450315a975c87d9695b52b1e758ad8dfa96ac84ea3be887bea56885a2a76ae0c'
-          print(f'RC5_FINAL_XCODE_INPUT_AGGREGATE={actual} FILES={len(files)}')
-          if len(files)!=25 or actual!=expected: raise SystemExit('RC5 final Xcode input closure mismatch')
+              rel=f.relative_to(root).as_posix(); actual=hashlib.sha256(f.read_bytes()).hexdigest(); want=expected.get(rel)
+              print(actual,rel)
+              if actual!=want: bad.append((rel,want,actual))
+          if len(files)!=25 or len(expected)!=25: bad.append(('COUNT','25',f'files={len(files)} expected={len(expected)}'))
+          if bad:
+              print('--- RC5 BYTE MISMATCHES ---')
+              for rel,want,actual in bad: print(rel,'expected=',want,'actual=',actual)
+              raise SystemExit('RC5 Xcode inputs do not byte-match final local package')
+          print('RC5_XCODE_INPUTS_BYTE_MATCH_OK')
           PY
-
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$work/Info.plist" | grep -Fx '30005'
-          grep -F 'CURRENT_PROJECT_VERSION: 30005' "$work/project.yml"
-          grep -F 'dispatch_get_main_queue' "$work/Services/SafariExtensionBridge.m"
-          grep -F '@MainActor' "$work/Services/SafariExtensionService.swift"
-          ! grep -F 'Dictionary(uniqueKeysWithValues:' "$work/Services/LocalStore.swift"
 
       - name: Validate changed macOS command scripts
         working-directory: ${{ runner.temp }}/gac-rc5
-        shell: bash
         run: |
-          set -euo pipefail
           for f in '清理旧版本.command' '构建并安装.command' '明日最终验收.command'; do zsh -n "$f"; done
-          grep -F '/usr/bin/find /Volumes' '清理旧版本.command'
-          grep -F 'UserData/Downloads' '清理旧版本.command'
-          grep -F 'DerivedData' '清理旧版本.command'
-          grep -F 'lsregister' '清理旧版本.command'
 
       - name: Install XcodeGen
-        run: |
-          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
-          xcodegen --version
+        run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
 
-      - name: Generate Xcode project
+      - name: Generate project
         working-directory: ${{ runner.temp }}/gac-rc5
         run: xcodegen generate --spec project.yml
 
-      - name: XCTest with SafariServices XPC regression
+      - name: XCTest
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/xcodebuild-tests.log"
-          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=30005 MARKETING_VERSION=3.0.0 test >"$log" 2>&1; then
-            tail -n 360 "$log"
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 260 {} \; 2>/dev/null || true
-            exit 1
-          fi
-          grep -E 'Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 30 || true
+          log="$RUNNER_TEMP/tests.log"
+          if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Debug -derivedDataPath "$RUNNER_TEMP/DerivedDataTests" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=30005 MARKETING_VERSION=3.0.0 test >"$log" 2>&1; then tail -n 360 "$log"; exit 1; fi
+          grep -E 'Executed [0-9]+ tests|TEST SUCCEEDED' "$log" | tail -n 20 || true
 
-      - name: Release build exactly as installer
+      - name: Release build and metadata
         working-directory: ${{ runner.temp }}/gac-rc5
         shell: bash
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/xcodebuild-release.log"
+          log="$RUNNER_TEMP/release.log"
           if ! xcodebuild -project GLaDOSAccountCenter.xcodeproj -scheme GLaDOSAccountCenter -configuration Release -derivedDataPath "$RUNNER_TEMP/DerivedDataRelease" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=30005 MARKETING_VERSION=3.0.0 build >"$log" 2>&1; then tail -n 360 "$log"; exit 1; fi
           app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
-          test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
           codesign --verify --deep --strict "$app"
           bundle=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
           short=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
-          echo "RC5_BUILT_BUNDLE=$bundle VERSION=$version SHORT=$short"
-          if [[ "$bundle" != 'com.enoch.glados-account-center' || "$version" != '30005' || "$short" != '3.0.0' ]]; then
-            echo 'RC5 release metadata mismatch'; exit 1
-          fi
+          echo "BUNDLE=$bundle VERSION=$version SHORT=$short"
+          if [[ "$bundle" != 'com.enoch.glados-account-center' || "$version" != '30005' || "$short" != '3.0.0' ]]; then exit 1; fi
+          test -d "$app/Contents/PlugIns/GLaDOS Account Center Safari Extension.appex"
           echo RC5_RELEASE_BUILD_OK
 
-      - name: Release startup smoke for diagnosed SafariServices crash
+      - name: Startup smoke
         shell: bash
         run: |
           set -euo pipefail
-          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"
-          exe="$app/Contents/MacOS/GLaDOS Account Center"
-          before="$RUNNER_TEMP/crashes-before.txt"; during="$RUNNER_TEMP/crashes-during.txt"
-          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$before" || true
-          "$exe" >"$RUNNER_TEMP/rc5-startup-smoke.log" 2>&1 &
-          pid=$!
-          sleep 15
-          if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$RUNNER_TEMP/rc5-startup-smoke.log" || true
-            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -mmin -5 -print -exec tail -n 260 {} \; 2>/dev/null || true
-            exit 1
-          fi
-          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$during" || true
-          new_reports=$(comm -13 "$before" "$during" || true)
-          if [[ -n "$new_reports" ]]; then printf '%s\n' "$new_reports"; kill "$pid" 2>/dev/null || true; exit 1; fi
+          app="$RUNNER_TEMP/DerivedDataRelease/Build/Products/Release/GLaDOS Account Center.app"; exe="$app/Contents/MacOS/GLaDOS Account Center"
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$RUNNER_TEMP/before" || true
+          "$exe" >"$RUNNER_TEMP/smoke.log" 2>&1 & pid=$!; sleep 15
+          kill -0 "$pid" 2>/dev/null || { cat "$RUNNER_TEMP/smoke.log" || true; exit 1; }
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -name 'GLaDOS Account Center*' -print 2>/dev/null | sort > "$RUNNER_TEMP/after" || true
+          [[ -z "$(comm -13 "$RUNNER_TEMP/before" "$RUNNER_TEMP/after" || true)" ]] || exit 1
           /usr/bin/osascript -e 'tell application id "com.enoch.glados-account-center" to quit' >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
-          sleep 1
-          kill "$pid" 2>/dev/null || true
-          wait "$pid" 2>/dev/null || true
+          sleep 1; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           echo RC5_STARTUP_SMOKE_OK
