@@ -1,7 +1,7 @@
 import unittest
 from datetime import date, datetime, timezone
 
-from status import build_checkin_history
+from status import build_checkin_history, native_streak
 
 
 def ms(y, m, d, h=4):
@@ -55,6 +55,34 @@ class StatusHistoryTests(unittest.TestCase):
         ]}
         _, streak, _ = build_checkin_history(payload, today=date(2026, 8, 7), window_days=3)
         self.assertEqual(streak, 3)
+
+    def test_points_native_streak_is_authoritative_over_limited_history(self):
+        history = [
+            {"time": ms(2026, 7, 21 + offset), "change": 1}
+            for offset in range(11)
+        ] + [
+            {"time": ms(2026, 8, day), "change": 1}
+            for day in range(1, 10)
+        ]
+        points_payload = {"points": 500, "streak": 47, "history": history}
+        _, inferred_streak, _ = build_checkin_history(points_payload, today=date(2026, 8, 9), window_days=35)
+        self.assertEqual(inferred_streak, 20)
+        self.assertEqual(native_streak(points_payload, {"streak": 99}), 47)
+
+    def test_status_streak_is_compatibility_fallback_only(self):
+        self.assertEqual(native_streak({"points": 20}, {"checkinStreak": "33"}), 33)
+
+    def test_missing_native_streak_does_not_use_history_inference(self):
+        points_payload = {
+            "points": 20,
+            "history": [
+                {"time": ms(2026, 8, 6), "change": 1},
+                {"time": ms(2026, 8, 7), "change": 1},
+            ],
+        }
+        _, inferred_streak, _ = build_checkin_history(points_payload, today=date(2026, 8, 7), window_days=2)
+        self.assertEqual(inferred_streak, 2)
+        self.assertIsNone(native_streak(points_payload, {}))
 
 
 if __name__ == "__main__":

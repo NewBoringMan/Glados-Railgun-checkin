@@ -89,6 +89,21 @@ def _status_streak(data: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def native_streak(points_payload: Dict[str, Any], status_data: Dict[str, Any]) -> Optional[int]:
+    """Return GLaDOS' native streak value without inferring it from history.
+
+    The current GLaDOS Points page displays ``/user/points``' top-level
+    ``streak`` value. Older deployments may expose a compatible streak field
+    in ``/user/status`` instead, so status data remains a compatibility-only
+    fallback. A finite points-history window must never be presented as the
+    account's real streak.
+    """
+    points_streak = _status_streak(points_payload)
+    if points_streak is not None:
+        return points_streak
+    return _status_streak(status_data)
+
+
 def _read_status_payload(api: GladosAPI) -> Dict[str, Any]:
     payload = api._request_json("GET", "/api/user/status")
     data = payload.get("data")
@@ -247,10 +262,8 @@ def read_status(cookie: str, account_key: str, domains: Iterable[str]):
             points = _to_int(points_payload.get("points"), "points")
             plan_name, vip_level = plan_from_status_data(data)
             email = _text_field(data, ("email", "userEmail"))
-            checkin_history, inferred_streak, history_source = build_checkin_history(points_payload)
-            streak = _status_streak(data)
-            if streak is None:
-                streak = inferred_streak
+            checkin_history, _, history_source = build_checkin_history(points_payload)
+            streak = native_streak(points_payload, data)
             return {
                 "account_key": account_key,
                 "domain": domain,
