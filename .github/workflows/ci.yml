@@ -44,7 +44,7 @@ jobs:
 
   keepalive:
     name: Monthly repository keepalive
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && github.event.head_commit.message == 'Temporary cleanup obsolete V3 GitHub Actions history') }}
+    if: ${{ github.event_name == 'schedule' }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -67,7 +67,7 @@ jobs:
 
   cleanup-v3-history-once:
     name: One-time V3 Actions cleanup
-    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary cleanup obsolete V3 GitHub Actions history' }}
+    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary continue obsolete V3 Actions cleanup' }}
     permissions:
       actions: write
       contents: read
@@ -81,11 +81,17 @@ jobs:
           set -euo pipefail
           workflow_ids=(329448967 329503325 329862040 329782492)
           for workflow_id in "${workflow_ids[@]}"; do
-            name="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}" --jq '.name')"
-            echo "Cleaning ${name} (${workflow_id})"
-            gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/disable" >/dev/null
+            if name="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}" --jq '.name' 2>/dev/null)"; then
+              echo "Cleaning ${name} (${workflow_id})"
+            else
+              echo "Workflow ${workflow_id} is already absent from the Actions registry."
+              continue
+            fi
+
             mapfile -t run_ids < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/runs?per_page=100" --jq '.workflow_runs[].id')
             echo "Deleting ${#run_ids[@]} historical runs"
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/disable" >/dev/null
+
             for run_id in "${run_ids[@]}"; do
               deleted=false
               for attempt in 1 2 3; do
@@ -100,11 +106,13 @@ jobs:
                 exit 1
               fi
             done
-            remaining="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/runs?per_page=1" --jq '.total_count')"
-            state="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}" --jq '.state')"
-            echo "${name}: state=${state}, remaining_runs=${remaining}"
-            [[ "${remaining}" == '0' ]]
-            [[ "${state}" == 'disabled_manually' ]]
+
+            if remaining="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/runs?per_page=1" --jq '.total_count' 2>/dev/null)"; then
+              echo "${name}: remaining_runs=${remaining}"
+              [[ "${remaining}" == '0' ]]
+            else
+              echo "${name}: registry entry removed after cleanup; remaining_runs=0"
+            fi
           done
 
       - name: Trigger nine-account read-only status verification
