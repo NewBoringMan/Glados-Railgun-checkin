@@ -68,7 +68,7 @@ jobs:
 
   withdraw_account_center_source:
     name: One-time withdraw Account Center public refs
-    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary: withdraw Account Center public refs' }}
+    if: ${{ github.event_name == 'push' }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
