@@ -65,25 +65,3 @@ jobs:
           fi
           git commit -m 'chore: monthly repository keepalive'
           git push
-
-  cleanup-failed-maintenance-runs-once:
-    name: Remove failed maintenance runs
-    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary remove failed maintenance runs' }}
-    permissions:
-      actions: write
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Delete failed transient runs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          for run_id in 31623808056 31623923099; do
-            if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" >/dev/null 2>&1; then
-              echo "Deleted transient run ${run_id}"
-            else
-              echo "Transient run ${run_id} was already absent"
-            fi
-          done
