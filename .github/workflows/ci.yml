@@ -2,6 +2,9 @@ name: GLaDOS Check-in Tests
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '23 3 1 * *'
+      timezone: 'Asia/Taipei'
   push:
     branches: [ master ]
     paths:
@@ -11,6 +14,7 @@ on:
       - 'requirements.txt'
       - 'tests/**'
       - '.github/glados/**'
+      - '.github/workflows/ci.yml'
   pull_request:
     paths:
       - 'checkin.py'
@@ -25,6 +29,7 @@ permissions:
 
 jobs:
   test:
+    if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -36,3 +41,79 @@ jobs:
         run: python -m py_compile checkin.py status.py logging_config.py
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+  keepalive:
+    name: Monthly repository keepalive
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && github.event.head_commit.message == 'Temporary: cleanup obsolete V3 GitHub Actions history') }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Record repository activity
+        shell: bash
+        run: |
+          set -euo pipefail
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/keepalive
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/keepalive
+          if git diff --cached --quiet; then
+            echo 'No keepalive change required.'
+            exit 0
+          fi
+          git commit -m 'chore: monthly repository keepalive'
+          git push
+
+  cleanup-v3-history-once:
+    name: One-time V3 Actions cleanup
+    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary: cleanup obsolete V3 GitHub Actions history' }}
+    permissions:
+      actions: write
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable obsolete V3 workflows and delete their runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_ids=(329448967 329503325 329862040 329782492)
+          for workflow_id in "${workflow_ids[@]}"; do
+            name="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}" --jq '.name')"
+            echo "Cleaning ${name} (${workflow_id})"
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/disable" >/dev/null
+            mapfile -t run_ids < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/runs?per_page=100" --jq '.workflow_runs[].id')
+            echo "Deleting ${#run_ids[@]} historical runs"
+            for run_id in "${run_ids[@]}"; do
+              deleted=false
+              for attempt in 1 2 3; do
+                if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" >/dev/null 2>&1; then
+                  deleted=true
+                  break
+                fi
+                sleep "$((attempt * 2))"
+              done
+              if [[ "${deleted}" != true ]]; then
+                echo "Failed to delete run ${run_id}" >&2
+                exit 1
+              fi
+            done
+            remaining="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/runs?per_page=1" --jq '.total_count')"
+            state="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}" --jq '.state')"
+            echo "${name}: state=${state}, remaining_runs=${remaining}"
+            [[ "${remaining}" == '0' ]]
+            [[ "${state}" == 'disabled_manually' ]]
+          done
+
+      - name: Trigger nine-account read-only status verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/gladosStatus.yml/dispatches" \
+            -f ref=master \
+            -f 'inputs[account]=all'
