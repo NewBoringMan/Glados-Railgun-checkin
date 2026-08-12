@@ -65,39 +65,3 @@ jobs:
           fi
           git commit -m 'chore: monthly repository keepalive'
           git push
-
-  withdraw_account_center_source:
-    name: Finalize Account Center public withdrawal
-    if: ${{ github.event_name == 'push' }}
-    permissions:
-      actions: write
-      contents: write
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Verify public source refs are absent
-        shell: bash
-        run: |
-          set -euo pipefail
-          repo="${GITHUB_REPOSITORY}"
-          refs=(
-            'heads/v3/account-center'
-            'tags/archive-v3-account-center-20260812'
-          )
-          for ref in "${refs[@]}"; do
-            if gh api "repos/${repo}/git/ref/${ref}" >/dev/null 2>&1; then
-              echo "Unexpected public ref still exists: refs/${ref}" >&2
-              exit 1
-            fi
-          done
-      - name: Remove transient maintenance runs
-        shell: bash
-        run: |
-          set -euo pipefail
-          repo="${GITHUB_REPOSITORY}"
-          for run_id in 31626283645 31626335243; do
-            if gh api "repos/${repo}/actions/runs/${run_id}" >/dev/null 2>&1; then
-              gh api --method DELETE "repos/${repo}/actions/runs/${run_id}"
-            fi
-          done
