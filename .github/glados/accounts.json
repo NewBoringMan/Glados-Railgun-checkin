@@ -15,11 +15,6 @@
       "enabled" : true,
       "label" : "GLaDOS 69B933"
     },
-    "6A0FDB876245E1CE" : {
-      "autoExchange" : true,
-      "enabled" : true,
-      "label" : "GLaDOS 6A0FDB"
-    },
     "6BA27F0D29BB2856" : {
       "autoExchange" : true,
       "enabled" : true,
@@ -29,11 +24,6 @@
       "autoExchange" : true,
       "enabled" : true,
       "label" : "GLaDOS 754D6E"
-    },
-    "F672DACD1B1CB36C" : {
-      "autoExchange" : true,
-      "enabled" : true,
-      "label" : "GLaDOS F672DA"
     }
   },
   "defaults" : {
