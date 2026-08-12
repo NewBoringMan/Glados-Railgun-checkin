@@ -94,6 +94,30 @@ jobs:
           GLADOS_VERBOSE: 'true'
         run: python checkin.py
 
+  account_6a0fdb876245e1ce:
+    name: GLaDOS account 6A0FDB876245E1CE
+    if: ${{ github.event_name == 'schedule' || inputs.account == 'all' || inputs.account == '6A0FDB876245E1CE' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run check-in
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_6A0FDB876245E1CE }}
+          GLADOS_ACCOUNT_KEY: '6A0FDB876245E1CE'
+          GLADOS_AUTO_EXCHANGE: 'true'
+          GLADOS_EXCHANGE_CATALOG: '.github/glados/exchange_plans.json'
+          PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+          GLADOS_VERBOSE: 'true'
+        run: python checkin.py
+
   account_6ba27f0d29bb2856:
     name: GLaDOS account 6BA27F0D29BB2856
     if: ${{ github.event_name == 'schedule' || inputs.account == 'all' || inputs.account == '6BA27F0D29BB2856' }}
