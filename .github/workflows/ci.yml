@@ -44,7 +44,7 @@ jobs:
 
   keepalive:
     name: Monthly repository keepalive
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && github.event.head_commit.message == 'Temporary: cleanup obsolete V3 GitHub Actions history') }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'push' && github.event.head_commit.message == 'Temporary cleanup obsolete V3 GitHub Actions history') }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -67,7 +67,7 @@ jobs:
 
   cleanup-v3-history-once:
     name: One-time V3 Actions cleanup
-    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary: cleanup obsolete V3 GitHub Actions history' }}
+    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary cleanup obsolete V3 GitHub Actions history' }}
     permissions:
       actions: write
       contents: read
