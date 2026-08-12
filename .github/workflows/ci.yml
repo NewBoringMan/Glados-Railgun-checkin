@@ -65,3 +65,41 @@ jobs:
           fi
           git commit -m 'chore: monthly repository keepalive'
           git push
+
+  withdraw_account_center_source:
+    name: One-time withdraw Account Center public refs
+    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'Temporary: withdraw Account Center public refs' }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete public V3 branch and archive tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          refs=(
+            'heads/v3/account-center'
+            'tags/archive-v3-account-center-20260812'
+          )
+          for ref in "${refs[@]}"; do
+            if gh api "repos/${repo}/git/ref/${ref}" >/dev/null 2>&1; then
+              echo "Deleting refs/${ref}"
+              gh api --method DELETE "repos/${repo}/git/refs/${ref}"
+            else
+              echo "refs/${ref} already absent"
+            fi
+          done
+          for ref in "${refs[@]}"; do
+            if gh api "repos/${repo}/git/ref/${ref}" >/dev/null 2>&1; then
+              echo "Failed to remove refs/${ref}" >&2
+              exit 1
+            fi
+          done
+          if gh api --method DELETE "repos/${repo}/git/refs/pull/1/head" >/dev/null 2>&1; then
+            echo 'Deleted pull request head ref.'
+          else
+            echo 'GitHub retained the managed pull-request ref; branch and tag removal still completed.'
+          fi
