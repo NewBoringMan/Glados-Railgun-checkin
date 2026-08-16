@@ -29,6 +29,56 @@ jobs:
           echo "4d98071b0e34a1b706fd49ecf1f41601fc379d95b7df90bdf733e3a037c7b478  /tmp/probe.tar.gz" | shasum -a 256 -c -
           mkdir probe
           tar -xzf /tmp/probe.tar.gz -C probe
+          cat > probe/Tests/BulkProbeTests/BulkProbeTests.swift <<'SWIFT'
+          import XCTest
+          import Foundation
+          @testable import StorageScanner
+          @testable import StorageCore
+
+          final class BulkProbeTests: XCTestCase {
+              private let volume = VolumeIdentity(uuid: UUID(), fileSystem: "apfs-test")
+
+              func testBulkMatchesFoundationAndDeduplicatesHardlinks() throws {
+                  let fm = FileManager.default
+                  let root = fm.temporaryDirectory.appendingPathComponent("StorageObservatoryBulkProbe-\(UUID().uuidString)")
+                  defer { try? fm.removeItem(at: root) }
+                  try fm.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
+                  let a = root.appendingPathComponent("nested/a.bin")
+                  let b = root.appendingPathComponent("b.txt")
+                  let hard = root.appendingPathComponent("a-hard.bin")
+                  try Data(repeating: 0x41, count: 8192).write(to: a)
+                  try Data("hello".utf8).write(to: b)
+                  try fm.linkItem(at: a, to: hard)
+
+                  let foundation = MetadataScanner().scan(root: root, volume: volume)
+                  let bulk = try XCTUnwrap(BulkMetadataScanner().scan(root: root, volume: volume))
+                  XCTAssertEqual(bulk.backend, ScanBackend.bulk)
+                  XCTAssertTrue(bulk.failures.isEmpty, "bulk failures: \(bulk.failures)")
+
+                  let aPath = PathCanonicalizer.nodePath(a)
+                  let hardPath = PathCanonicalizer.nodePath(hard)
+                  let foundationNonHard = Set(foundation.nodes.values.map { $0.path }.filter { $0 != aPath && $0 != hardPath })
+                  let bulkNonHard = Set(bulk.nodes.values.map { $0.path }.filter { $0 != aPath && $0 != hardPath })
+                  XCTAssertEqual(bulkNonHard, foundationNonHard)
+                  XCTAssertNotNil(bulk.nodes.values.first { $0.path == PathCanonicalizer.nodePath(b) })
+
+                  let bulkA = bulk.nodes.values.filter { $0.path == aPath || $0.path == hardPath }
+                  XCTAssertEqual(bulkA.count, 1, "hard-linked content should be represented once")
+                  XCTAssertEqual(bulkA.first?.size.logicalBytes, 8192)
+              }
+
+              func testAdaptiveSelectsBulkOnMacOS() throws {
+                  let fm = FileManager.default
+                  let root = fm.temporaryDirectory.appendingPathComponent("StorageObservatoryAdaptiveProbe-\(UUID().uuidString)")
+                  defer { try? fm.removeItem(at: root) }
+                  try fm.createDirectory(at: root, withIntermediateDirectories: true)
+                  try Data("x".utf8).write(to: root.appendingPathComponent("x.txt"))
+                  let result = AdaptiveMetadataScanner().scan(root: root, volume: volume)
+                  XCTAssertEqual(result.backend, ScanBackend.bulk)
+                  XCTAssertTrue(result.nodes.values.contains { $0.path.hasSuffix("x.txt") })
+              }
+          }
+          SWIFT
       - name: Toolchain
         run: |
           sw_vers
