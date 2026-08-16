@@ -1,0 +1,41 @@
+--- a/Sources/StorageBenchmark/main.swift
++++ b/Sources/StorageBenchmark/main.swift
+@@ -13,6 +13,7 @@
+     var repeats = 2
+     var backend = "adaptive"
+     var keepFixture = false
++    var rootPath: String?
+ 
+     static func parse() -> Options {
+         var result = Options()
+@@ -25,6 +26,7 @@
+             case "--repeats": index += 1; if index < args.count { result.repeats = Int(args[index]) ?? result.repeats }
+             case "--backend": index += 1; if index < args.count { result.backend = args[index] }
+             case "--keep-fixture": result.keepFixture = true
++            case "--root": index += 1; if index < args.count { result.rootPath = args[index] }
+             default: break
+             }
+             index += 1
+@@ -113,8 +115,20 @@
+ }
+ 
+ let options = Options.parse()
+-let root = try makeFixture(fileCount: options.files, filesPerDirectory: options.filesPerDirectory)
+-defer { if !options.keepFixture { try? FileManager.default.removeItem(at: root) } }
++let root: URL
++let ownsFixture: Bool
++if let rootPath = options.rootPath {
++    root = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
++    guard FileManager.default.fileExists(atPath: root.path) else {
++        FileHandle.standardError.write(Data("benchmark --root path does not exist: \(root.path)\n".utf8))
++        exit(3)
++    }
++    ownsFixture = false
++} else {
++    root = try makeFixture(fileCount: options.files, filesPerDirectory: options.filesPerDirectory)
++    ownsFixture = true
++}
++defer { if ownsFixture && !options.keepFixture { try? FileManager.default.removeItem(at: root) } }
+ let volume = VolumeIdentity(uuid: UUID(), fileSystem: "benchmark")
+ var samples: [Sample] = []
+ 
