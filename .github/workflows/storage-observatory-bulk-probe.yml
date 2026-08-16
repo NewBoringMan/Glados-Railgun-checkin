@@ -23,8 +23,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "5b82698bfce85a32d147bd44db2c4ba1f6119e66c6e1f23b837bad74a0efb620  storage-observatory-bulk-probe.b64" | shasum -a 256 -c -
-          base64 -D -i storage-observatory-bulk-probe.b64 -o /tmp/probe.tar.gz
+          cat storage-observatory-bulk-probe-v2/chunk-*.b64 > /tmp/probe.b64
+          echo "5b82698bfce85a32d147bd44db2c4ba1f6119e66c6e1f23b837bad74a0efb620  /tmp/probe.b64" | shasum -a 256 -c -
+          base64 -D -i /tmp/probe.b64 -o /tmp/probe.tar.gz
           echo "3d0ae643637ddb63a1d30a61d29e116509be505c21e549fdef24ba847c34cc26  /tmp/probe.tar.gz" | shasum -a 256 -c -
           mkdir probe
           tar -xzf /tmp/probe.tar.gz -C probe
