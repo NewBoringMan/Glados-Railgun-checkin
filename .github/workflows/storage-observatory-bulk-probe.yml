@@ -23,10 +23,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat storage-observatory-bulk-probe-v2/chunk-*.b64 > /tmp/probe.b64
-          echo "5b82698bfce85a32d147bd44db2c4ba1f6119e66c6e1f23b837bad74a0efb620  /tmp/probe.b64" | shasum -a 256 -c -
+          cat storage-observatory-bulk-probe-v3/chunk-*.b64 > /tmp/probe.b64
+          echo "1b768dc5b0cd9729db4813304f5348cea145ec783fe4e1fae2d511a5fabef53f  /tmp/probe.b64" | shasum -a 256 -c -
           base64 -D -i /tmp/probe.b64 -o /tmp/probe.tar.gz
-          echo "3d0ae643637ddb63a1d30a61d29e116509be505c21e549fdef24ba847c34cc26  /tmp/probe.tar.gz" | shasum -a 256 -c -
+          echo "4d98071b0e34a1b706fd49ecf1f41601fc379d95b7df90bdf733e3a037c7b478  /tmp/probe.tar.gz" | shasum -a 256 -c -
           mkdir probe
           tar -xzf /tmp/probe.tar.gz -C probe
       - name: Toolchain
