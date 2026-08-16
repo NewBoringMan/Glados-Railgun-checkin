@@ -1,0 +1,39 @@
+name: Storage Observatory Bulk Scanner Probe
+on:
+  push:
+    branches: [storage-observatory-ci-temp]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bulk:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify and materialize exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "06a3847cec9d68e2f7027de242923618d63ab833c9c460b0d2e86b02436dbcaf  storage-observatory-bulk-probe.b64" | shasum -a 256 -c -
+          base64 -D -i storage-observatory-bulk-probe.b64 -o /tmp/probe.tar.gz
+          echo "525275782dae5e7ddd6bcfa7a0bd1bf93fe20f00c809dc2b1865025fe53f254d  /tmp/probe.tar.gz" | shasum -a 256 -c -
+          mkdir probe
+          tar -xzf /tmp/probe.tar.gz -C probe
+      - name: Toolchain
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
+      - name: Compile and run bulk scanner probe
+        working-directory: probe
+        run: swift test --parallel
