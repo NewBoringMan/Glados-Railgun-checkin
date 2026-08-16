@@ -23,9 +23,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "06a3847cec9d68e2f7027de242923618d63ab833c9c460b0d2e86b02436dbcaf  storage-observatory-bulk-probe.b64" | shasum -a 256 -c -
+          echo "5b82698bfce85a32d147bd44db2c4ba1f6119e66c6e1f23b837bad74a0efb620  storage-observatory-bulk-probe.b64" | shasum -a 256 -c -
           base64 -D -i storage-observatory-bulk-probe.b64 -o /tmp/probe.tar.gz
-          echo "525275782dae5e7ddd6bcfa7a0bd1bf93fe20f00c809dc2b1865025fe53f254d  /tmp/probe.tar.gz" | shasum -a 256 -c -
+          echo "3d0ae643637ddb63a1d30a61d29e116509be505c21e549fdef24ba847c34cc26  /tmp/probe.tar.gz" | shasum -a 256 -c -
           mkdir probe
           tar -xzf /tmp/probe.tar.gz -C probe
       - name: Toolchain
