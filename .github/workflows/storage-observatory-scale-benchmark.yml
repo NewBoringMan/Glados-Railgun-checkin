@@ -1,0 +1,55 @@
+name: Storage Observatory Scale Benchmark
+on:
+  push:
+    branches: [storage-observatory-ci-temp]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scale:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - files: 1000000
+            foundation: 'yes'
+          - files: 2000000
+            foundation: 'no'
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize exact benchmark package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat storage-observatory-benchmark-v2/chunk-*.b64 > /tmp/benchmark.b64
+          echo "b1cae07159f938fc6821ca583cdaeddb7d6fde836f4c359689783b2a91e7812d  /tmp/benchmark.b64" | shasum -a 256 -c -
+          base64 -D -i /tmp/benchmark.b64 -o /tmp/benchmark.tar.gz
+          echo "1079e788633dd41034f544aa78fc9faceee45f087f96f9f9faf1aa78871077d9  /tmp/benchmark.tar.gz" | shasum -a 256 -c -
+          mkdir benchmark
+          tar -xzf /tmp/benchmark.tar.gz -C benchmark
+      - name: Build benchmark
+        working-directory: benchmark
+        run: swift build -c release --product StorageBenchmark
+      - name: Foundation scale scan
+        if: matrix.foundation == 'yes'
+        working-directory: benchmark
+        run: .build/release/StorageBenchmark --files ${{ matrix.files }} --repeats 1 --backend foundation > foundation-${{ matrix.files }}-arm64.json
+      - name: Bulk scale scan
+        working-directory: benchmark
+        run: .build/release/StorageBenchmark --files ${{ matrix.files }} --repeats 1 --backend adaptive > adaptive-${{ matrix.files }}-arm64.json
+      - name: Summary
+        working-directory: benchmark
+        run: |
+          python3 - <<'PY'
+          import glob,json,os
+          for p in sorted(glob.glob('*.json')):
+            d=json.load(open(p)); s=d['samples'][0]
+            print(os.path.basename(p), s['backend'], round(s['elapsedSeconds'],4), round(s['nodesPerSecond']), s['nodeCount'], s['peakRSSBytes'])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StorageObservatory-scale-${{ matrix.files }}-arm64
+          path: benchmark/*.json
+          if-no-files-found: error
