@@ -1,7 +1,5 @@
 name: Storage Observatory Scale Benchmark
 on:
-  push:
-    branches: [storage-observatory-ci-temp]
   workflow_dispatch:
 permissions:
   contents: read
