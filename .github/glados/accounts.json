@@ -1,5 +1,10 @@
 {
   "accounts" : {
+    "009CA646E3B6E8E8" : {
+      "autoExchange" : true,
+      "enabled" : true,
+      "label" : "GLaDOS 009CA6"
+    },
     "059502CEBB0D18D6" : {
       "autoExchange" : true,
       "enabled" : true,
