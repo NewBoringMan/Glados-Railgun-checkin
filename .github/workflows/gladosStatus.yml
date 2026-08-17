@@ -17,6 +17,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  account_009ca646e3b6e8e8:
+    name: GLaDOS status 009CA646E3B6E8E8
+    if: ${{ inputs.account == 'all' || inputs.account == '009CA646E3B6E8E8' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Read account status
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_009CA646E3B6E8E8 }}
+          GLADOS_ACCOUNT_KEY: '009CA646E3B6E8E8'
+        run: python status.py
+
   account_059502cebb0d18d6:
     name: GLaDOS status 059502CEBB0D18D6
     if: ${{ inputs.account == 'all' || inputs.account == '059502CEBB0D18D6' }}
