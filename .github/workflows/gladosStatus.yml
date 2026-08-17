@@ -85,6 +85,23 @@ jobs:
           GLADOS_ACCOUNT_KEY: '28993337790302AC'
         run: python status.py
 
+  account_464f83108a606891:
+    name: GLaDOS status 464F83108A606891
+    if: ${{ inputs.account == 'all' || inputs.account == '464F83108A606891' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Read account status
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_ACCOUNT_464F83108A606891 }}
+          GLADOS_ACCOUNT_KEY: '464F83108A606891'
+        run: python status.py
+
   account_69b9338d952fee8d:
     name: GLaDOS status 69B9338D952FEE8D
     if: ${{ inputs.account == 'all' || inputs.account == '69B9338D952FEE8D' }}
