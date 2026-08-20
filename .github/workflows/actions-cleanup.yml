@@ -1,0 +1,40 @@
+name: GitHub Actions Storage Cleanup
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/actions-cleanup.yml'
+  schedule:
+    - cron: '17 4 */3 * *'
+      timezone: 'Asia/Taipei'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    name: Cleanup old Actions runs and logs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup old workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          echo "Cleaning old Actions runs for ${repo}"
+
+          gh api --paginate "repos/${repo}/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.created_at < (now - 604800 | todate)) | .id' \
+            | while read -r run_id; do
+                if [ -n "${run_id}" ]; then
+                  echo "Deleting run ${run_id}"
+                  gh api --method DELETE "repos/${repo}/actions/runs/${run_id}" || true
+                fi
+              done
+
+          echo "Cleanup completed"
