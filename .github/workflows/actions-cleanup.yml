@@ -1,15 +1,13 @@
 name: GitHub Actions Storage Cleanup
 
+# Only maintenance logic. Do not modify business workflows.
+# This workflow cleans historical Actions data only.
+
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
-    paths:
-      - '.github/workflows/actions-cleanup.yml'
   schedule:
-    - cron: '17 4 */3 * *'
-      timezone: 'Asia/Taipei'
+    # Daily cleanup at 04:17 Taipei time
+    - cron: '17 4 * * *'
 
 permissions:
   actions: write
@@ -17,7 +15,7 @@ permissions:
 
 jobs:
   cleanup:
-    name: Cleanup old Actions runs and logs
+    name: Cleanup old Actions history and artifacts
     runs-on: ubuntu-latest
     steps:
       - name: Cleanup old workflow runs
@@ -26,14 +24,36 @@ jobs:
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
-          echo "Cleaning old Actions runs for ${repo}"
 
+          echo "Cleaning workflow runs for ${repo}"
+
+          # Keep recent execution history for troubleshooting.
+          # Remove runs older than 3 days.
           gh api --paginate "repos/${repo}/actions/runs?per_page=100" \
-            --jq '.workflow_runs[] | select(.created_at < (now - 604800 | todate)) | .id' \
+            --jq '.workflow_runs[] | select(.created_at < (now - 259200 | todate)) | .id' \
             | while read -r run_id; do
                 if [ -n "${run_id}" ]; then
-                  echo "Deleting run ${run_id}"
+                  echo "Deleting workflow run ${run_id}"
                   gh api --method DELETE "repos/${repo}/actions/runs/${run_id}" || true
+                fi
+              done
+
+      - name: Cleanup old Actions artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+
+          echo "Cleaning artifacts for ${repo}"
+
+          # Remove artifacts older than 3 days.
+          gh api --paginate "repos/${repo}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.created_at < (now - 259200 | todate)) | .id' \
+            | while read -r artifact_id; do
+                if [ -n "${artifact_id}" ]; then
+                  echo "Deleting artifact ${artifact_id}"
+                  gh api --method DELETE "repos/${repo}/actions/artifacts/${artifact_id}" || true
                 fi
               done
 
