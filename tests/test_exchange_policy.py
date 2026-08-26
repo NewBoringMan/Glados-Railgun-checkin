@@ -6,24 +6,36 @@ from checkin import ExchangePlan, load_exchange_catalog, run_one_account, select
 
 
 class FakeAPI:
-    def __init__(self, domain, cookie, *, points=0, fail_status=False):
+    def __init__(self, domain, cookie, *, points=0, fail_status=False, fail_checkin=False, fail_points=False):
         self.domain = domain
         self.cookie = cookie
         self._points = points
         self.exchange_calls = []
         self.closed = False
         self.fail_status = fail_status
+        self.fail_checkin = fail_checkin
+        self.fail_points = fail_points
+        self.calls = []
 
     def status(self):
+        self.calls.append("status")
         if self.fail_status:
             from checkin import NetworkError
-            raise NetworkError("down")
+            raise NetworkError("status down")
         return {"days_left": 100, "email": "", "plan_name": "Edu"}
 
     def checkin(self):
+        self.calls.append("checkin")
+        if self.fail_checkin:
+            from checkin import NetworkError
+            raise NetworkError("checkin down")
         return {"state": "already", "message": "already", "points_added": 0}
 
     def points(self):
+        self.calls.append("points")
+        if self.fail_points:
+            from checkin import NetworkError
+            raise NetworkError("points down")
         return self._points
 
     def exchange(self, plan_id):
@@ -122,7 +134,7 @@ class ExchangePolicyTests(unittest.TestCase):
         apis = []
 
         def factory(domain, cookie):
-            api = FakeAPI(domain, cookie, points=10, fail_status=(domain == "glados.cloud"))
+            api = FakeAPI(domain, cookie, points=10, fail_checkin=(domain == "glados.cloud"))
             apis.append(api)
             return api
 
@@ -138,6 +150,54 @@ class ExchangePolicyTests(unittest.TestCase):
         self.assertEqual(result.domain, "railgun.info")
         self.assertEqual(len(apis), 2)
         self.assertTrue(apis[0].closed)
+
+    def test_status_failure_never_blocks_checkin(self):
+        holder = []
+
+        def factory(domain, cookie):
+            api = FakeAPI(domain, cookie, points=20, fail_status=True)
+            holder.append(api)
+            return api
+
+        result = run_one_account(
+            "cookie",
+            1,
+            account_key="A",
+            auto_exchange=True,
+            catalog=[ExchangePlan("plan500", 500, 100)],
+            domains=["glados.cloud"],
+            api_factory=factory,
+        )
+        self.assertEqual(result.checkin, "already")
+        self.assertEqual(result.exchange, "waiting")
+        self.assertTrue(result.success)
+        self.assertEqual(holder[0].calls[:2], ["checkin", "points"])
+        self.assertEqual(holder[0].calls[-1], "status")
+        self.assertIn("status down", result.status_warning)
+
+    def test_points_failure_is_visible_but_checkin_stays_completed(self):
+        holder = []
+
+        def factory(domain, cookie):
+            api = FakeAPI(domain, cookie, points=500, fail_points=True)
+            holder.append(api)
+            return api
+
+        result = run_one_account(
+            "cookie",
+            1,
+            account_key="A",
+            auto_exchange=True,
+            catalog=[ExchangePlan("plan500", 500, 100)],
+            domains=["glados.cloud"],
+            api_factory=factory,
+        )
+        self.assertEqual(result.checkin, "already")
+        self.assertEqual(result.exchange, "check_failed")
+        self.assertFalse(result.success)
+        self.assertIn("积分/兑换检查失败", result.error)
+        self.assertEqual(holder[0].exchange_calls, [])
+        self.assertEqual(holder[0].calls[:2], ["checkin", "points"])
 
     def test_catalog_validation(self):
         with TemporaryDirectory() as tmp:

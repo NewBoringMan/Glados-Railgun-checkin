@@ -36,9 +36,7 @@ NON_CHECKIN_MARKERS = ("exchange", "redeem", "兑换", "invite", "referral", "�
 
 
 def _text_field(data: Dict[str, Any], keys: Iterable[str]) -> str:
-    for source in (data, data.get("user")):
-        if not isinstance(source, dict):
-            continue
+    for source in _candidate_dicts(data):
         for key in keys:
             value = source.get(key)
             if isinstance(value, str) and value.strip():
@@ -47,9 +45,7 @@ def _text_field(data: Dict[str, Any], keys: Iterable[str]) -> str:
 
 
 def _vip_level(data: Dict[str, Any]) -> Optional[int]:
-    for source in (data, data.get("user")):
-        if not isinstance(source, dict):
-            continue
+    for source in _candidate_dicts(data):
         for key in VIP_LEVEL_KEYS:
             value = source.get(key)
             if value is None or isinstance(value, bool):
@@ -73,9 +69,7 @@ def plan_from_status_data(data: Dict[str, Any]) -> Tuple[str, Optional[int]]:
 
 
 def _status_streak(data: Dict[str, Any]) -> Optional[int]:
-    for source in (data, data.get("user")):
-        if not isinstance(source, dict):
-            continue
+    for source in _candidate_dicts(data):
         for key in STREAK_KEYS:
             value = source.get(key)
             if value is None or isinstance(value, bool):
@@ -104,19 +98,41 @@ def native_streak(points_payload: Dict[str, Any], status_data: Dict[str, Any]) -
     return _status_streak(status_data)
 
 
-def _read_status_payload(api: GladosAPI) -> Dict[str, Any]:
-    payload = api._request_json("GET", "/api/user/status")
+def _candidate_dicts(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """Yield compatible API object shapes from most-specific to fallback."""
     data = payload.get("data")
-    if not isinstance(data, dict):
-        raise ProtocolError("状态接口缺少 data")
-    if data.get("leftDays") is None:
-        raise ProtocolError("状态接口缺少 leftDays")
-    return data
+    if isinstance(data, dict):
+        yield data
+        nested_user = data.get("user")
+        if isinstance(nested_user, dict):
+            yield nested_user
+    user = payload.get("user")
+    if isinstance(user, dict):
+        yield user
+    yield payload
+
+
+def _optional_number(data: Dict[str, Any], keys: Iterable[str]) -> Optional[int]:
+    for source in _candidate_dicts(data):
+        for key in keys:
+            value = source.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _read_status_payload(api: GladosAPI) -> Dict[str, Any]:
+    """Read optional profile metadata without assuming the legacy ``data`` envelope."""
+    return api._request_json("GET", "/api/user/status")
 
 
 def _read_points_payload(api: GladosAPI) -> Dict[str, Any]:
     payload = api._request_json("GET", "/api/user/points")
-    if payload.get("points") is None:
+    if _optional_number(payload, ("points", "point", "pointsTotal", "points_total")) is None:
         raise ProtocolError("积分接口缺少 points")
     return payload
 
@@ -253,22 +269,36 @@ def build_checkin_history(
 
 
 def read_status(cookie: str, account_key: str, domains: Iterable[str]):
+    """Read account state with Points as the required source and Status as optional metadata."""
     last_error = ""
     for domain in domains:
         api = GladosAPI(domain, cookie)
         try:
-            data = _read_status_payload(api)
+            # Points is the durable account-status source used for authentication,
+            # points, the native streak, and the calendar. Status is deliberately
+            # queried only afterwards so a schema change there cannot blank a card.
             points_payload = _read_points_payload(api)
-            points = _to_int(points_payload.get("points"), "points")
-            plan_name, vip_level = plan_from_status_data(data)
-            email = _text_field(data, ("email", "userEmail"))
+            points = _optional_number(points_payload, ("points", "point", "pointsTotal", "points_total"))
+            if points is None:
+                raise ProtocolError("积分接口缺少 points")
+
+            status_payload: Dict[str, Any] = {}
+            status_warning = ""
+            try:
+                status_payload = _read_status_payload(api)
+            except (NetworkError, ProtocolError, AuthenticationError, ChallengeError) as exc:
+                status_warning = str(exc)
+
+            plan_name, vip_level = plan_from_status_data(status_payload)
+            email = _text_field(status_payload, ("email", "userEmail"))
             checkin_history, _, history_source = build_checkin_history(points_payload)
-            streak = native_streak(points_payload, data)
+            streak = native_streak(points_payload, status_payload)
+            days_left = _optional_number(status_payload, ("leftDays", "daysLeft", "left_days"))
             return {
                 "account_key": account_key,
                 "domain": domain,
                 "ok": True,
-                "days_left": _to_int(data.get("leftDays"), "leftDays"),
+                "days_left": days_left,
                 "points_total": points,
                 "email": email,
                 "plan_name": plan_name,
@@ -276,6 +306,7 @@ def read_status(cookie: str, account_key: str, domains: Iterable[str]):
                 "streak": streak,
                 "checkin_history": checkin_history,
                 "history_source": history_source,
+                "status_warning": status_warning,
                 "error": "",
             }
         except (NetworkError, ProtocolError) as exc:
@@ -301,6 +332,7 @@ def _error_result(account_key: str, domain: str, error: str) -> Dict[str, Any]:
         "streak": None,
         "checkin_history": [],
         "history_source": "unavailable",
+        "status_warning": "",
         "error": error,
     }
 

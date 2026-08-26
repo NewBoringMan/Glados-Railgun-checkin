@@ -78,11 +78,14 @@ class AccountResult:
     exchange: str = "disabled"
     points_needed: Optional[int] = None
     points_after_exchange: Optional[int] = None
+    status_warning: str = ""
     error: str = ""
 
     @property
     def success(self) -> bool:
-        return self.checkin in {"success", "already"}
+        # A completed check-in with a failed points/exchange verification is
+        # operationally degraded and must make Actions fail visibly.
+        return self.checkin in {"success", "already"} and not self.error
 
 
 class Config:
@@ -171,16 +174,12 @@ class GladosAPI:
         raise NetworkError(f"{self.domain} 请求失败: {last_error}")
 
     def status(self) -> Dict[str, Any]:
+        """Read optional account metadata across legacy and newer response envelopes."""
         payload = self._request_json("GET", "/api/user/status")
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise ProtocolError("状态接口缺少 data")
-        if data.get("leftDays") is None:
-            raise ProtocolError("状态接口缺少 leftDays")
         return {
-            "days_left": _to_int(data.get("leftDays"), "leftDays"),
-            "email": _first_string(data, ("email", "userEmail")),
-            "plan_name": _first_string(data, ("plan", "planName", "membership", "vipType")),
+            "days_left": _first_int(payload, ("leftDays", "daysLeft", "left_days")),
+            "email": _first_string(payload, ("email", "userEmail")),
+            "plan_name": _first_string(payload, ("plan", "planName", "membership", "vipType")),
         }
 
     def checkin(self) -> Dict[str, Any]:
@@ -204,9 +203,10 @@ class GladosAPI:
 
     def points(self) -> int:
         payload = self._request_json("GET", "/api/user/points")
-        if payload.get("points") is None:
+        points = _first_int(payload, ("points", "point", "pointsTotal", "points_total"))
+        if points is None:
             raise ProtocolError("积分接口缺少 points")
-        return _to_int(payload.get("points"), "points")
+        return points
 
     def exchange(self, plan_id: str) -> str:
         payload = self._request_json(
@@ -262,6 +262,17 @@ def select_best_exchange_plan(plans: Iterable[ExchangePlan]) -> ExchangePlan:
     return min(candidates, key=lambda plan: (plan.cost_per_day, plan.days, plan.points, plan.plan_id))
 
 
+def _refresh_optional_status(api: GladosAPI, result: AccountResult) -> None:
+    """Best-effort metadata refresh that can never downgrade a completed check-in."""
+    try:
+        status = api.status()
+        result.days_left = status.get("days_left")
+        result.email = status.get("email", "")
+        result.plan_name = status.get("plan_name", "")
+    except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
+        result.status_warning = str(exc)
+
+
 def run_one_account(
     cookie: str,
     account_index: int,
@@ -283,17 +294,19 @@ def run_one_account(
     result.exchange_days = best_plan.days
     result.exchange_cost_per_day = float(best_plan.cost_per_day)
 
+    # The write path is intentionally first. Read-only status/points APIs must
+    # never gate the check-in request itself.
     selected_api = None
     last_error = ""
     for domain in domains:
         api = api_factory(domain, cookie)
         try:
-            status = api.status()
-            selected_api = api
+            outcome = api.checkin()
+            result.checkin = outcome["state"]
+            result.message = outcome["message"]
+            result.points_added = int(outcome.get("points_added", 0))
             result.domain = domain
-            result.days_left = status.get("days_left")
-            result.email = status.get("email", "")
-            result.plan_name = status.get("plan_name", "")
+            selected_api = api
             break
         except (NetworkError, ProtocolError) as exc:
             last_error = str(exc)
@@ -309,33 +322,40 @@ def run_one_account(
         return result
 
     try:
-        outcome = selected_api.checkin()
-        result.checkin = outcome["state"]
-        result.message = outcome["message"]
-        result.points_added = int(outcome.get("points_added", 0))
-        result.points_total = selected_api.points()
+        try:
+            result.points_total = selected_api.points()
+        except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
+            result.error = f"签到已完成，但积分/兑换检查失败：{exc}"
+            result.exchange = "check_failed" if auto_exchange else "disabled"
+            _refresh_optional_status(selected_api, result)
+            return result
 
         if not auto_exchange:
             result.exchange = "disabled"
+            _refresh_optional_status(selected_api, result)
             return result
 
         if result.points_total < best_plan.points:
             result.exchange = "waiting"
             result.points_needed = best_plan.points - result.points_total
+            _refresh_optional_status(selected_api, result)
             return result
 
-        selected_api.exchange(best_plan.plan_id)
-        result.exchange = "success"
-        result.points_after_exchange = selected_api.points()
         try:
-            refreshed = selected_api.status()
-            result.days_left = refreshed.get("days_left", result.days_left)
-            result.plan_name = refreshed.get("plan_name", result.plan_name)
-        except CheckinError:
-            pass
-        return result
-    except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
-        result.error = str(exc)
+            selected_api.exchange(best_plan.plan_id)
+            result.exchange = "success"
+        except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
+            result.exchange = "failed"
+            result.error = f"签到已完成，但自动兑换失败：{exc}"
+            _refresh_optional_status(selected_api, result)
+            return result
+
+        try:
+            result.points_after_exchange = selected_api.points()
+        except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
+            result.error = f"兑换已提交，但兑换后积分复核失败：{exc}"
+
+        _refresh_optional_status(selected_api, result)
         return result
     finally:
         selected_api.close()
@@ -362,6 +382,8 @@ def format_human_summary(result: AccountResult) -> str:
         lines.append("兑换: 已关闭")
     else:
         lines.append(f"兑换: {result.exchange}")
+    if result.status_warning:
+        lines.append(f"状态辅助信息: 暂不可用 · {result.status_warning}")
     if result.error:
         lines.append(f"错误: {result.error}")
     return "\n".join(lines)
@@ -440,18 +462,39 @@ def _to_int(value: Any, field: str) -> int:
         raise ProtocolError(f"{field} 不是有效数字") from exc
 
 
-def _first_string(data: Dict[str, Any], keys: Iterable[str]) -> str:
-    for key in keys:
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+def _candidate_dicts(data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    payload_data = data.get("data")
+    if isinstance(payload_data, dict):
+        yield payload_data
+        nested_user = payload_data.get("user")
+        if isinstance(nested_user, dict):
+            yield nested_user
     user = data.get("user")
     if isinstance(user, dict):
+        yield user
+    yield data
+
+
+def _first_string(data: Dict[str, Any], keys: Iterable[str]) -> str:
+    for source in _candidate_dicts(data):
         for key in keys:
-            value = user.get(key)
+            value = source.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return ""
+
+
+def _first_int(data: Dict[str, Any], keys: Iterable[str]) -> Optional[int]:
+    for source in _candidate_dicts(data):
+        for key in keys:
+            value = source.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _extract_points_added(payload: Dict[str, Any], message: str) -> int:
