@@ -1,15 +1,15 @@
-# GLaDOS Account Center V2.0.8 single-app integration
+# GLaDOS Account Center V2.0.9 single-app integration
 
-V2.0.8 keeps the proven V2.0.6/V2.0.7 Account Center business core intact and removes every user-visible helper app. The installed product must be exactly one macOS application: `GLaDOS Account Center.app`.
+V2.0.9 keeps the proven V2.0.6/V2.0.7/V2.0.8 Account Center business core intact, keeps the single-app architecture, and adds a visible exchange-policy entry in the main window title bar. The installed product must be exactly one macOS application: `GLaDOS Account Center.app`.
 
 ## Architecture
 
 - `GLaDOSAccountCenter.real`: the proven native SwiftUI Account Center core. Existing account management, status, calendar, run history, GitHub management and add-account flow remain unchanged.
 - `launcher.c`: a minimal launcher that injects `PolicyMenuPlugin.dylib` and executes the proven native core.
-- `PolicyMenuPlugin.m`: adds `账号兑换方案…` to the Account Center app menu and loads `GLaDOSPolicyEditor.dylib` in the same process with `dlopen`/`dlsym`.
+- `PolicyMenuPlugin.m`: adds a visible `兑换方案` button to the Account Center main window title bar, keeps `账号兑换方案…` in the app menu as a fallback, and loads `GLaDOSPolicyEditor.dylib` in the same process with `dlopen`/`dlsym`.
 - `PolicyEditor.swift`: an in-process SwiftUI `NSWindow`. It is not an app, creates no helper process, and reads/writes only `.github/glados/account_policies.json` through GitHub CLI/API. Cookies and Secret values are never read.
-- `SafariExtensionSource/`: maintainable Safari Web Extension source/resources and native handler. `build-v208.sh` uses Xcode's `safari-web-extension-converter` plus `xcodebuild` to produce a standards-compliant `com.apple.Safari.web-extension` `.appex`, then embeds only that extension at `GLaDOS Account Center.app/Contents/PlugIns/`; no standalone `GLaDOS Safari Bridge.app` is required.
-- `build-v208.sh`: builds/signs the true single-app bundle, rebuilds the Safari extension from source, and refuses output if any nested `.app` remains.
+- `SafariExtensionSource/`: maintainable Safari Web Extension source/resources and native handler. `build-v209.sh` uses Xcode's `safari-web-extension-converter` plus `xcodebuild` to produce a standards-compliant `com.apple.Safari.web-extension` `.appex`, then embeds only that extension at `GLaDOS Account Center.app/Contents/PlugIns/`; no standalone `GLaDOS Safari Bridge.app` is required.
+- `build-v209.sh`: builds/signs the true single-app bundle, rebuilds the Safari extension from source, and refuses output if any nested `.app` remains.
 
 ## Account exchange policy
 
@@ -33,9 +33,9 @@ Saving uses the GitHub Contents API with the file SHA observed at load time. A s
 ## Build
 
 ```bash
-./app_integration/build-v208.sh \
+./app_integration/build-v209.sh \
   '/Users/enoch/Applications/GLaDOS Account Center.app' \
-  '/private/tmp/GLaDOS-Account-Center-v2.0.8-final.app'
+  '/private/tmp/GLaDOS-Account-Center-v2.0.9-final.app'
 ```
 
 The build script verifies signing, rebuilds the Safari Web Extension from source with a macOS 12 deployment target, validates its extension point/bundle identifier, requires the embedded `.appex`, and fails if any nested `.app` exists. Xcode command-line tools are therefore a build-time dependency only; the installed product remains one Account Center app.
@@ -49,4 +49,4 @@ The build script verifies signing, rebuilds the Safari Web Extension from source
 - `.github/glados/account_policies.json`
 - production workflows/schedules and account history
 
-V2.0.8 changes packaging/integration only; check-in, points, status fallback and exchange execution logic remain the validated production logic.
+V2.0.9 changes packaging/integration visibility only; check-in, points, status fallback and exchange execution logic remain the validated production logic.

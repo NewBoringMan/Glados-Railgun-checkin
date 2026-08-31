@@ -2,10 +2,10 @@
 set -euo pipefail
 
 SOURCE_APP="${1:-/Users/enoch/Applications/GLaDOS Account Center.app}"
-OUTPUT_APP="${2:-/private/tmp/GLaDOS-Account-Center-v2.0.8-stage.app}"
+OUTPUT_APP="${2:-/private/tmp/GLaDOS-Account-Center-v2.0.9-stage.app}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="2.0.8"
-BUILD="20008"
+VERSION="2.0.9"
+BUILD="20009"
 
 if [[ ! -d "$SOURCE_APP/Contents" ]]; then
   echo "Source app not found: $SOURCE_APP" >&2
