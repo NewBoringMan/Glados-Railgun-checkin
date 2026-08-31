@@ -9,6 +9,7 @@ V2.0.9 keeps the proven V2.0.6/V2.0.7/V2.0.8 Account Center business core intact
 - `PolicyMenuPlugin.m`: adds a visible `兑换方案` button to the Account Center main window title bar, keeps `账号兑换方案…` in the app menu as a fallback, and loads `GLaDOSPolicyEditor.dylib` in the same process with `dlopen`/`dlsym`.
 - `PolicyEditor.swift`: an in-process SwiftUI `NSWindow`. It is not an app, creates no helper process, and reads/writes only `.github/glados/account_policies.json` through GitHub CLI/API. Cookies and Secret values are never read.
 - `SafariExtensionSource/`: maintainable Safari Web Extension source/resources and native handler. `build-v209.sh` uses Xcode's `safari-web-extension-converter` plus `xcodebuild` to produce a standards-compliant `com.apple.Safari.web-extension` `.appex`, then embeds only that extension at `GLaDOS Account Center.app/Contents/PlugIns/`; no standalone `GLaDOS Safari Bridge.app` is required.
+- V2.0.9 Build 20010 removes the last legacy Safari helper/setup-directory fallback. Safari setup now opens Safari directly and refers only to the extension embedded in Account Center.
 - `build-v209.sh`: builds/signs the true single-app bundle, rebuilds the Safari extension from source, and refuses output if any nested `.app` remains.
 
 ## Account exchange policy

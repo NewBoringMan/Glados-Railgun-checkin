@@ -5,7 +5,7 @@ SOURCE_APP="${1:-/Users/enoch/Applications/GLaDOS Account Center.app}"
 OUTPUT_APP="${2:-/private/tmp/GLaDOS-Account-Center-v2.0.9-stage.app}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VERSION="2.0.9"
-BUILD="20009"
+BUILD="20010"
 
 if [[ ! -d "$SOURCE_APP/Contents" ]]; then
   echo "Source app not found: $SOURCE_APP" >&2
@@ -109,6 +109,7 @@ p = Path(sys.argv[1])
 text = p.read_text(encoding='utf-8')
 old_const = "const SAFARI_COMPANION_APP = path.join(os.homedir(), 'Applications', 'GLaDOS Safari Bridge.app');"
 new_const = "const SAFARI_EXTENSION_BUNDLE = path.resolve(__dirname, '..', 'PlugIns', 'GLaDOS Safari Bridge Extension.appex');"
+old_build_dir = "const SAFARI_BUILD_DIR = path.join(SUPPORT_DIR, 'SafariNativeBridge');\n"
 old_check = """  if (!fs.existsSync(SAFARI_COMPANION_APP)) {
     throw new Error('尚未安装“GLaDOS Safari Bridge.app”。请运行交付包中的“构建并安装 Safari 扩展.command”。');
   }
@@ -117,11 +118,31 @@ new_check = """  if (!fs.existsSync(SAFARI_EXTENSION_BUNDLE)) {
     throw new Error('GLaDOS Account Center 内置的 Safari 扩展缺失。请重新安装 GLaDOS Account Center。');
   }
 """
+old_setup = """function openSafariExtensionSetup() {
+  if (fs.existsSync(SAFARI_COMPANION_APP)) {
+    run('/usr/bin/open', [SAFARI_COMPANION_APP], { timeout: 10000 });
+  } else if (fs.existsSync(SAFARI_BUILD_DIR)) {
+    run('/usr/bin/open', [SAFARI_BUILD_DIR], { timeout: 10000 });
+  }
+  run('/usr/bin/open', ['-a', 'Safari'], { timeout: 10000 });
+"""
+new_setup = """function openSafariExtensionSetup() {
+  run('/usr/bin/open', ['-a', 'Safari'], { timeout: 10000 });
+"""
 if old_const in text:
     text = text.replace(old_const, new_const, 1)
+if old_build_dir in text:
+    text = text.replace(old_build_dir, '', 1)
 if old_check in text:
     text = text.replace(old_check, new_check, 1)
-if 'SAFARI_EXTENSION_BUNDLE' not in text or 'GLaDOS Safari Bridge.app' in text:
+if old_setup in text:
+    text = text.replace(old_setup, new_setup, 1)
+if (
+    'SAFARI_EXTENSION_BUNDLE' not in text
+    or 'GLaDOS Safari Bridge.app' in text
+    or 'SAFARI_COMPANION_APP' in text
+    or 'SAFARI_BUILD_DIR' in text
+):
     raise SystemExit('Safari bridge integration patch did not apply cleanly')
 p.write_text(text, encoding='utf-8')
 PY
