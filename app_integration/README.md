@@ -6,7 +6,7 @@ V2.0.9 keeps the proven V2.0.6/V2.0.7/V2.0.8 Account Center business core intact
 
 - `GLaDOSAccountCenter.real`: the proven native SwiftUI Account Center core. Existing account management, status, calendar, run history, GitHub management and add-account flow remain unchanged.
 - `launcher.c`: a minimal launcher that injects `PolicyMenuPlugin.dylib` and executes the proven native core.
-- `PolicyMenuPlugin.m`: adds a visible `兑换方案` button to the Account Center main window title bar, keeps `账号兑换方案…` in the app menu as a fallback, and loads `GLaDOSPolicyEditor.dylib` in the same process with `dlopen`/`dlsym`.
+- `PolicyMenuPlugin.m`: adds a visible `兑换方案` button to the Account Center main window title bar, keeps `账号兑换方案…` in the app menu as a fallback, and loads `GLaDOSPolicyEditor.dylib` in the same process with `dlopen`/`dlsym`. It also upgrades each account card's `打开 GLaDOS` action to use a Microsoft Edge profile isolated by that account's stable Account Key.
 - `PolicyEditor.swift`: an in-process SwiftUI `NSWindow`. It is not an app, creates no helper process, and reads/writes only `.github/glados/account_policies.json` through GitHub CLI/API. Cookies and Secret values are never read.
 - `SafariExtensionSource/`: maintainable Safari Web Extension source/resources and native handler. `build-v209.sh` uses Xcode's `safari-web-extension-converter` plus `xcodebuild` to produce a standards-compliant `com.apple.Safari.web-extension` `.appex`, then embeds only that extension at `GLaDOS Account Center.app/Contents/PlugIns/`; no standalone `GLaDOS Safari Bridge.app` is required.
 - V2.0.9 Build 20010 removes the last legacy Safari helper/setup-directory fallback. Safari setup now opens Safari directly and refers only to the extension embedded in Account Center.
@@ -21,6 +21,14 @@ GitHub remains the single source of truth:
 Supported choices are generated from the verified exchange catalog. Current verified choices include smart/auto, `100 -> 10 days`, `200 -> 30 days`, and `500 -> 100 days`. Missing/empty account policies safely default to smart/auto. Per-account policy remains independent from the generated `gladosAccounts.yml` workflow.
 
 Saving uses the GitHub Contents API with the file SHA observed at load time. A stale editor cannot silently overwrite a newer change from another computer. Fixed mappings for deleted accounts are pruned on the next successful editor save.
+
+## Account-specific GLaDOS browser sessions
+
+- Persistent account-specific profiles live under `~/Library/Application Support/GLaDOS Account Center/BrowserProfiles/accounts/<ACCOUNT_KEY>/edge/`.
+- `打开 GLaDOS` identifies the account card that opened the menu and launches Microsoft Edge with exactly that account's profile and the GLaDOS management page.
+- The existing `重新读取登录信息`, add-account, GitHub Secret and check-in flows are intentionally unchanged.
+- Existing GitHub Secrets are never read back or copied into browser storage. Existing accounts therefore need one normal browser login the first time their account-specific Edge profile is created. After that, Edge keeps the session normally.
+- If the plugin cannot confidently identify the account card, it refuses to open a generic GLaDOS session. This fail-closed behavior prevents accidental cross-account login confusion.
 
 ## Single-app rules
 
