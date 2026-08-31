@@ -85,6 +85,11 @@
       "enabled" : true,
       "label" : "GLaDOS BF2B99"
     },
+    "D24056DB5D3E666D" : {
+      "autoExchange" : true,
+      "enabled" : true,
+      "label" : "GLaDOS D24056"
+    },
     "D3BF64EA169A450D" : {
       "autoExchange" : true,
       "enabled" : true,
