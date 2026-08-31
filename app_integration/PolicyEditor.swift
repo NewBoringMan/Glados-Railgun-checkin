@@ -5,6 +5,8 @@ import AppKit
 private let repository = "NewBoringMan/Glados-Railgun-checkin"
 private let policyPath = ".github/glados/account_policies.json"
 private let defaultBranch = "master"
+private let statusCacheURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/GLaDOS Account Center/status-cache.json")
 
 struct AccountEntry: Decodable {
     let autoExchange: Bool
@@ -14,6 +16,16 @@ struct AccountEntry: Decodable {
 
 struct AccountsFile: Decodable {
     let accounts: [String: AccountEntry]
+}
+
+struct StatusCacheEntry: Decodable {
+    let accountKey: String
+    let email: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accountKey = "account_key"
+        case email
+    }
 }
 
 struct ExchangePlan: Codable, Hashable, Identifiable {
@@ -44,9 +56,19 @@ struct AccountPolicies: Codable, Equatable {
 struct AccountRow: Identifiable, Hashable {
     let key: String
     let label: String
+    let email: String?
     let enabled: Bool
     let autoExchange: Bool
     var id: String { key }
+
+    private var normalizedEmail: String? {
+        guard let email else { return nil }
+        let value = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    var displayName: String { normalizedEmail ?? label }
+    var subtitle: String { normalizedEmail == nil ? key : "\(label) · \(key)" }
 }
 
 struct PolicyOption: Identifiable, Hashable {
@@ -161,7 +183,7 @@ final class PolicyEditorModel: ObservableObject {
         defer { isBusy = false }
 
         do {
-            let snapshot = try await Task.detached(priority: .userInitiated) { () -> (AccountsFile, CatalogFile, AccountPolicies, String?) in
+            let snapshot = try await Task.detached(priority: .userInitiated) { () -> (AccountsFile, CatalogFile, AccountPolicies, String?, [String: String]) in
                 let decoder = JSONDecoder()
                 let accountsRaw = try Shell.shared.gh([
                     "api", "repos/\(repository)/contents/.github/glados/accounts.json",
@@ -186,6 +208,7 @@ final class PolicyEditorModel: ObservableObject {
 
                 var policies = AccountPolicies()
                 var policySHA: String? = nil
+                var emailsByKey: [String: String] = [:]
                 if policyMetadata.status == 0 {
                     let sha = policyMetadata.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
                     policySHA = sha.isEmpty ? nil : sha
@@ -203,7 +226,16 @@ final class PolicyEditorModel: ObservableObject {
                         throw PolicyEditorError.commandFailed(policyMetadata.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
                     }
                 }
-                return (accounts, catalog, policies, policySHA)
+                if let cacheData = try? Data(contentsOf: statusCacheURL),
+                   let cachedEntries = try? decoder.decode([StatusCacheEntry].self, from: cacheData) {
+                    for entry in cachedEntries {
+                        let email = (entry.email ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !email.isEmpty {
+                            emailsByKey[entry.accountKey.uppercased()] = email
+                        }
+                    }
+                }
+                return (accounts, catalog, policies, policySHA, emailsByKey)
             }.value
 
             let validPlans = Set(snapshot.1.plans.filter(\.verified).map(\.id))
@@ -211,9 +243,16 @@ final class PolicyEditorModel: ObservableObject {
                 ? snapshot.2.defaultPolicy : "auto"
 
             rows = snapshot.0.accounts.map { key, value in
-                AccountRow(key: key.uppercased(), label: value.label, enabled: value.enabled, autoExchange: value.autoExchange)
+                let normalizedKey = key.uppercased()
+                return AccountRow(
+                    key: normalizedKey,
+                    label: value.label,
+                    email: snapshot.4[normalizedKey],
+                    enabled: value.enabled,
+                    autoExchange: value.autoExchange
+                )
             }.sorted { lhs, rhs in
-                let l = lhs.label.localizedCaseInsensitiveCompare(rhs.label)
+                let l = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
                 return l == .orderedSame ? lhs.key < rhs.key : l == .orderedAscending
             }
             plans = snapshot.1.plans.filter(\.verified)
@@ -352,9 +391,9 @@ struct PolicyEditorContentView: View {
                     ForEach(model.rows) { row in
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(row.label)
+                                Text(row.displayName)
                                     .font(.body.weight(.medium))
-                                Text(row.key)
+                                Text(row.subtitle)
                                     .font(.caption.monospaced())
                                     .foregroundStyle(.secondary)
                             }
