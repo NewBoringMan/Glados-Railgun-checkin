@@ -1,5 +1,7 @@
 {
-  "version": 1,
-  "default": "auto",
-  "accounts": {}
+  "accounts" : {
+    "D5B94FCC804F2B47" : "plan200"
+  },
+  "default" : "auto",
+  "version" : 1
 }
