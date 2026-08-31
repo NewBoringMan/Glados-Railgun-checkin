@@ -3,7 +3,6 @@ set -euo pipefail
 
 SOURCE_APP="${1:-/Users/enoch/Applications/GLaDOS Account Center.app}"
 OUTPUT_APP="${2:-/private/tmp/GLaDOS-Account-Center-v2.0.8-stage.app}"
-SAFARI_BRIDGE_APP="${3:-/Users/enoch/Applications/GLaDOS Safari Bridge.app}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VERSION="2.0.8"
 BUILD="20008"
@@ -25,11 +24,11 @@ FRAMEWORKS="$OUTPUT_APP/Contents/Frameworks"
 PLUGINS="$OUTPUT_APP/Contents/PlugIns"
 CAPTURE="$OUTPUT_APP/Contents/Resources/capture_account.js"
 EMBEDDED_SAFARI="$PLUGINS/GLaDOS Safari Bridge Extension.appex"
-SOURCE_EMBEDDED="$SOURCE_APP/Contents/PlugIns/GLaDOS Safari Bridge Extension.appex"
-STANDALONE_EMBEDDED="$SAFARI_BRIDGE_APP/Contents/PlugIns/GLaDOS Safari Bridge Extension.appex"
+SAFARI_SOURCE="$SCRIPT_DIR/SafariExtensionSource"
 
 mkdir -p "$FRAMEWORKS" "$PLUGINS"
 python3 -c 'import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$OUTPUT_APP/Contents/Applications"
+python3 -c 'import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$EMBEDDED_SAFARI"
 
 if [[ -x "$MACOS/GLaDOSAccountCenter.real" ]]; then
   cp "$MACOS/GLaDOSAccountCenter.real" "$MACOS/GLaDOSAccountCenter"
@@ -52,15 +51,55 @@ xcrun clang -arch arm64 -dynamiclib -fobjc-arc -framework AppKit \
   -o "$FRAMEWORKS/PolicyMenuPlugin.dylib" \
   "$SCRIPT_DIR/PolicyMenuPlugin.m"
 
-if [[ ! -d "$EMBEDDED_SAFARI" ]]; then
-  if [[ -d "$SOURCE_EMBEDDED" ]]; then
-    /usr/bin/ditto "$SOURCE_EMBEDDED" "$EMBEDDED_SAFARI"
-  elif [[ -d "$STANDALONE_EMBEDDED" ]]; then
-    /usr/bin/ditto "$STANDALONE_EMBEDDED" "$EMBEDDED_SAFARI"
-  else
-    echo "Safari extension source not found; refusing to build a version that loses Safari support." >&2
-    exit 3
-  fi
+if [[ ! -f "$SAFARI_SOURCE/Resources/manifest.json" || ! -f "$SAFARI_SOURCE/SafariWebExtensionHandler.swift" ]]; then
+  echo "Safari extension source is incomplete." >&2
+  exit 3
+fi
+
+SAFARI_TMP="$(mktemp -d "${TMPDIR:-/private/tmp}/glados-safari-v208.XXXXXX")"
+cleanup_safari_tmp() {
+  python3 -c 'import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1]); shutil.rmtree(p) if p.exists() else None' "$SAFARI_TMP"
+}
+trap cleanup_safari_tmp EXIT
+
+xcrun safari-web-extension-converter "$SAFARI_SOURCE/Resources" \
+  --project-location "$SAFARI_TMP" \
+  --app-name 'GLaDOS Account Center' \
+  --bundle-identifier com.enoch.glados-account-center \
+  --swift --macos-only --copy-resources --no-open --no-prompt --force >/dev/null
+
+SAFARI_PROJECT_ROOT="$SAFARI_TMP/GLaDOS Account Center"
+SAFARI_EXTENSION_SOURCE="$SAFARI_PROJECT_ROOT/GLaDOS Account Center Extension"
+SAFARI_BUILD_ROOT="$SAFARI_TMP/build"
+cp "$SAFARI_SOURCE/SafariWebExtensionHandler.swift" "$SAFARI_EXTENSION_SOURCE/SafariWebExtensionHandler.swift"
+
+xcodebuild \
+  -project "$SAFARI_PROJECT_ROOT/GLaDOS Account Center.xcodeproj" \
+  -target 'GLaDOS Account Center Extension' \
+  -configuration Release \
+  SYMROOT="$SAFARI_BUILD_ROOT/products" \
+  OBJROOT="$SAFARI_BUILD_ROOT/obj" \
+  CODE_SIGNING_ALLOWED=NO \
+  MACOSX_DEPLOYMENT_TARGET=12.0 \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
+  PRODUCT_BUNDLE_IDENTIFIER=com.enoch.glados-account-center.safari-bridge.extension \
+  build >/dev/null
+
+SAFARI_PRODUCT="$SAFARI_BUILD_ROOT/products/Release/GLaDOS Account Center Extension.appex"
+if [[ ! -d "$SAFARI_PRODUCT" ]]; then
+  echo "Safari extension build product not found." >&2
+  exit 3
+fi
+/usr/bin/ditto "$SAFARI_PRODUCT" "$EMBEDDED_SAFARI"
+
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$EMBEDDED_SAFARI/Contents/Info.plist")" != "com.apple.Safari.web-extension" ]]; then
+  echo "Safari extension point is invalid." >&2
+  exit 3
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$EMBEDDED_SAFARI/Contents/Info.plist")" != "com.enoch.glados-account-center.safari-bridge.extension" ]]; then
+  echo "Safari extension bundle identifier is invalid." >&2
+  exit 3
 fi
 
 python3 - "$CAPTURE" <<'PY'
@@ -116,3 +155,4 @@ fi
 echo "Built: $OUTPUT_APP"
 echo "Version: $VERSION ($BUILD)"
 echo "Single-app layout: OK"
+echo "Safari web extension: standard embedded .appex"
