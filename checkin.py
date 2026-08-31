@@ -22,6 +22,7 @@ from logging_config import init_logger
 LOGGER = init_logger()
 DEFAULT_DOMAINS = ("glados.cloud", "railgun.info")
 DEFAULT_CATALOG_PATH = Path(".github/glados/exchange_plans.json")
+DEFAULT_ACCOUNT_POLICIES_PATH = Path(".github/glados/account_policies.json")
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 CHALLENGE_HINTS = ("captcha", "challenge", "access denied", "cloudflare", "人机验证", "验证码")
 
@@ -71,6 +72,9 @@ class AccountResult:
     email: str = ""
     plan_name: str = ""
     auto_exchange: bool = False
+    exchange_policy: str = "auto"
+    exchange_policy_source: str = "default"
+    policy_warning: str = ""
     exchange_plan: str = ""
     exchange_threshold: Optional[int] = None
     exchange_days: Optional[int] = None
@@ -98,6 +102,9 @@ class Config:
         self.auto_exchange = _as_bool(source.get("GLADOS_AUTO_EXCHANGE"), False)
         self.account_key = source.get("GLADOS_ACCOUNT_KEY", "").strip()
         self.catalog_path = Path(source.get("GLADOS_EXCHANGE_CATALOG", str(DEFAULT_CATALOG_PATH)))
+        self.account_policies_path = Path(
+            source.get("GLADOS_ACCOUNT_POLICIES_FILE", str(DEFAULT_ACCOUNT_POLICIES_PATH))
+        )
         self.domains = tuple(
             item.strip().lower()
             for item in source.get("GLADOS_DOMAINS", ",".join(DEFAULT_DOMAINS)).split(",")
@@ -262,6 +269,87 @@ def select_best_exchange_plan(plans: Iterable[ExchangePlan]) -> ExchangePlan:
     return min(candidates, key=lambda plan: (plan.cost_per_day, plan.days, plan.points, plan.plan_id))
 
 
+def load_account_policies(path: Path) -> str:
+    """Load the non-sensitive account policy file without ever gating check-in.
+
+    Missing/unreadable configuration deliberately falls back to smart auto.
+    Malformed JSON is handled by parse_account_policies so each result carries
+    an explicit policy warning.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        LOGGER.warning("账号兑换策略文件读取失败，已回退智能最优: %s", exc)
+        return ""
+
+
+def parse_account_policies(raw: str) -> tuple[str, Dict[str, str], str]:
+    """Parse non-sensitive per-account exchange policy configuration.
+
+    Expected shape:
+    {"version":1,"default":"auto","accounts":{"ACCOUNT_KEY":"plan200"}}
+    """
+    if not raw:
+        return "auto", {}, ""
+
+    warnings: List[str] = []
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        return "auto", {}, f"账号兑换策略配置无法解析，已回退智能最优：{exc}"
+
+    if not isinstance(payload, dict):
+        return "auto", {}, "账号兑换策略配置不是对象，已回退智能最优"
+
+    default_policy = str(payload.get("default", "auto") or "auto").strip()
+    if default_policy != "auto" and not re.fullmatch(r"plan[A-Za-z0-9_-]+", default_policy):
+        warnings.append(f"默认兑换策略 {default_policy!r} 无效，已回退智能最优")
+        default_policy = "auto"
+
+    accounts_raw = payload.get("accounts", {})
+    accounts: Dict[str, str] = {}
+    if accounts_raw is None:
+        accounts_raw = {}
+    if not isinstance(accounts_raw, dict):
+        warnings.append("账号兑换策略 accounts 不是对象，已忽略账号级配置")
+    else:
+        for key, value in accounts_raw.items():
+            account_key = str(key or "").strip().upper()
+            policy = str(value or "").strip()
+            if not account_key:
+                continue
+            if policy == "auto" or re.fullmatch(r"plan[A-Za-z0-9_-]+", policy):
+                accounts[account_key] = policy
+            else:
+                warnings.append(f"账号 {account_key} 的兑换策略 {policy!r} 无效，已忽略")
+
+    return default_policy, accounts, "；".join(warnings)
+
+
+def resolve_exchange_plan(
+    plans: Iterable[ExchangePlan], account_key: str, raw_policies: str
+) -> tuple[ExchangePlan, str, str, str]:
+    catalog = list(plans)
+    default_policy, accounts, warning = parse_account_policies(raw_policies)
+    normalized_key = (account_key or "").strip().upper()
+    source = "account" if normalized_key and normalized_key in accounts else "default"
+    configured_policy = accounts.get(normalized_key, default_policy)
+
+    if configured_policy == "auto":
+        return select_best_exchange_plan(catalog), "auto", source, warning
+
+    selected = next((plan for plan in catalog if plan.plan_id == configured_policy and plan.verified), None)
+    if selected is not None:
+        return selected, configured_policy, source, warning
+
+    fallback = select_best_exchange_plan(catalog)
+    extra = f"兑换策略 {configured_policy} 不存在或未验证，已回退智能最优 {fallback.plan_id}"
+    warning = f"{warning}；{extra}" if warning else extra
+    return fallback, "auto", "fallback", warning
+
+
 def _refresh_optional_status(api: GladosAPI, result: AccountResult) -> None:
     """Best-effort metadata refresh that can never downgrade a completed check-in."""
     try:
@@ -281,6 +369,7 @@ def run_one_account(
     auto_exchange: bool,
     catalog: List[ExchangePlan],
     domains: Iterable[str],
+    account_policies: str = "",
     api_factory=GladosAPI,
 ) -> AccountResult:
     result = AccountResult(
@@ -288,11 +377,16 @@ def run_one_account(
         account_key=account_key or f"legacy-{account_index}",
         auto_exchange=auto_exchange,
     )
-    best_plan = select_best_exchange_plan(catalog)
-    result.exchange_plan = best_plan.plan_id
-    result.exchange_threshold = best_plan.points
-    result.exchange_days = best_plan.days
-    result.exchange_cost_per_day = float(best_plan.cost_per_day)
+    selected_plan, configured_policy, policy_source, policy_warning = resolve_exchange_plan(
+        catalog, result.account_key, account_policies
+    )
+    result.exchange_policy = configured_policy
+    result.exchange_policy_source = policy_source
+    result.policy_warning = policy_warning
+    result.exchange_plan = selected_plan.plan_id
+    result.exchange_threshold = selected_plan.points
+    result.exchange_days = selected_plan.days
+    result.exchange_cost_per_day = float(selected_plan.cost_per_day)
 
     # The write path is intentionally first. Read-only status/points APIs must
     # never gate the check-in request itself.
@@ -335,14 +429,14 @@ def run_one_account(
             _refresh_optional_status(selected_api, result)
             return result
 
-        if result.points_total < best_plan.points:
+        if result.points_total < selected_plan.points:
             result.exchange = "waiting"
-            result.points_needed = best_plan.points - result.points_total
+            result.points_needed = selected_plan.points - result.points_total
             _refresh_optional_status(selected_api, result)
             return result
 
         try:
-            selected_api.exchange(best_plan.plan_id)
+            selected_api.exchange(selected_plan.plan_id)
             result.exchange = "success"
         except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
             result.exchange = "failed"
@@ -371,9 +465,12 @@ def format_human_summary(result: AccountResult) -> str:
         f"自动兑换: {'开启' if result.auto_exchange else '关闭'}",
     ]
     if result.exchange_threshold is not None:
+        policy_label = "智能最优" if result.exchange_policy == "auto" else f"固定 {result.exchange_policy}"
         lines.append(
-            f"最优兑换: {result.exchange_plan} · {result.exchange_threshold} 分 → {result.exchange_days} 天 · {result.exchange_cost_per_day:.3f} 分/天"
+            f"兑换策略: {policy_label} · 本次 {result.exchange_plan} · {result.exchange_threshold} 分 → {result.exchange_days} 天 · {result.exchange_cost_per_day:.3f} 分/天"
         )
+    if result.policy_warning:
+        lines.append(f"策略警告: {result.policy_warning}")
     if result.exchange == "waiting":
         lines.append(f"兑换: 未触发 · 还差 {result.points_needed} 分")
     elif result.exchange == "success":
@@ -421,6 +518,7 @@ def main() -> int:
         float(best.cost_per_day),
     )
     LOGGER.info("自动兑换: %s", "开启" if config.auto_exchange else "关闭")
+    account_policies = load_account_policies(config.account_policies_path)
 
     results: List[AccountResult] = []
     for index, cookie in enumerate(config.cookies, 1):
@@ -431,6 +529,7 @@ def main() -> int:
             auto_exchange=config.auto_exchange,
             catalog=catalog,
             domains=config.domains,
+            account_policies=account_policies,
         )
         results.append(result)
         LOGGER.info("\n%s", format_human_summary(result))
