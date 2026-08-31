@@ -1,49 +1,52 @@
-# GLaDOS Account Center V2.0.7 integration
+# GLaDOS Account Center V2.0.8 single-app integration
 
-This directory contains the maintainable source for the V2.0.7 per-account exchange-policy integration.
+V2.0.8 keeps the proven V2.0.6/V2.0.7 Account Center business core intact and removes every user-visible helper app. The installed product must be exactly one macOS application: `GLaDOS Account Center.app`.
 
 ## Architecture
 
-- `GLaDOSAccountCenter.real`: the proven V2.0.6 native SwiftUI binary, kept unchanged.
-- `launcher.c`: a minimal launcher that injects `PolicyMenuPlugin.dylib` and then executes the original binary.
-- `PolicyMenuPlugin.m`: adds `账号兑换方案…` to the Account Center app menu and opens the embedded editor.
-- `PolicyEditor.swift`: SwiftUI editor for per-account exchange policies.
-- `PolicyEditor-Info.plist`: embedded helper bundle metadata.
-- `build-v207.sh`: reproducibly builds/signs V2.0.7 from a trusted Account Center app base.
+- `GLaDOSAccountCenter.real`: the proven native SwiftUI Account Center core. Existing account management, status, calendar, run history, GitHub management and add-account flow remain unchanged.
+- `launcher.c`: a minimal launcher that injects `PolicyMenuPlugin.dylib` and executes the proven native core.
+- `PolicyMenuPlugin.m`: adds `账号兑换方案…` to the Account Center app menu and loads `GLaDOSPolicyEditor.dylib` in the same process with `dlopen`/`dlsym`.
+- `PolicyEditor.swift`: an in-process SwiftUI `NSWindow`. It is not an app, creates no helper process, and reads/writes only `.github/glados/account_policies.json` through GitHub CLI/API. Cookies and Secret values are never read.
+- `SafariExtensionSource/`: maintainable Safari Web Extension source/resources. The built `.appex` is embedded at `GLaDOS Account Center.app/Contents/PlugIns/`; no standalone `GLaDOS Safari Bridge.app` is required.
+- `build-v208.sh`: builds/signs the true single-app bundle and refuses output if any nested `.app` remains.
 
-## Single source of truth
+## Account exchange policy
 
-Per-account exchange policy is stored in one non-sensitive GitHub file:
+GitHub remains the single source of truth:
 
 `.github/glados/account_policies.json`
 
-Shape:
+Supported choices are generated from the verified exchange catalog. Current verified choices include smart/auto, `100 -> 10 days`, `200 -> 30 days`, and `500 -> 100 days`. Missing/empty account policies safely default to smart/auto. Per-account policy remains independent from the generated `gladosAccounts.yml` workflow.
 
-```json
-{"version":1,"default":"auto","accounts":{"ACCOUNT_KEY":"plan200"}}
-```
+Saving uses the GitHub Contents API with the file SHA observed at load time. A stale editor cannot silently overwrite a newer change from another computer. Fixed mappings for deleted accounts are pruned on the next successful editor save.
 
-`auto` means the existing smart best-plan policy. Fixed values must reference a verified plan in `.github/glados/exchange_plans.json`.
+## Single-app rules
 
-The editor reads `.github/glados/accounts.json` for account key/label/enabled/autoExchange, `.github/glados/exchange_plans.json` for verified choices, and `.github/glados/account_policies.json` for the current per-account selection. It never reads GitHub Secret values or GLaDOS cookie contents.
-
-Saving updates only `account_policies.json` on `master` through the GitHub Contents API, using the file SHA observed when the editor loaded for optimistic concurrency. If another device changes the file first, GitHub rejects the stale save instead of letting it overwrite newer policy. After a successful write, the editor reads the file back and verifies the exact decoded policy before reporting success. The small Git commit produced by each real policy change is intentional: it gives rollback/history and avoids coupling policy delivery to the Account Center workflow generator.
-
-## Safety / compatibility
-
-- Missing policy file or missing account mapping → `auto`.
-- Malformed JSON / missing or unverified fixed plan → backend falls back to smart best plan and records a warning.
-- `autoExchange=false` continues to disable exchange regardless of selected plan.
-- `checkin.py` reads the policy file directly from the checked-out repository, so Account Center can regenerate `gladosAccounts.yml` later without erasing policy delivery.
-- CI validates policy-file structure and fixed-plan validity. A stale mapping from a later deleted account is harmless and is pruned the next time the policy editor saves.
-- V2.0.6 business/UI logic remains in the original native binary instead of being reimplemented.
+1. Never ship `Contents/Applications/*.app`.
+2. Do not create a standalone exchange-policy app or Safari bridge app.
+3. Helper implementation code may be a dylib/framework or `.appex`, because macOS does not expose those as separate user apps.
+4. Build/test copies go under `/private/tmp` and are deleted after validation; do not keep `.app` backups in Spotlight-indexed workspaces.
+5. Rollback copies are compressed ZIP archives, not `.app` directories.
+6. Future V2.0.9+ work should upgrade this one Account Center bundle and preserve existing business/data contracts unless an explicit migration is required.
 
 ## Build
 
 ```bash
-./app_integration/build-v207.sh \
-  "/path/to/trusted/GLaDOS Account Center.app" \
-  "/path/to/output/GLaDOS Account Center.app"
+./app_integration/build-v208.sh \
+  '/Users/enoch/Applications/GLaDOS Account Center.app' \
+  '/private/tmp/GLaDOS-Account-Center-v2.0.8-final.app'
 ```
 
-The build is arm64, requires the macOS/Xcode command-line toolchain, signs the helper/plugin/parent bundle ad hoc, and performs `codesign --verify --deep --strict` before reporting success.
+The build script verifies signing, requires the embedded Safari extension, and fails if any nested `.app` exists.
+
+## Data that must never be removed during upgrades
+
+- `~/Library/Application Support/GLaDOS Account Center/BrowserProfiles`
+- Cookies/login state
+- GitHub Secrets
+- `.github/glados/accounts.json`
+- `.github/glados/account_policies.json`
+- production workflows/schedules and account history
+
+V2.0.8 changes packaging/integration only; check-in, points, status fallback and exchange execution logic remain the validated production logic.

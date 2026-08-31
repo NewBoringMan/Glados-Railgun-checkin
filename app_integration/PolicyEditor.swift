@@ -267,9 +267,10 @@ final class PolicyEditorModel: ObservableObject {
                 return
             }
 
+            let policiesToSave = policies
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-            var data = try encoder.encode(policies)
+            var data = try encoder.encode(policiesToSave)
             data.append(0x0A)
             let base64 = data.base64EncodedString()
             let expectedSHA = loadedPolicySHA
@@ -301,7 +302,7 @@ final class PolicyEditorModel: ObservableObject {
                 return (decoded, sha.isEmpty ? nil : sha)
             }.value
 
-            guard verified.0 == policies else {
+            guard verified.0 == policiesToSave else {
                 throw PolicyEditorError.invalidData("GitHub 写入后的策略与本地选择不一致，已停止并提示检查。")
             }
 
@@ -327,7 +328,7 @@ final class PolicyEditorModel: ObservableObject {
     }
 }
 
-struct ContentView: View {
+struct PolicyEditorContentView: View {
     @StateObject private var model = PolicyEditorModel()
 
     var body: some View {
@@ -397,7 +398,7 @@ struct ContentView: View {
                     .foregroundStyle(model.isError ? Color.red : Color.secondary)
                     .lineLimit(2)
                 Spacer()
-                Button("取消") { NSApplication.shared.terminate(nil) }
+                Button("关闭") { NSApp.keyWindow?.performClose(nil) }
                     .keyboardShortcut(.cancelAction)
                 Button("保存到 GitHub") { Task { await model.save() } }
                     .keyboardShortcut(.defaultAction)
@@ -410,12 +411,35 @@ struct ContentView: View {
     }
 }
 
-@main
-struct GLaDOSPolicyEditorApp: App {
-    var body: some Scene {
-        WindowGroup("GLaDOS 账号兑换方案") {
-            ContentView()
+@MainActor
+final class PolicyEditorWindowManager {
+    static let shared = PolicyEditorWindowManager()
+    private var window: NSWindow?
+
+    func show() {
+        if let window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
-        .windowResizability(.contentSize)
+
+        let controller = NSHostingController(rootView: PolicyEditorContentView())
+        let window = NSWindow(contentViewController: controller)
+        window.title = "GLaDOS 账号兑换方案"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 760, height: 620))
+        window.minSize = NSSize(width: 720, height: 560)
+        window.isReleasedWhenClosed = false
+        window.center()
+        self.window = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+@_cdecl("GLaDOSShowPolicyEditor")
+public func GLaDOSShowPolicyEditor() {
+    Task { @MainActor in
+        PolicyEditorWindowManager.shared.show()
     }
 }

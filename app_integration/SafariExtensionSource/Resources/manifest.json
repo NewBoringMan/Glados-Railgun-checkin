@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "GLaDOS Account Center Safari 扩展",
+  "version": "2.0.4",
+  "description": "仅在用户主动点击后，读取 glados.cloud/railgun.info 的 koa:sess 与 koa:sess.sig，并通过 Safari Native Messaging 交给GLaDOS Account Center。",
+  "permissions": ["cookies", "tabs", "activeTab", "storage", "nativeMessaging"],
+  "host_permissions": [
+    "https://glados.cloud/*",
+    "https://*.glados.cloud/*",
+    "https://railgun.info/*",
+    "https://*.railgun.info/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://glados.cloud/*",
+        "https://*.glados.cloud/*",
+        "https://railgun.info/*",
+        "https://*.railgun.info/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "发送当前 GLaDOS 账号",
+    "default_popup": "popup.html"
+  }
+}

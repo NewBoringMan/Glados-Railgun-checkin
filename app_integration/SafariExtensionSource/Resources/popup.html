@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GLaDOS Account Center</title>
+  <style>
+    body { width: 330px; margin: 0; padding: 18px; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; color: #202124; }
+    h1 { font-size: 17px; margin: 0 0 10px; }
+    p { line-height: 1.5; margin: 8px 0; }
+    button { width: 100%; border: 0; border-radius: 9px; padding: 11px 14px; font-weight: 600; background: #1677ff; color: white; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    #status { min-height: 42px; color: #555; }
+    .hint { font-size: 12px; color: #777; }
+  </style>
+</head>
+<body>
+  <h1>GLaDOS Account Center</h1>
+  <p id="status">请先在GLaDOS Account Center中选择 Safari，再确认当前页面已登录。</p>
+  <button id="send" type="button">发送当前账号</button>
+  <p class="hint">仅发送 koa:sess 与 koa:sess.sig；不会读取 GitHub Cookie。</p>
+  <script src="popup.js"></script>
+</body>
+</html>
