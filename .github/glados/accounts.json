@@ -90,6 +90,11 @@
       "enabled" : true,
       "label" : "GLaDOS D24056"
     },
+    "D3538DA41326CDF3" : {
+      "autoExchange" : true,
+      "enabled" : true,
+      "label" : "GLaDOS D3538D"
+    },
     "D3BF64EA169A450D" : {
       "autoExchange" : true,
       "enabled" : true,
