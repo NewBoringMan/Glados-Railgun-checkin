@@ -11,7 +11,9 @@ on:
         default: all
         type: string
   schedule:
-    - cron: '0 5,17 * * *'
+    - cron: '23 18 * * *'
+      timezone: 'Asia/Taipei'
+    - cron: '33 4 * * *'
       timezone: 'Asia/Taipei'
 
 permissions:
