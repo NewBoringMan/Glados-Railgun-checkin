@@ -90,13 +90,13 @@ class StatusApiCompatibilityTests(unittest.TestCase):
                 "/api/user/points": ProtocolError("points broken"),
                 "/api/user/status": {},
             },
-            "railgun.info": {
+            "glados.network": {
                 "/api/user/points": {"points": 9, "history": []},
                 "/api/user/status": {"data": {"leftDays": 5}},
             },
-        }, domains=("glados.cloud", "railgun.info"))
+        }, domains=("glados.cloud", "glados.network"))
         self.assertTrue(result["ok"])
-        self.assertEqual(result["domain"], "railgun.info")
+        self.assertEqual(result["domain"], "glados.network")
         self.assertEqual(result["points_total"], 9)
         self.assertEqual(result["days_left"], 5)
 
@@ -109,6 +109,22 @@ class StatusApiCompatibilityTests(unittest.TestCase):
         })
         self.assertFalse(result["ok"])
         self.assertIn("expired", result["error"])
+
+    def test_wrong_domain_authentication_falls_back_to_second_domain(self):
+        result = self.run_status({
+            "glados.cloud": {
+                "/api/user/points": AuthenticationError("wrong domain"),
+                "/api/user/status": {},
+            },
+            "glados.network": {
+                "/api/user/points": {"points": 19, "history": []},
+                "/api/user/status": {"data": {"leftDays": 12}},
+            },
+        }, domains=("glados.cloud", "glados.network"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["domain"], "glados.network")
+        self.assertEqual(result["points_total"], 19)
+        self.assertEqual(result["days_left"], 12)
 
     def test_nested_points_shape_is_supported(self):
         result = self.run_status({

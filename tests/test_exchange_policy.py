@@ -3,18 +3,33 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from checkin import (
+    AuthenticationError,
+    DEFAULT_DOMAINS,
     ExchangePlan,
+    GladosAPI,
+    ProtocolError,
     load_account_policies,
     load_exchange_catalog,
     parse_account_policies,
     resolve_exchange_plan,
     run_one_account,
+    safe_payload_summary,
     select_best_exchange_plan,
 )
 
 
 class FakeAPI:
-    def __init__(self, domain, cookie, *, points=0, fail_status=False, fail_checkin=False, fail_points=False):
+    def __init__(
+        self,
+        domain,
+        cookie,
+        *,
+        points=0,
+        fail_status=False,
+        fail_checkin=False,
+        fail_points=False,
+        checkin_error=None,
+    ):
         self.domain = domain
         self.cookie = cookie
         self._points = points
@@ -23,6 +38,7 @@ class FakeAPI:
         self.fail_status = fail_status
         self.fail_checkin = fail_checkin
         self.fail_points = fail_points
+        self.checkin_error = checkin_error
         self.calls = []
 
     def status(self):
@@ -34,6 +50,8 @@ class FakeAPI:
 
     def checkin(self):
         self.calls.append("checkin")
+        if self.checkin_error is not None:
+            raise self.checkin_error
         if self.fail_checkin:
             from checkin import NetworkError
             raise NetworkError("checkin down")
@@ -57,6 +75,60 @@ class FakeAPI:
 
 
 class ExchangePolicyTests(unittest.TestCase):
+    def test_default_domains_are_current_glados_hosts_only(self):
+        self.assertEqual(
+            DEFAULT_DOMAINS,
+            (
+                "glados.cloud",
+                "glados.network",
+                "glados.rocks",
+                "glados.one",
+                "glados.space",
+                "glados.vip",
+                "glados-facility.com",
+            ),
+        )
+        self.assertNotIn("railgun.info", DEFAULT_DOMAINS)
+
+    def test_checkin_token_matches_request_domain(self):
+        class Response:
+            status_code = 200
+            text = '{"code":1,"message":"already"}'
+            headers = {}
+
+            @staticmethod
+            def json():
+                return {"code": 1, "message": "already"}
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                return Response()
+
+            def close(self):
+                pass
+
+        session = Session()
+        api = GladosAPI("glados.network", "cookie", session=session)
+        self.assertEqual(api.checkin()["state"], "already")
+        self.assertEqual(session.calls[0][2]["json"], {"token": "glados.network"})
+
+    def test_safe_payload_summary_never_logs_nested_values(self):
+        summary = safe_payload_summary({
+            "code": -2,
+            "message": "No permission",
+            "data": {"secret": "TOP-SECRET", "user": {"email": "private@example.com"}},
+        })
+        self.assertIn("code=-2", summary)
+        self.assertIn("No permission", summary)
+        self.assertIn("secret", summary)
+        self.assertIn("email", summary)
+        self.assertNotIn("TOP-SECRET", summary)
+        self.assertNotIn("private@example.com", summary)
+
     def test_current_catalog_selects_500(self):
         plans = [
             ExchangePlan("plan100", 100, 10),
@@ -272,11 +344,56 @@ class ExchangePolicyTests(unittest.TestCase):
             account_key="A",
             auto_exchange=False,
             catalog=[ExchangePlan("plan500", 500, 100)],
-            domains=["glados.cloud", "railgun.info"],
+            domains=["glados.cloud", "glados.network"],
             api_factory=factory,
         )
-        self.assertEqual(result.domain, "railgun.info")
+        self.assertEqual(result.domain, "glados.network")
         self.assertEqual(len(apis), 2)
+        self.assertTrue(apis[0].closed)
+
+    def test_no_permission_falls_through_to_next_glados_domain(self):
+        apis = []
+
+        def factory(domain, cookie):
+            error = ProtocolError("code=-2, No permission") if domain == "glados.cloud" else None
+            api = FakeAPI(domain, cookie, points=10, checkin_error=error)
+            apis.append(api)
+            return api
+
+        result = run_one_account(
+            "cookie",
+            1,
+            account_key="A",
+            auto_exchange=False,
+            catalog=[ExchangePlan("plan500", 500, 100)],
+            domains=["glados.cloud", "glados.network"],
+            api_factory=factory,
+        )
+        self.assertEqual(result.domain, "glados.network")
+        self.assertEqual(result.checkin, "already")
+        self.assertTrue(result.success)
+        self.assertTrue(apis[0].closed)
+
+    def test_wrong_domain_authentication_falls_through_to_next_glados_domain(self):
+        apis = []
+
+        def factory(domain, cookie):
+            error = AuthenticationError("wrong domain") if domain == "glados.cloud" else None
+            api = FakeAPI(domain, cookie, points=10, checkin_error=error)
+            apis.append(api)
+            return api
+
+        result = run_one_account(
+            "cookie",
+            1,
+            account_key="A",
+            auto_exchange=False,
+            catalog=[ExchangePlan("plan500", 500, 100)],
+            domains=["glados.cloud", "glados.network"],
+            api_factory=factory,
+        )
+        self.assertEqual(result.domain, "glados.network")
+        self.assertTrue(result.success)
         self.assertTrue(apis[0].closed)
 
     def test_status_failure_never_blocks_checkin(self):

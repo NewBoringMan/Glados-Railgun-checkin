@@ -20,7 +20,15 @@ from logging_config import init_logger
 
 
 LOGGER = init_logger()
-DEFAULT_DOMAINS = ("glados.cloud", "railgun.info")
+DEFAULT_DOMAINS = (
+    "glados.cloud",
+    "glados.network",
+    "glados.rocks",
+    "glados.one",
+    "glados.space",
+    "glados.vip",
+    "glados-facility.com",
+)
 DEFAULT_CATALOG_PATH = Path(".github/glados/exchange_plans.json")
 DEFAULT_ACCOUNT_POLICIES_PATH = Path(".github/glados/account_policies.json")
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -206,13 +214,17 @@ class GladosAPI:
             }
         if code == 1:
             return {"state": "already", "message": message, "points_added": 0}
-        raise ProtocolError(f"签到接口业务拒绝，code={code!r}, message={message[:120]}")
+        raise ProtocolError(
+            f"{self.domain} 签到接口业务拒绝，code={code!r}, message={message[:120]}"
+        )
 
     def points(self) -> int:
         payload = self._request_json("GET", "/api/user/points")
         points = _first_int(payload, ("points", "point", "pointsTotal", "points_total"))
         if points is None:
-            raise ProtocolError("积分接口缺少 points")
+            raise ProtocolError(
+                f"{self.domain} 积分接口缺少 points · {safe_payload_summary(payload)}"
+            )
         return points
 
     def exchange(self, plan_id: str) -> str:
@@ -402,14 +414,10 @@ def run_one_account(
             result.domain = domain
             selected_api = api
             break
-        except (NetworkError, ProtocolError) as exc:
+        except (NetworkError, ProtocolError, AuthenticationError, ChallengeError) as exc:
             last_error = str(exc)
             api.close()
             continue
-        except (AuthenticationError, ChallengeError) as exc:
-            api.close()
-            result.error = str(exc)
-            return result
 
     if selected_api is None:
         result.error = last_error or "所有 GLaDOS 域名均不可用"
@@ -572,6 +580,25 @@ def _candidate_dicts(data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     if isinstance(user, dict):
         yield user
     yield data
+
+
+def safe_payload_summary(data: Dict[str, Any]) -> str:
+    """Return non-secret API shape diagnostics without logging account data values."""
+    top_keys = sorted(str(key) for key in data.keys())[:24]
+    nested = data.get("data")
+    data_keys = sorted(str(key) for key in nested.keys())[:24] if isinstance(nested, dict) else []
+    nested_user = nested.get("user") if isinstance(nested, dict) else None
+    user_keys = (
+        sorted(str(key) for key in nested_user.keys())[:24]
+        if isinstance(nested_user, dict)
+        else []
+    )
+    code = data.get("code")
+    message = str(data.get("message", "") or "").replace("\n", " ").replace("\r", " ").strip()[:80]
+    return (
+        f"code={code!r}, message={message!r}, keys={top_keys!r}, "
+        f"data_keys={data_keys!r}, data_user_keys={user_keys!r}"
+    )
 
 
 def _first_string(data: Dict[str, Any], keys: Iterable[str]) -> str:

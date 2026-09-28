@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from checkin import AuthenticationError, ChallengeError, GladosAPI, NetworkError, ProtocolError
+from checkin import AuthenticationError, ChallengeError, DEFAULT_DOMAINS, GladosAPI, NetworkError, ProtocolError, safe_payload_summary
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -133,7 +133,7 @@ def _read_status_payload(api: GladosAPI) -> Dict[str, Any]:
 def _read_points_payload(api: GladosAPI) -> Dict[str, Any]:
     payload = api._request_json("GET", "/api/user/points")
     if _optional_number(payload, ("points", "point", "pointsTotal", "points_total")) is None:
-        raise ProtocolError("积分接口缺少 points")
+        raise ProtocolError(f"{api.domain} 积分接口缺少 points · {safe_payload_summary(payload)}")
     return payload
 
 
@@ -280,7 +280,7 @@ def read_status(cookie: str, account_key: str, domains: Iterable[str]):
             points_payload = _read_points_payload(api)
             points = _optional_number(points_payload, ("points", "point", "pointsTotal", "points_total"))
             if points is None:
-                raise ProtocolError("积分接口缺少 points")
+                raise ProtocolError(f"{domain} 积分接口缺少 points · {safe_payload_summary(points_payload)}")
 
             status_payload: Dict[str, Any] = {}
             status_warning = ""
@@ -309,11 +309,9 @@ def read_status(cookie: str, account_key: str, domains: Iterable[str]):
                 "status_warning": status_warning,
                 "error": "",
             }
-        except (NetworkError, ProtocolError) as exc:
+        except (NetworkError, ProtocolError, AuthenticationError, ChallengeError) as exc:
             last_error = str(exc)
             continue
-        except (AuthenticationError, ChallengeError) as exc:
-            return _error_result(account_key, domain, str(exc))
         finally:
             api.close()
     return _error_result(account_key, "", last_error or "所有 GLaDOS 域名均不可用")
@@ -342,7 +340,7 @@ def main() -> int:
     account_key = os.environ.get("GLADOS_ACCOUNT_KEY", "").strip()
     domains = tuple(
         value.strip().lower()
-        for value in os.environ.get("GLADOS_DOMAINS", "glados.cloud,railgun.info").split(",")
+        for value in os.environ.get("GLADOS_DOMAINS", ",".join(DEFAULT_DOMAINS)).split(",")
         if value.strip()
     )
     result = _error_result(account_key, "", "GLADOS_COOKIES 为空") if not cookie else read_status(cookie, account_key, domains)
