@@ -1,9 +1,48 @@
 # Account Center login refresh — candidate integration contract
 
-Status: the offline safety core and its tests are implemented. The native application,
-Gmail OAuth adapter, live login driver, Keychain adapter, cloud publisher and monthly
-scheduler are NOT connected by this candidate. No production automation is enabled.
+Status: the offline safety core, a bounded native HTTP login adapter, and the Gmail
+read-only REST adapter are implemented. Only the code-request step has been tried
+live; a fresh forwarded message and complete login have NOT been accepted. The native
+application, Gmail OAuth consent/token storage, Keychain credential storage, cloud
+publisher and monthly scheduler are NOT connected. No production automation is enabled.
 This is not an installable Account Center release.
+
+## 2026-09-29 continuation — measured boundary
+
+- DevSpace recovered. The installed app was independently read as Build 20011.
+- The current 26-row status cache has zero nonempty email fields. A matching historical
+  cache backup contains five successful email records; the experiment identity was
+  not present in that backup. No complete 26-account identity recovery is claimed.
+- The installed `core.js` already derives account keys from the stable user ID with
+  SHA-256 of `glados-user:<userId>`, truncated to 16 uppercase hex characters. The new
+  adapter matches that algorithm and refuses keys outside the existing account set.
+- Inspected the current public first-party client at
+  `https://glados.cloud/app.bundle.js`: email-code requests go to `/api/authorization`,
+  login goes to `/api/login`, and the site field is `glados.network`. The page also
+  supplies its own optional Authorization context and handles a captcha-required
+  response. We do not generate a fingerprint or bypass a human challenge.
+- At 2026-09-29T08:12:24Z, exactly one authorized experiment code request from the Mac
+  to the pinned cloud origin returned HTTP 200, code 0, captcha_required false, with
+  fields `code` and `method`. This means accepted request, NOT confirmed mail delivery.
+  Cookie values, codes and customer emails were not written into the repository.
+- Repeated scoped Gmail inspection still found only the two pre-existing old forwarded
+  sample messages. The search was widened within the authorized receiving mailbox to
+  include redirected mail retaining its original To header, including spam/trash for
+  diagnosis. No new message was found at the latest check. No code was resubmitted.
+- No live login, Secret replacement, exchange, app installation or scheduled refresh
+  was performed in this increment.
+
+`login_refresh_http.py` pins HTTPS origins, blocks redirects, has zero automatic POST
+retries, distinguishes ambiguous write timeouts, stops on captcha/permission errors,
+requires authenticated identity matching and an existing stable key, and exposes no
+check-in/exchange or Gmail mutation operation. Gmail profile verification uses the
+same access token as each message request. RAW mail is size bounded and transport
+authentication is checked before passing messages to the OTP parser.
+
+The remaining live prerequisite is a fresh code arriving through the intended forward
+route. After that, run the full single-account login acceptance before cloud writes.
+Independent Gmail consent/token storage and native UI integration still remain; do
+not describe this prerequisite as the only remaining implementation work.
 
 ## Scope and compatibility
 
@@ -38,8 +77,8 @@ after the one-account live acceptance gate passes.
 
 Store the verified mapping `existing Account Key -> email` locally with owner-only
 permissions, independently from status-cache.json. Never save a blank failed status
-as a new identity. Do not derive a new account key or Secret name from a newly issued
-session. Existing per-account policies remain attached to their original keys.
+as a new identity. Do not derive a new account key or Secret name from the changing raw
+cookie value. The existing stable user-ID hashing convention must be preserved. Existing per-account policies remain attached to their original keys.
 
 `remember_verified_identity` accepts identity already verified by a trusted caller.
 `import_successful_cache` is for an app-owned, previously successful status snapshot;
@@ -99,7 +138,9 @@ Use the normal GLaDOS login flow through the user's background-only DCF entry po
 when GUI is needed. Do not use direct automation of existing Safari/Brave profiles,
 osascript, or foreground takeover. A native HTTP login adapter can replace GUI only
 after the actual supported contract, security checks and session behavior have been
-verified on the target account. No login endpoint is invented by this candidate.
+verified on the target account. The inspected endpoint contract is implemented in
+`login_refresh_http.py`, but only requesting the email code has passed a live test;
+full authentication and credential publication remain gated.
 
 A human challenge, permission block or identity mismatch requires manual intervention;
 do not change domains, proxies, fingerprints or providers to evade it. Pin each account
