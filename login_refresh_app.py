@@ -16,12 +16,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 
 # -I excludes the script directory; explicitly admit only this sealed bundle folder.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from login_refresh_core import RefreshError, RefreshStore, account_key, email_address
 from login_refresh_mail import mac_mail_instance
 from login_refresh_oauth import DesktopClient, KeychainStore, OAuthProvider, PendingConsent
+from login_refresh_notifications import NativeNotifications, NotificationOutbox
 
 REPO = 'NewBoringMan/Glados-Railgun-checkin'
 SUPPORT = Path.home() / 'Library/Application Support/GLaDOS Account Center'
@@ -57,9 +59,12 @@ MESSAGES = {
     'invalid_request':'无法识别此操作，请更新 Account Center 后重试。',
     'read_only_identity':'这是已确认的邮箱身份，不能直接改成另一邮箱；请使用正常登录重新核对。',
     'missing_identity':'此账号尚未保存邮箱，请先填写并核对。',
+    'account_disabled_during_refresh':'此账号已被停用，暂停其未完成维护，不继续发码或更新凭据。',
+    'notification_permission_required':'请先在登录维护窗口开启系统通知并发送一次测试，避免失败后无法主动提醒。',
     'unfinished_job_requires_resume':'已有账号等待收码或云端验证，请先继续该账号，避免串号。',
     'preexisting_secret_required':'未找到此账号原有的 GitHub Secret，已停止，未创建新账号。',
     'cloud_operation_uncertain':'GitHub 操作结果暂不明确，已保留恢复记录；不会重复登录或盲目覆盖。',
+    'publication_receipt_required':'上次凭据上传未收到明确成功回执；需要人工核对，不能用旧登录仍有效来冒充更新成功。',
     'cloud_status_busy':'已有状态查询正在运行，稍后继续本次验证，不重新发码。',
     'cloud_dispatch_uncertain':'云端验证任务是否创建暂不明确，需要核对后继续，不重复发送。',
     'cloud_verification_failed':'云端验证未通过；新登录不能标为恢复成功，请核对任务结果。',
@@ -154,12 +159,14 @@ class AccountRepository:
 
 
 class AppService:
-    def __init__(self,support=SUPPORT,repository=None,secrets_store=None,mail_probe=mac_mail_instance):
+    def __init__(self,support=SUPPORT,repository=None,secrets_store=None,mail_probe=mac_mail_instance,notifications=None):
         self.support=Path(support)
         self.store=RefreshStore(self.support/'login-refresh.sqlite')
         self.repo=repository or AccountRepository(self.support)
         self.secrets=secrets_store
         self.mail_probe=mail_probe
+        notification_helper=Path(__file__).resolve().parents[2]/'MacOS/RefreshNotifications'
+        self.notices=NotificationOutbox(self.store.db,notifications or NativeNotifications(notification_helper))
         self.store.db.executescript('''
 CREATE TABLE IF NOT EXISTS identity_pending(account_key TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -199,13 +206,18 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
             known=self.store.identity(key)
             pending=self.store.db.execute('SELECT email FROM identity_pending WHERE account_key=?',(key,)).fetchone()
             row=cache.get(key,{})
+            maintenance=self.store.db.execute('SELECT phase,reason,attempts FROM jobs WHERE account_key=? ORDER BY cycle DESC LIMIT 1',(key,)).fetchone()
+            maintenance_reason=maintenance['reason'] if maintenance else ''
             policy=snapshot['policies'].get('accounts',{}).get(key,snapshot['policies'].get('default','auto'))
             rows.append({'key':key,'label':str(record.get('label',key)),
                          'email':known['email'] if known else pending[0] if pending else '',
                          'identity_kind':'confirmed' if known else 'pending' if pending else 'missing',
                          'enabled':record.get('enabled') is True,'auto_exchange':record.get('autoExchange') is True,
                          'policy':str(policy),'points':row.get('points_total') if isinstance(row.get('points_total'),(int,float)) else None,
-                         'last_status_ok':row.get('ok') is True})
+                         'last_status_ok':row.get('ok') is True,
+                         'maintenance_phase':maintenance['phase'] if maintenance else 'not_started',
+                         'maintenance_attempts':maintenance['attempts'] if maintenance else 0,
+                         'maintenance_message':MESSAGES.get(maintenance_reason,'三次尝试均失败，需要人工处理。' if maintenance and maintenance['attempts']>=3 and maintenance['phase']=='manual' else '')})
         rows.sort(key=lambda r:((r['email'] or r['label']).casefold(),r['key']))
         try:mail_running=bool(self.mail_probe());mail_error=''
         except RefreshError:mail_running=False;mail_error='mail_probe_unavailable'
@@ -221,7 +233,8 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
                     gmail.update(authorized=False,reason='mail_reauthorization_required')
             except RefreshError as exc:gmail['reason']=str(exc) if str(exc) in MESSAGES else 'keychain_unavailable'
         acceptance=self.setting('live_acceptance',{})
-        accepted=isinstance(acceptance,dict) and acceptance.get('runner_version')==1 and acceptance.get('cloud_verified') is True
+        from login_refresh_runner import RUNNER_VERSION
+        accepted=isinstance(acceptance,dict) and acceptance.get('runner_version')==RUNNER_VERSION and acceptance.get('cloud_verified') is True
         return {'ok':True,'event':'snapshot','accounts':rows,'repository_source':source,
                 'mail_running':mail_running,'mail_reason':mail_error,'mailbox':self.setting('mailbox',''),
                 'gmail':gmail,'identity_conflicts':conflicts,'confirmed_count':sum(r['identity_kind']=='confirmed' for r in rows),
@@ -230,7 +243,8 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
                 'automation_reason':'已通过单账号验证；批量队列可继续处理已保存邮箱的账号。' if accepted else '请先完成收码授权并通过一个账号的真实登录与云端验证。',
                 'last_live_gate':'网站要求人机验证时，该账号暂停并交给人工；不会自动绕过。',
                 'last_summary':self.setting('last_refresh_summary',{}),
-                'last_result':self.setting('last_refresh_result',{})}
+                'last_result':self.setting('last_refresh_result',{}),
+                'notifications':self.notices.status()}
 
     def save_email(self,key,value):
         key,email=account_key(key),email_address(value)
@@ -294,6 +308,8 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
         if enabled:
             if not RefreshRunner(self).accepted():raise RefreshError('live_acceptance_required')
             self.check_mailbox()
+            if self.notices.status()['authorization'] not in {'authorized','provisional'}:
+                raise RefreshError('notification_permission_required')
             if not self.mail_probe():raise RefreshError('mail_background_start_unavailable')
             LocalSchedule().enable()
             self.put_setting('monthly_enabled',True)
@@ -301,6 +317,11 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
         self.put_setting('monthly_enabled',False)
         LocalSchedule().disable()
         return {'ok':True,'message':'每月自动维护已停用；已保存邮箱、登录资料和 GitHub 签到不受影响。'}
+
+    def collect_notifications(self,reason=None):
+        self.notices.observe_jobs()
+        if reason:self.notices.shared_failure(reason)
+        return self.notices.flush()
 
     def dispatch(self,request):
         action=request.get('action')
@@ -310,6 +331,15 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
         if action=='import_client':return self.import_client(request.get('config'))
         if action=='authorize_mailbox':return self.consent()
         if action=='check_mailbox':return self.check_mailbox()
+        if action=='check_notifications':
+            status=self.notices.status()
+            return {'ok':True,'event':'notification_status',**status,
+                    'message':'通知已获授权。' if status['authorization'] in {'authorized','provisional'} else '请先在本窗口开启通知权限；未投递提醒仍保留在本机。'}
+        if action=='test_notification':
+            self.notices.enqueue('user-test:'+str(uuid.uuid4()),'test')
+            sent=self.notices.flush(limit=5)
+            return {'ok':sent['accepted']>0,'event':'notification_test',
+                    'message':'通知请求已交给系统；是否显示受系统通知设置影响。' if sent['accepted'] else '通知未获系统接收；请检查权限，测试记录保留待投递。'}
         if action=='refresh_one':return self.maintain(request.get('key',''))
         if action=='refresh_all':return self.maintain(batch=True)
         if action=='enable_monthly':return self.set_monthly(True)
@@ -322,6 +352,8 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
 
 def main():
     service=None
+    request={}
+    failure_reason=None
     try:
         if sys.argv[1:]==['--tick']:
             request={'action':'scheduled_tick'}
@@ -338,9 +370,19 @@ def main():
         if helper.exists():secrets_store=KeychainStore(helper)
         service=AppService(secrets_store=secrets_store)
         emit(service.dispatch(request))
-    except Exception as exc:emit(public_error(exc))
+    except Exception as exc:
+        failure_reason=str(exc) if isinstance(exc,RefreshError) else 'internal_error'
+        emit(public_error(exc))
     finally:
-        if service:service.close()
+        if service:
+            try:
+                if request.get('action') in {'refresh_one','refresh_all','scheduled_tick'}:
+                    service.collect_notifications(failure_reason)
+            except Exception:
+                # A notification failure must not falsify login state or expose data.
+                # The durable outbox remains pending for the next authorized delivery.
+                pass
+            service.close()
 
 
 if __name__=='__main__':main()

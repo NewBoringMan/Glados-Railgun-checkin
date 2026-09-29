@@ -18,7 +18,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_ID = 'com.enoch.glados-account-center'
 VERSION = '2.0.10'
-BUILD = '20014'
+BUILD = '20015'
 SOURCE = Path.home() / 'Applications/GLaDOS Account Center.app'
 OUT_ROOT = ROOT / 'build/maintenance.noindex'
 PRODUCT = OUT_ROOT / 'GLaDOS Account Center.app'
@@ -56,7 +56,8 @@ def main():
     if not original.is_file():
         raise RuntimeError('Expected existing original core executable is missing')
     original_sha = sha(original)
-    baseline_resources = manifest(source / 'Contents/Resources')
+    baseline_resources = {name:digest for name,digest in manifest(source / 'Contents/Resources').items()
+                          if not name.startswith('LoginRefresh/')}
     baseline_plugins = manifest(source / 'Contents/PlugIns')
     python = Path('/opt/homebrew/bin/python3')
     if not python.is_file():
@@ -74,6 +75,10 @@ def main():
         macos = PRODUCT / 'Contents/MacOS'
         resources = PRODUCT / 'Contents/Resources/LoginRefresh'
         frameworks.mkdir(exist_ok=True)
+        if resources.is_symlink():
+            raise RuntimeError('Maintenance resources unexpectedly symlinked')
+        if resources.exists():
+            shutil.rmtree(resources)
         resources.mkdir(exist_ok=False)
         for path in ROOT.glob('login_refresh_*.py'):
             shutil.copy2(path, resources / path.name)
@@ -85,22 +90,32 @@ def main():
              sources / 'PolicyEditor.swift', sources / 'AccountEmailDirectory.swift',
              '-o', frameworks / 'GLaDOSPolicyEditor.dylib'])
         run([*common, '-emit-library', '-module-name', 'GLaDOSRefreshCenter',
-             '-framework', 'SwiftUI', '-framework', 'AppKit',
+             '-framework', 'SwiftUI', '-framework', 'AppKit', '-framework', 'UserNotifications',
              sources / 'RefreshCenter.swift', '-o', frameworks / 'GLaDOSRefreshCenter.dylib'])
         run(['/usr/bin/xcrun', 'clang', '-arch', 'arm64', '-dynamiclib', '-fobjc-arc',
              '-framework', 'AppKit', sources / 'PolicyMenuPlugin.m',
              '-o', frameworks / 'PolicyMenuPlugin.dylib'])
-        run([*common, '-DREFRESH_SECRET_CLI', '-framework', 'Security', '-framework',
-             'LocalAuthentication', sources / 'RefreshSecretStore.swift',
-             '-o', macos / 'RefreshSecretStore'])
+        # The unchanged signed SecretStore is preserved across this update so an
+        # already granted Keychain application ACL is not gratuitously invalidated.
+        preserved_secret_store = (macos / 'RefreshSecretStore').is_file()
+        if not preserved_secret_store:
+            run([*common, '-DREFRESH_SECRET_CLI', '-framework', 'Security', '-framework',
+                 'LocalAuthentication', sources / 'RefreshSecretStore.swift',
+                 '-o', macos / 'RefreshSecretStore'])
+        run([*common, '-framework', 'UserNotifications', sources / 'RefreshNotifications.swift',
+             '-o', macos / 'RefreshNotifications'])
         updated_info = dict(info)
         updated_info.update(CFBundleShortVersionString=VERSION, CFBundleVersion=BUILD,
                             GLaDOSRefreshPython=str(python))
         (PRODUCT / 'Contents/Info.plist').write_bytes(plistlib.dumps(updated_info))
         for name in ['GLaDOSPolicyEditor.dylib', 'GLaDOSRefreshCenter.dylib', 'PolicyMenuPlugin.dylib']:
             run(['/usr/bin/codesign', '--force', '--sign', '-', frameworks / name])
+        if not preserved_secret_store:
+            run(['/usr/bin/codesign', '--force', '--sign', '-', '--identifier',
+                 EXPECTED_ID + '.refresh-secret-store', macos / 'RefreshSecretStore'])
+        run(['/usr/bin/codesign', '--verify', '--strict', macos / 'RefreshSecretStore'])
         run(['/usr/bin/codesign', '--force', '--sign', '-', '--identifier',
-             EXPECTED_ID + '.refresh-secret-store', macos / 'RefreshSecretStore'])
+             EXPECTED_ID + '.refresh-notifications', macos / 'RefreshNotifications'])
         run(['/usr/bin/codesign', '--force', '--sign', '-', PRODUCT])
         run(['/usr/bin/codesign', '--verify', '--deep', '--strict', PRODUCT])
         if sha(PRODUCT / 'Contents/MacOS/GLaDOSAccountCenter.real') != original_sha:

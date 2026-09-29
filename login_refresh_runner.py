@@ -20,7 +20,7 @@ from login_refresh_http import GladosEmailLogin, GmailReadOnly, NativeJSONTransp
 
 UTC = timezone.utc
 REPO = 'NewBoringMan/Glados-Railgun-checkin'
-RUNNER_VERSION = 1
+RUNNER_VERSION = 2
 ACTIVE = ('preflight', 'awaiting_code', 'candidate_verified', 'publish_pending', 'verify_pending')
 
 
@@ -189,6 +189,8 @@ CREATE TABLE IF NOT EXISTS refresh_holds(account_key TEXT PRIMARY KEY,reason TEX
                 cycle,key = active['cycle'],active['account_key']
                 if key not in snapshot['accounts']:
                     raise RefreshError('unknown_account')
+                if snapshot['accounts'][key].get('enabled') is not True:
+                    raise RefreshError('account_disabled_during_refresh')
                 return self._execute(cycle,key,snapshot,output)
             for k in keys:
                 target = self._target(k)
@@ -300,6 +302,9 @@ CREATE TABLE IF NOT EXISTS refresh_holds(account_key TEXT PRIMARY KEY,reason TEX
     def _publish_resume(self,cycle,key,snapshot,output):
         meta = self._meta(cycle,key)
         candidate = self.service.secrets.get('candidate-'+key)
+        if candidate is None and self.store.job(cycle,key)['phase'] == 'verify_pending':
+            # Recovery after promotion but before committing the completed phase.
+            candidate = self.service.secrets.get('active-'+key)
         if (not candidate or candidate.get('key') != key or candidate.get('generation') != meta.get('generation')
                 or email_address(candidate.get('email','')) != self._target(key)):
             raise RefreshError('verified_candidate_required')
@@ -316,9 +321,14 @@ CREATE TABLE IF NOT EXISTS refresh_holds(account_key TEXT PRIMARY KEY,reason TEX
             self._save_meta(cycle,key,meta)
             self.store.published(cycle,key)
         elif phase == 'publish_pending':
-            # A prior upload may have succeeded; reconcile through a NEW cloud read.
-            # Do not upload another credential or start another login here.
+            # A still-valid OLD Secret can pass an email/status check. Without a
+            # definite upload receipt that cannot prove this candidate was stored.
+            # Keep the candidate and stop; do not falsely mark an uncertain write done.
+            if meta.get('uploaded') is not True:
+                raise RefreshError('publication_receipt_required')
             self.store.published(cycle,key)
+        if meta.get('uploaded') is not True:
+            raise RefreshError('publication_receipt_required')
         if meta.get('dispatch_uncertain') and not meta.get('run_id'):
             raise RefreshError('cloud_dispatch_uncertain')
         if not meta.get('run_id'):
@@ -337,9 +347,9 @@ CREATE TABLE IF NOT EXISTS refresh_holds(account_key TEXT PRIMARY KEY,reason TEX
         output({'ok':True,'event':'verifying','account_key':key,'message':'正在执行单账号云端只读验证；不触发兑换。'})
         for _ in range(18):
             if self.cloud.verify_status(meta['run_id'],key,candidate['email'],meta['source_sha'],meta['dispatch_started']):
-                self.store.cloud_verified(cycle,key,candidate['email'])
                 self.service.secrets.put('active-'+key,candidate)
                 self.service.secrets.delete('candidate-'+key)
+                self.store.cloud_verified(cycle,key,candidate['email'])
                 self.store.db.execute('DELETE FROM identity_pending WHERE account_key=?',(key,))
                 self.service.put_setting('live_acceptance',{'runner_version':RUNNER_VERSION,'cloud_verified':True,
                                                           'account_key':key,'run_id':meta['run_id'],'at':self.now().timestamp()})

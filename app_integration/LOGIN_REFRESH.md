@@ -1,5 +1,59 @@
 # Account Center login refresh — implementation and acceptance record
 
+## Current installed update: 2.0.10 / Build 20015
+
+Installed in place over Build 20014 on 2026-09-29. The original business executable,
+account keys, current GitHub production version, original browser scripts and Safari
+extension remain unchanged. This is still the same one application and bundle ID.
+
+This update adds the durable system-notification outbox and native notification helper.
+It contains no custom message text from remote services, codes, cookies or emails.
+A failed-account notice is queued after three failures; challenges can notify earlier.
+Shared failures are deduplicated. Permission denial/unavailable delivery preserves the
+pending notice instead of claiming delivery. The native worker only checks permission
+or submits a fixed notification; only an explicit main-UI button can ask permission.
+System acceptance is NOT proof that the user saw a banner.
+
+The UI now shows per-account failure details and attempt counts, notification status,
+an explicit permission button and a test-notification button. The monthly enable gate
+requires notification permission in addition to Gmail authorization and live acceptance.
+Actual installed status at verification: notifications `not_determined`, pending 0,
+Gmail client absent and unauthorized, Mail running, monthly task disabled, 26 registered
+accounts and 5 durable known emails. No real notification was delivered in this run.
+
+Recovery correctness fix: a cloud read succeeding against the OLD still-valid Secret
+cannot prove a timed-out replacement upload succeeded. Without a persisted definite
+upload receipt, the candidate now remains protected and publication pauses for review;
+it cannot be marked complete by that old-credential result. Keychain promotion failures
+also leave a resumable phase instead of prematurely committing done. Disabled accounts
+are no longer silently resumed by an automatic batch. Runner acceptance version is 2.
+
+Verification: 334 test executions pass. The installed app's signature and all nine
+maintenance Python modules were checked against source. The installed Keychain helper
+passed its synthetic noninteractive test and removed the test item. Native notification
+status returned `not_determined` without requesting permission or displaying a window.
+The unchanged original core SHA-256 remains
+`1a2fe7eeeb27c2315b40b07cf4fc0d3f159bbd75045bc3471e283f5fe067a455`.
+
+DCF acceptance progressed: the actual running app's overview was captured through the
+unchanged production background-only DCF broker, observing both toolbar entries and
+26 accounts. The attempted maintenance-window interaction met an expired-session guard;
+no foreground override or direct provider call was used. DCF sent the authorized quit;
+a later guard detected a focus change and stopped further interaction. The installer
+then independently verified the app had exited before replacing any files. No direct
+GUI kill/open workaround was used. The updated app was not launched after installation.
+Thus actual new-notification permission, banner delivery and new-window interaction
+are still unaccepted; the compiled/linked buttons are not claimed as clicked successfully.
+
+Remaining live prerequisites are unchanged: configure the app's own Desktop Gmail
+OAuth client and complete consent; satisfy any website human verification normally;
+complete the fresh account/cloud path. Mail cold-start is still not wired to a verified
+DCF launch action and safely pauses if Mail is closed. Unknown emails are not guessed.
+This is an installed incremental improvement, NOT completion of unattended operation.
+
+Older build notes below are historical. This section overrides their installed build
+and notification-module status, but does not override uncompleted acceptance gates.
+
 ## Installed update: 2.0.10 / Build 20014
 
 The previously installed 2.0.9 / Build 20011 bundle was used as the update base. The

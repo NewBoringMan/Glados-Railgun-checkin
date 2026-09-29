@@ -176,12 +176,45 @@ class RunnerTests(AppTests):
         with self.assertRaisesRegex(RefreshError,'cloud_operation_uncertain'):self.run_success()
         self.assertEqual(self.app.store.job('2026-09',A)['phase'],'publish_pending')
         self.assertIn('candidate-'+A,self.secret.values);self.assertFalse(self.runner.accepted())
-    def test_ambiguous_upload_reconciles_without_relogin_or_second_upload(self):
+    def test_ambiguous_upload_cannot_be_proved_by_valid_old_secret(self):
         self.cloud.error=RefreshError('cloud_operation_uncertain')
         with self.assertRaises(RefreshError):self.run_success()
-        self.cloud.error=None;self.runner.one(A)
+        self.cloud.error=None
+        with self.assertRaisesRegex(RefreshError,'publication_receipt_required'):self.runner.one(A)
         self.assertEqual(self.login.calls.count('request'),1);self.assertEqual(len(self.cloud.uploads),1)
-        self.assertTrue(self.runner.accepted())
+        self.assertEqual(self.cloud.runs,[]);self.assertFalse(self.runner.accepted())
+        self.assertIn('candidate-'+A,self.secret.values)
+    def test_confirmed_upload_receipt_can_resume_without_reupload(self):
+        self.cloud.error=RefreshError('cloud_operation_uncertain')
+        with self.assertRaises(RefreshError):self.run_success()
+        # Simulate a persisted definite API acknowledgement before the phase commit.
+        meta=self.runner._meta('2026-09',A);meta['uploaded']=True
+        self.runner._save_meta('2026-09',A,meta)
+        self.cloud.error=None;self.runner.one(A)
+        self.assertEqual(len(self.cloud.uploads),1);self.assertTrue(self.runner.accepted())
+    def test_failed_keychain_promotion_keeps_job_resumable(self):
+        put=self.secret.put
+        def fail_active(key,value):
+            if key.startswith('active-'):raise RefreshError('keychain_unavailable')
+            put(key,value)
+        self.secret.put=fail_active
+        with self.assertRaisesRegex(RefreshError,'keychain_unavailable'):self.run_success()
+        self.assertEqual(self.app.store.job('2026-09',A)['phase'],'verify_pending')
+        self.secret.put=put;self.runner.one(A)
+        self.assertTrue(self.runner.accepted());self.assertEqual(self.login.calls.count('request'),1)
+    def test_promoted_candidate_recovers_after_phase_commit_interruption(self):
+        commit=self.app.store.cloud_verified
+        self.app.store.cloud_verified=lambda *a:(_ for _ in ()).throw(RefreshError('commit_interrupted'))
+        with self.assertRaisesRegex(RefreshError,'commit_interrupted'):self.run_success()
+        self.assertNotIn('candidate-'+A,self.secret.values);self.assertIn('active-'+A,self.secret.values)
+        self.app.store.cloud_verified=commit;self.runner.one(A)
+        self.assertTrue(self.runner.accepted());self.assertEqual(len(self.cloud.uploads),1)
+    def test_disabled_account_is_not_resumed_by_batch(self):
+        self.app.store.db.execute("INSERT INTO jobs(cycle,account_key,phase,due) VALUES('2026-09',?,'preflight',?)",(A,NOW.timestamp()))
+        self.repo.snapshot['accounts'][A]['enabled']=False
+        self.app.put_setting('live_acceptance',{'runner_version':2,'cloud_verified':True})
+        with self.assertRaisesRegex(RefreshError,'account_disabled_during_refresh'):self.runner.one(batch=True)
+        self.assertEqual(self.login.calls,[])
     def test_cloud_still_running_retains_verify_phase(self):
         self.cloud.verify=False;result=self.run_success()
         self.assertEqual(result['event'],'verification_pending');self.assertFalse(self.runner.accepted())

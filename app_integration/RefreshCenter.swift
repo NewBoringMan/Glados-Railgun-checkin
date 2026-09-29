@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import UserNotifications
 
 private struct RefreshAccount: Decodable, Identifiable {
     let key: String
@@ -13,6 +14,9 @@ private struct RefreshAccount: Decodable, Identifiable {
     let policy: String
     let points: Double?
     let last_status_ok: Bool
+    let maintenance_phase: String?
+    let maintenance_attempts: Int?
+    let maintenance_message: String?
     var id: String { key }
     var title: String { email.isEmpty ? label : email }
     var policyTitle: String {
@@ -31,6 +35,11 @@ private struct MailAuthorization: Decodable {
     let reason: String
 }
 
+private struct RefreshNotificationStatus: Decodable {
+    let authorization: String
+    let pending: Int
+}
+
 private struct RefreshSnapshot: Decodable {
     let accounts: [RefreshAccount]
     let repository_source: String
@@ -43,6 +52,7 @@ private struct RefreshSnapshot: Decodable {
     let automation_ready: Bool
     let automation_reason: String
     let last_live_gate: String
+    let notifications: RefreshNotificationStatus?
 }
 
 @MainActor
@@ -186,6 +196,20 @@ private final class RefreshModel: ObservableObject {
         }
     }
 
+    func authorizeNotifications() {
+        guard !busy else { return }
+        // This is called ONLY from the user's explicit button. A scheduler/helper
+        // never invokes a permission prompt or changes system notification settings.
+        UNUserNotificationCenter.current().requestAuthorization(options:[.alert]) { [weak self] granted, failure in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.error = !granted || failure != nil
+                self.message = granted ? "系统通知权限已开启，可发送测试通知。" : "系统通知未获允许；任务失败记录仍保留在本机。"
+                self.load()
+            }
+        }
+    }
+
     func openConsent() {
         // A direct, explicit user gesture, not an automatic browser launch. No focus
         // change is performed by the unattended worker or on opening this window.
@@ -269,6 +293,13 @@ private struct RefreshCenterView: View {
                                 if account.identity_kind == "missing" { Text("尚未保存邮箱").font(.caption).foregroundStyle(.orange) }
                                 else if account.identity_kind == "pending" { Text("邮箱已保存 · 待登录核实").font(.caption).foregroundStyle(.secondary) }
                                 else { Text("邮箱已确认 · 登录失效也不会清空").font(.caption).foregroundStyle(.secondary) }
+                                if let maintenance = account.maintenance_message, !maintenance.isEmpty {
+                                    Text(maintenance).font(.caption).foregroundStyle(.orange)
+                                        .fixedSize(horizontal:false,vertical:true)
+                                }
+                                if let attempts = account.maintenance_attempts, attempts > 0 {
+                                    Text("本轮尝试 \(attempts)/3 次").font(.caption).foregroundStyle(.secondary)
+                                }
                             }.frame(maxWidth: .infinity, alignment: .leading)
                             VStack(alignment: .trailing, spacing: 4) {
                                 Text(account.policyTitle).font(.callout)
@@ -332,6 +363,13 @@ private struct RefreshCenterView: View {
                 .font(.callout).foregroundStyle(.secondary)
             statusLine("收码邮箱", model.snapshot?.gmail.authorized == true ? "已有授权" : "需要首次授权")
             statusLine("GitHub 账号目录", model.snapshot?.repository_source == "github" ? "刚从 GitHub 读取" : "上次保存的目录")
+            statusLine("系统通知", ["authorized","provisional"].contains(model.snapshot?.notifications?.authorization ?? "") ? "已授权" : "需要授权或组件不可用")
+            HStack {
+                Button("开启通知权限") { model.authorizeNotifications() }.disabled(model.busy)
+                Button("发送测试通知") { model.run(["action":"test_notification"]) }
+                    .disabled(model.busy || !["authorized","provisional"].contains(model.snapshot?.notifications?.authorization ?? ""))
+                Text("待投递提醒 \(model.snapshot?.notifications?.pending ?? 0) 条").font(.caption).foregroundStyle(.secondary)
+            }
             Divider()
             Text(model.snapshot?.schedule_enabled == true ? "每月串行维护已启用" : "每月串行维护未启用").font(.headline)
             Text(model.snapshot?.automation_reason ?? "需要先完成单账号真实登录与云端验证。")
