@@ -27,6 +27,8 @@ from login_refresh_core import (
     CodeCandidate, LoginAttempt, MailEnvelope, RefreshError, aware, email_address,
 )
 
+from login_refresh_mail import MailForwardingGate
+
 UTC = timezone.utc
 GMAIL_ORIGIN = "https://gmail.googleapis.com"
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -214,15 +216,25 @@ class GladosEmailLogin:
     capture adapter, but this class never generates or changes a device fingerprint.
     Absence of this header is supported only where the server accepts it normally.
     """
-    def __init__(self, transport: Transport, *, authorization: str | None = None):
+    def __init__(self, transport: Transport, *, authorization: str | None = None,
+                 mail_gate: MailForwardingGate | None = None):
         if authorization is not None and not re.fullmatch(r"fp1\.[0-9a-f]{16,64}", authorization):
             raise RefreshError("invalid_first_party_authorization")
         self.transport = transport
         self.authorization = authorization
+        self.mail_gate = mail_gate if mail_gate is not None else MailForwardingGate()
         self._attempt: LoginAttempt | None = None
         self._send_started = False
         self._submit_started = False
         self._terminal = False
+
+    def prepare_delivery(self):
+        """Call before taking the Gmail baseline or counting a login attempt."""
+        self.mail_gate.prepare()
+
+    def check_delivery(self):
+        """Call during each Gmail poll. Does not launch Mail or send another code."""
+        self.mail_gate.require_running()
 
     def _headers(self):
         headers = {"Origin": LOGIN_ORIGIN, "Referer": LOGIN_ORIGIN + "/login",
@@ -235,6 +247,9 @@ class GladosEmailLogin:
         attempt.validate()
         if self._send_started or self._terminal:
             raise RefreshError("code_request_already_started")
+        # Mail is the user's LOCAL forwarding engine, even when reading via Gmail.
+        # No code request and no consumed send attempt if this prerequisite is absent.
+        self.check_delivery()
         # Set before the network write: timeout cannot be retried in this attempt.
         self._send_started = True
         self._attempt = attempt

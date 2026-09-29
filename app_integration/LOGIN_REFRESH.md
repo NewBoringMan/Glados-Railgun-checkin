@@ -92,10 +92,56 @@ The source repository may be public. Do not commit real customer emails, email b
 OTP values, browser profiles, OAuth tokens, cookies, identity SQLite files or logs.
 The source and tests contain fictitious examples only.
 
-## Mail adapter contract
+## Mail adapter contract — local forwarding dependency
 
-Use Gmail's official read-only API for the dedicated receiving mailbox; Apple Mail can
-remain its normal viewer. Do not scrape Mail's UI or private message database. The
+The user confirmed that Apple Mail was closed during the earlier test. After the
+user opened it, the outstanding original message (2026-09-29 16:12:26 Asia/Taipei)
+was forwarded into Gmail at 16:50:37. The 38-minute delay means that code is expired;
+a new arrival does not reset its ten-minute lifetime. This later observation
+supersedes the earlier "no forwarded message observed" status, but it does not prove
+full login success or that all accounts' forwarding routes work.
+
+For this installation, Apple Mail is a REQUIRED LOCAL FORWARDING COMPONENT, not
+merely a viewer. Reading Gmail through its API does not run a rule installed in Mail.
+Retain the user's existing forwarding rules; do not require switching 26 providers'
+server-side rules merely to fix this missing application prerequisite.
+
+Required order: prepare Mail in the background -> verify source mailbox/check-new-mail
+readiness and Gmail access -> collect the Gmail baseline -> record request time/intent
+-> request one code -> poll Gmail while monitoring Mail -> validate fresh code/identity.
+Perform this preparation before a monthly batch and each retry pass, and recheck
+Mail immediately before every account's code request. Keep Mail running throughout
+all active waits. Do not close it after the job, whether the user or the job started it.
+
+`login_refresh_mail.py` implements a bounded process-lifecycle guard. The native probe
+reads only the exact Mail executable's PID/start time. The HTTP client's
+`prepare_delivery()` must be called before baseline collection; `request_code()` now
+refuses to send without a prepared, currently running Mail instance. `check_delivery()`
+is exposed for every receiver polling iteration. A loss/restart of Mail or a long
+sleep gap invalidates readiness. Pausing this shared dependency does not invalidate
+26 cookies or justify 26 login retries. Already-requested codes retain their original
+expiry; neither restoring Mail nor replaying a forwarded message restarts the clock.
+
+A cold-start hook is available to the native host for ONE DCF-approved background
+start, followed by a real process recheck; absent/denied launch support pauses before
+sending. This hook is NOT yet wired to a production launcher. The reviewed DCF tool
+surface does not provide a dedicated background application-launch action, and the
+LocalAnt tool route remains unavailable in this turn. Do not invent such a tool,
+use direct osascript/open, enable foreground permission, or alter DCF to work around it.
+Mail is already running in the live environment; no restart or focus change was needed.
+If the user quits Mail mid-job, pause rather than repeatedly reopening it against them.
+
+A stable process and the 15-second bounded warmup DO NOT prove mailbox connectivity,
+sync completion, automatic polling configuration or forwarding delivery. The native
+integration must verify those separately; a manual-only fetching setting or offline
+source account remains a blocking/diagnostic state, not a green "ready" inferred from
+sleeping for a fixed duration. A preflight denial must occur before reserving an
+attempt. If a later gate denies after intent reservation but before the HTTP send,
+the runner must reconcile that definite non-send instead of consuming a login retry.
+Queue-to-host integration is still pending, so this is not claimed as a full runner test.
+
+Use Gmail's official read-only API for reading the dedicated receiving mailbox.
+Do not scrape Mail's UI or private message database. The
 standalone app needs its own OAuth authorization; a ChatGPT Gmail connection cannot
 be exported as the app's credential. Request `gmail.readonly`, not send/delete/modify.
 This scope can read the mailbox; filtering to GLaDOS messages is application logic,
@@ -103,8 +149,9 @@ NOT a Gmail-enforced per-label permission boundary. Keep OAuth tokens in macOS K
 Check the consent application's production/testing status and token lifetime before
 claiming unattended monthly operation.
 
-Before requesting an OTP, verify mailbox access and capture current message IDs as the
-attempt baseline. Retain the baseline, request timestamp, mailbox and target email as
+After the Mail prerequisite and mailbox readiness checks, verify Gmail access and
+capture current message IDs as the attempt baseline. Do not take that baseline before
+Mail has had a chance to process its pending messages. Retain the baseline, request timestamp, mailbox and target email as
 non-secret attempt state. Persist send intent before sending once. If the send response
 is ambiguous, wait for that attempt rather than immediately sending another request.
 Use individual Gmail message IDs, not concatenated conversation-thread bodies.
@@ -213,12 +260,14 @@ alone. Distinguish service outage, challenge, permission failure and expired ses
 From the repository root, using Python 3.10+ on macOS or Linux:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_login_refresh_core.py -v
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p 'test_login_refresh*.py' -v
 ```
 
-The initial candidate passes 67 offline tests. This result proves parser/queue behavior
-under those fixtures, not real email forwarding, OAuth consent, Safari behavior,
-credential validity, native UI integration or unattended monthly execution.
+The initial candidate had 67 core tests. The current candidate additionally has
+50 HTTP/Gmail tests and 29 Mail-lifecycle tests: 146 refresh-module tests passed on
+the target Mac. A real read-only Mail process/preflight check passed without launching
+or quitting Mail. These results do not prove automatic DCF startup, mailbox-online
+readiness, OAuth consent, complete login, native UI integration or monthly execution.
 
 ## Primary references
 

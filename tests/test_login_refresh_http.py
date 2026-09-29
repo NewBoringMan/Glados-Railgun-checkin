@@ -12,9 +12,20 @@ from unittest.mock import Mock
 
 from login_refresh_core import CodeCandidate, LoginAttempt, RefreshError
 from login_refresh_http import (
-    GMAIL_ORIGIN, LOGIN_ORIGIN, LOGIN_SITE, GladosEmailLogin, GmailReadOnly,
+    GMAIL_ORIGIN, LOGIN_ORIGIN, LOGIN_SITE, GladosEmailLogin as NativeLoginClient, GmailReadOnly,
     HTTPFailure, JSONResponse, NativeJSONTransport, trusted_outer_sender,
 )
+
+from login_refresh_mail import MailForwardingGate
+
+
+def GladosEmailLogin(transport, **kwargs):
+    """HTTP-only tests use an explicitly prepared synthetic Mail prerequisite."""
+    gate = MailForwardingGate(lambda: 'synthetic-mail-instance', warmup_seconds=0)
+    client = NativeLoginClient(transport, mail_gate=gate, **kwargs)
+    client.prepare_delivery()
+    return client
+
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
 TARGET = 'person@example.com'
