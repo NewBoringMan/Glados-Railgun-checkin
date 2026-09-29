@@ -1,11 +1,63 @@
 # Account Center login refresh — candidate integration contract
 
-Status: the offline safety core, a bounded native HTTP login adapter, and the Gmail
-read-only REST adapter are implemented. Only the code-request step has been tried
-live; a fresh forwarded message and complete login have NOT been accepted. The native
-application, Gmail OAuth consent/token storage, Keychain credential storage, cloud
-publisher and monthly scheduler are NOT connected. No production automation is enabled.
-This is not an installable Account Center release.
+Status: candidate core, native HTTP login, Mail prerequisite, Gmail read-only REST,
+Desktop OAuth/PKCE and native Keychain components are implemented. The Keychain component
+has passed a real noninteractive synthetic-item test on the target Mac. Five historical
+email identities have been persisted privately. Real Google consent, successful GLaDOS
+login, native UI integration, cloud credential publication and monthly scheduling are
+NOT complete. No production automation is enabled. This is not an installable release.
+
+## Latest continuation — protected credentials and durable identity
+
+The current installed app remains Build 20011. A later single-account authorization
+request, made with Mail running, returned `captcha_required=true` and was stopped. No
+challenge retry, alternative domain, fingerprint spoofing or credential publication
+followed. In this increment no login/code request was made at all.
+
+Implemented `login_refresh_oauth.py`:
+- User-supplied Desktop OAuth client only; pinned official Google endpoints.
+- Short-lived IPv4 loopback receiver, S256 PKCE, unguessable state, exact Host/path,
+  duplicate-parameter rejection, single-use code exchange, no query/code logging.
+- Only Gmail read-only scope; authenticated mailbox validation before saving/replacing
+  a credential. An expired access token refreshes without another consent flow; an
+  expired/revoked refresh token requests human authorization. Shared network faults
+  do not delete the previous protected record.
+- No implicit browser opening. The host must present initial consent through the user's
+  approved interaction path. No Google OAuth client was created or imported, and no
+  real Google account consent was performed here.
+
+Implemented `app_integration/RefreshSecretStore.swift`, an internal helper, NOT another
+`.app`. It addresses only this app's fixed Keychain service and validated record keys.
+It communicates over anonymous pipes; secrets are not command arguments or file data.
+It never changes system Keychain settings or other applications' items, and disallows
+interactive authentication. A locked/denied Keychain pauses instead of opening a prompt.
+`tools/test_refresh_keychain.py` compiled and signed it, verified its signature, completed
+synthetic put/get/update/delete against the separate self-test service, verified removal,
+and rejected out-of-scope requests. Its temporary binary and module cache were removed.
+This test does not claim the helper is installed into the signed production bundle.
+
+Implemented `login_refresh_identity.py` and `tools/recover_login_identities.py`:
+- Require a matching snapshot SHA and current registered account keys.
+- Reject conflicting key/email mappings before applying any of a batch.
+- Keep historical provenance and source time separate from current authentication.
+- Applied five matching historical identities to the existing app data directory's
+  `login-refresh.sqlite`, permission 0600; reopened and verified five rows and zero jobs.
+- The existing 26-row status cache is unchanged. The remaining 21 identities were not
+  guessed. No email was added to the public repository, and no remote writes occurred.
+  This private state is required app data, not disposable work garbage.
+
+Verification: 254 Python tests pass (195 prior + 47 OAuth/pipe tests + 12 identity tests),
+plus native signed Keychain self-test. OAuth tests include an actual local callback
+socket with synthetic data; they do NOT exercise Google's live service.
+
+Source recovery: metadata for the original `GLaDOS-Account-Center-macOS-v2.0.4.zip`
+was located in the user's Library. Its original local download path no longer exists.
+The file tool denied raw-byte materialization and returned no readable archive content.
+This is a known source retrieval gap, not justification to replace V2 with V3 or binary
+patch the main window. A readable authorized copy is still needed for main UI integration.
+The previous two uncommitted live-probe drivers are disposable and are removed after
+confirming their bounded runtime has exited; keep the reusable Keychain test/migration
+scripts as maintained source.
 
 ## 2026-09-29 continuation — measured boundary
 
