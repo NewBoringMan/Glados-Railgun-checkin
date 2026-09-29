@@ -3,9 +3,11 @@
 
 @interface GLaDOSPolicyMenuTarget : NSObject
 - (void)openPolicyEditor:(id)sender;
+- (void)openRefreshCenter:(id)sender;
 @end
 
 static void *policyEditorHandle = NULL;
+static void *refreshCenterHandle = NULL;
 static NSString *const PolicyButtonIdentifier = @"com.enoch.glados-account-center.policy-button";
 
 typedef void (*GLaDOSShowPolicyEditorFunction)(void);
@@ -48,6 +50,22 @@ typedef void (*GLaDOSShowPolicyEditorFunction)(void);
 
     showEditor();
 }
+
+- (void)openRefreshCenter:(id)sender {
+    NSString *path = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Contents/Frameworks/GLaDOSRefreshCenter.dylib"];
+    if (!refreshCenterHandle) {
+        refreshCenterHandle = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+    }
+    void (*showRefresh)(void) = refreshCenterHandle ? (void (*)(void))dlsym(refreshCenterHandle, "GLaDOSShowRefreshCenter") : NULL;
+    if (!showRefresh) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"登录维护模块不可用";
+        alert.informativeText = @"请检查 Account Center 安装完整性。原账号、签到与兑换设置未被改动。";
+        [alert runModal];
+        return;
+    }
+    showRefresh();
+}
 @end
 
 static GLaDOSPolicyMenuTarget *policyMenuTarget = nil;
@@ -84,14 +102,24 @@ static void InstallPolicyButtonOnWindow(NSWindow *window) {
     button.toolTip = @"调整每个 GLaDOS 账号使用的兑换方案";
     [button sizeToFit];
 
+    NSButton *refreshButton = [NSButton buttonWithTitle:@"登录维护" target:policyMenuTarget action:@selector(openRefreshCenter:)];
+    refreshButton.bezelStyle = NSBezelStyleTexturedRounded;
+    refreshButton.controlSize = NSControlSizeRegular;
+    refreshButton.toolTip = @"保存账号邮箱、配置收码授权并检查登录维护状态";
+    [refreshButton sizeToFit];
     NSRect buttonFrame = button.frame;
-    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, buttonFrame.size.width + 12.0, 28.0)];
+    NSRect refreshFrame = refreshButton.frame;
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, buttonFrame.size.width + refreshFrame.size.width + 20.0, 28.0)];
     container.identifier = PolicyButtonIdentifier;
     button.frame = NSMakeRect(6.0,
                               floor((container.bounds.size.height - buttonFrame.size.height) / 2.0),
                               buttonFrame.size.width,
                               buttonFrame.size.height);
     [container addSubview:button];
+    refreshButton.frame = NSMakeRect(NSMaxX(button.frame) + 8.0,
+                                    floor((container.bounds.size.height - refreshFrame.size.height) / 2.0),
+                                    refreshFrame.size.width, refreshFrame.size.height);
+    [container addSubview:refreshButton];
 
     NSTitlebarAccessoryViewController *accessory = [[NSTitlebarAccessoryViewController alloc] init];
     accessory.view = container;
@@ -139,6 +167,16 @@ static void InstallPolicyMenu(void) {
         [appMenu insertItem:item atIndex:insertionIndex];
     }
 
+    BOOL hasRefreshMenuItem = NO;
+    for (NSMenuItem *item in appMenu.itemArray) {
+        if ([item.title isEqualToString:@"登录维护…"]) { hasRefreshMenuItem = YES; break; }
+    }
+    if (!hasRefreshMenuItem) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"登录维护…" action:@selector(openRefreshCenter:) keyEquivalent:@"l"];
+        item.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+        item.target = policyMenuTarget;
+        [appMenu insertItem:item atIndex:MIN((NSInteger)appMenu.numberOfItems, 3)];
+    }
     InstallPolicyButtonOnAllWindows();
 }
 

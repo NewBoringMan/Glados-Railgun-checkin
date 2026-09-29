@@ -1,5 +1,42 @@
 # Account Center login refresh — candidate integration contract
 
+## Same-app UI integration increment (not installed)
+
+The current installed 2.0.9 Build 20011 is the update base; an old V2 source archive
+is NOT a prerequisite for the independent in-process maintenance/policy modules.
+The original compiled main account-card implementation is left untouched.
+
+New source in this increment:
+- `RefreshCenter.swift`: an internal, same-process maintenance window with account
+  emails, local email entry, Gmail setup, consent and dependency status.
+- `login_refresh_app.py`: JSON-lines host adapter. Reads the real account registry,
+  retains local email identities, labels new user-entered email targets as unverified,
+  and exposes the previously implemented mailbox configuration/consent functions.
+  It does not expose live credential publication or enable batch/monthly automation.
+- `AccountEmailDirectory.swift`: read-only private SQLite adapter reused by the existing
+  policy editor, so a failed/empty status cache no longer erases its stored email name.
+- `PolicyMenuPlugin.m`: source for a visible Login Maintenance button/menu alongside
+  the original Exchange Policy button, without another application or main-binary edit.
+
+On the target Mac all three UI libraries typechecked and linked; the new window entry
+symbol was present. The existing 254 tests passed. A real source-entry snapshot through
+isolated Python returned 26 accounts, five confirmed local emails, Mail running and
+monthly execution disabled. Private email values were not printed. This is not a GUI
+screenshot/interaction acceptance and does not prove the original cards were modified.
+
+The additional runner, new packaging/installation script and new test-file write were
+not executed/created because those tool calls were denied. No alternative route was
+used to perform the denied installation or credential actions. The new native/UI
+sources are retained, but packaging and installation are pending. The existing
+`build-v209.sh` predates these extra source inputs; do not present it as a complete
+builder for this increment. Its policy editor target must eventually include
+`AccountEmailDirectory.swift` and SQLite, and the new module/resources must be added
+in an authorized packaging step before replacing the existing app.
+
+Do not mark the draft ready for release from typecheck or the old regression count.
+The running/installed app remains Build 20011 and the production branch is unchanged.
+
+
 Status: candidate core, native HTTP login, Mail prerequisite, Gmail read-only REST,
 Desktop OAuth/PKCE and native Keychain components are implemented. The Keychain component
 has passed a real noninteractive synthetic-item test on the target Mac. Five historical
