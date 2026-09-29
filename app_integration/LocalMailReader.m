@@ -1,58 +1,44 @@
-// Internal data-only Mail adapter. Uses Mail's public Scripting Bridge dictionary.
-// Does not drive GUI, activate/quit/launch Mail, run AppleScript, inspect Mail files,
-// read passwords, change rules, mark messages read, or modify any mailbox.
+// Internal, data-only Scripting Bridge adapter for the installed Apple Mail.
+// No GUI, launch, quit, scripts, passwords, database access or mailbox writes.
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
 #import <ScriptingBridge/ScriptingBridge.h>
 #import "Mail.h"
-
-static NSString *const OwnerBundle = @"com.enoch.glados-account-center";
-static const NSUInteger MaximumSourceBytes = 524288;
-static NSDictionary *Failure(NSString *reason) { return @{@"ok":@NO, @"reason":reason}; }
-static BOOL IsString(id value) { return [value isKindOfClass:NSString.class]; }
-static NSString *NormalizeEmail(id value) {
-    if (!IsString(value)) return nil;
-    NSString *email = [[value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
-    if (email.length > 254 || [email rangeOfString:@"^[^\\s<>@,;]+@[^\\s<>@,;]+\\.[^\\s<>@,;]+$" options:NSRegularExpressionSearch].location == NSNotFound) return nil;
-    return email;
+static NSDictionary *Failure(NSString *s) { return @{@"ok":@NO,@"reason":s}; }
+static BOOL IsString(id v) { return [v isKindOfClass:NSString.class]; }
+static NSString *NormalizeEmail(id v) {
+    if (!IsString(v)) return nil;
+    NSString *s = [[v stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+    return s.length <= 254 && [s rangeOfString:@"^[^\\s<>@,;]+@[^\\s<>@,;]+\\.[^\\s<>@,;]+$" options:NSRegularExpressionSearch].location != NSNotFound ? s : nil;
 }
-static NSString *CanonicalSubject(NSString *value) {
-    NSString *text = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSRegularExpression *prefix = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:fw|fwd|转发|轉寄)\\s*[:：]\\s*)+" options:NSRegularExpressionCaseInsensitive error:nil];
-    text = [prefix stringByReplacingMatchesInString:text options:0 range:NSMakeRange(0,text.length) withTemplate:@""];
-    return [[text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+static BOOL IsCodeSubject(NSString *v) {
+    if (!IsString(v)) return NO;
+    NSString *s = [v stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSRegularExpression *r = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:fw|fwd|转发|轉寄)\\s*[:：]\\s*)+" options:NSRegularExpressionCaseInsensitive error:nil];
+    s = [r stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0,s.length) withTemplate:@""];
+    return [[[s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString] isEqualToString:@"glados authentication code"];
 }
-static BOOL IsCodeSubject(NSString *value) {
-    return IsString(value) && [CanonicalSubject(value) isEqualToString:@"glados authentication code"];
-}
-static BOOL ValidTime(id value) {
-    return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() && isfinite([value doubleValue]);
-}
-static NSDictionary *ValidateRequest(NSDictionary *input) {
-    if (![input isKindOfClass:NSDictionary.class] || !IsString(input[@"op"])) return Failure(@"invalid_mail_request");
-    NSString *op = input[@"op"];
-    NSSet *operations = [NSSet setWithArray:@[@"permission",@"authorize",@"verify",@"check",@"list",@"read"]];
-    if (![operations containsObject:op]) return Failure(@"invalid_mail_request");
-    NSMutableSet *allowed = [NSMutableSet setWithArray:@[@"op"]];
+static NSDictionary *ValidateRequest(NSDictionary *q) {
+    if (![q isKindOfClass:NSDictionary.class] || !IsString(q[@"op"])) return Failure(@"invalid_mail_request");
+    NSString *op = q[@"op"];
+    if (![@[@"permission",@"authorize",@"verify",@"check",@"list",@"read"] containsObject:op]) return Failure(@"invalid_mail_request");
+    NSMutableSet *allowed = [NSMutableSet setWithObject:@"op"];
     if (![@[@"permission",@"authorize"] containsObject:op]) {
-        [allowed addObject:@"mailbox"];
-        if (!NormalizeEmail(input[@"mailbox"])) return Failure(@"invalid_email");
+        [allowed addObject:@"mailbox"]; if (!NormalizeEmail(q[@"mailbox"])) return Failure(@"invalid_email");
     }
-    if ([op isEqualToString:@"check"] && input[@"origin_email"]) {
-        [allowed addObject:@"origin_email"];
-        if (!NormalizeEmail(input[@"origin_email"])) return Failure(@"invalid_email");
+    if ([op isEqualToString:@"check"] && q[@"origin_email"]) {
+        [allowed addObject:@"origin_email"]; if (!NormalizeEmail(q[@"origin_email"])) return Failure(@"invalid_email");
     }
     if ([op isEqualToString:@"list"]) {
-        [allowed addObject:@"after"];
-        if (!ValidTime(input[@"after"])) return Failure(@"invalid_mail_window");
+        [allowed addObject:@"after"]; id v = q[@"after"];
+        if (![v isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)v) == CFBooleanGetTypeID() || !isfinite([v doubleValue])) return Failure(@"invalid_mail_window");
     }
     if ([op isEqualToString:@"read"]) {
-        [allowed addObject:@"message_id"];
-        NSString *mid = input[@"message_id"];
+        [allowed addObject:@"message_id"]; NSString *mid = q[@"message_id"];
         if (!IsString(mid) || [mid rangeOfString:@"^mail:[1-9][0-9]{0,14}$" options:NSRegularExpressionSearch].location == NSNotFound) return Failure(@"invalid_mail_id");
     }
-    for (NSString *key in input) if (![allowed containsObject:key]) return Failure(@"invalid_mail_request");
+    for (NSString *k in q) if (![allowed containsObject:k]) return Failure(@"invalid_mail_request");
     return nil;
 }
 @interface MailErrors : NSObject <SBApplicationDelegate>
@@ -62,131 +48,97 @@ static NSDictionary *ValidateRequest(NSDictionary *input) {
 - (id)eventDidFail:(const AppleEvent *)event withError:(NSError *)error { self.error = error; return nil; }
 @end
 static NSDictionary *Permission(BOOL ask) {
-    const char *bundle = "com.apple.mail";
-    AEAddressDesc target = {typeNull,NULL};
-    OSStatus made = AECreateDesc(typeApplicationBundleID,bundle,strlen(bundle),&target);
-    if (made != noErr) return Failure(@"mail_permission_unavailable");
-    OSStatus result = AEDeterminePermissionToAutomateTarget(&target,kAECoreSuite,kAEGetData,ask);
-    AEDisposeDesc(&target);
-    NSString *state = result == noErr ? @"granted" : result == errAEEventWouldRequireUserConsent ? @"required" : result == errAEEventNotPermitted ? @"denied" : @"unavailable";
-    return @{@"ok":@YES,@"permission":state,@"status":@(result)};
+    const char *name = "com.apple.mail"; AEAddressDesc target = {typeNull,NULL};
+    if (AECreateDesc(typeApplicationBundleID,name,strlen(name),&target) != noErr) return Failure(@"mail_permission_unavailable");
+    OSStatus code = AEDeterminePermissionToAutomateTarget(&target,kAECoreSuite,kAEGetData,ask); AEDisposeDesc(&target);
+    NSString *state = code == noErr ? @"granted" : code == errAEEventWouldRequireUserConsent ? @"required" : code == errAEEventNotPermitted ? @"denied" : @"unavailable";
+    return @{@"ok":@YES,@"permission":state,@"status":@(code)};
 }
-static MailAccount *FindAccount(MailApplication *app,NSString *mailbox,MailErrors *errors) {
-    SBElementArray *accounts = app.accounts;
-    if (accounts.count > 100 || errors.error) return nil;
+static MailAccount *FindAccount(MailApplication *app,NSString *email,MailErrors *e) {
+    SBElementArray *accounts = app.accounts; if (accounts.count > 100 || e.error) return nil;
     MailAccount *match = nil;
-    for (MailAccount *account in accounts) {
-        BOOL matches = NO;
-        for (NSString *address in account.emailAddresses) if ([NormalizeEmail(address) isEqualToString:mailbox]) matches = YES;
-        if (errors.error) return nil;
-        if (matches) {
-            if (match != nil || !account.enabled) return nil;
-            match = account;
-        }
+    for (MailAccount *a in accounts) {
+        BOOL found = NO;
+        for (NSString *address in a.emailAddresses) if ([NormalizeEmail(address) isEqualToString:email]) found = YES;
+        if (e.error) return nil;
+        if (found) { if (match || !a.enabled) return nil; match = a; }
     }
     return match;
 }
-static MailMailbox *FindInbox(MailAccount *account,MailErrors *errors) {
-    SBElementArray *boxes = account.mailboxes;
-    if (boxes.count > 250 || errors.error) return nil;
+static MailMailbox *FindInbox(MailAccount *account,MailErrors *e) {
+    SBElementArray *boxes = account.mailboxes; if (boxes.count > 250 || e.error) return nil;
     MailMailbox *match = nil;
-    NSSet *inboxNames = [NSSet setWithArray:@[@"inbox",@"收件箱",@"收件匣"]];
     for (MailMailbox *box in boxes) {
-        if ([inboxNames containsObject:[box.name lowercaseString]]) {
-            if (match != nil) return nil;
-            match = box;
-        }
-        if (errors.error) return nil;
+        if ([@[@"inbox",@"收件箱",@"收件匣"] containsObject:[box.name lowercaseString]]) { if (match) return nil; match = box; }
+        if (e.error) return nil;
     }
     return match;
 }
-static NSDictionary *Perform(NSDictionary *input) {
-    NSDictionary *invalid = ValidateRequest(input);
-    if (invalid) return invalid;
-    if (![[NSBundle mainBundle].bundleIdentifier isEqualToString:OwnerBundle]) return Failure(@"installed_bundle_required");
-    NSString *op = input[@"op"];
+static NSDictionary *Perform(NSDictionary *q) {
+    NSDictionary *invalid = ValidateRequest(q); if (invalid) return invalid;
+    if (![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.enoch.glados-account-center"]) return Failure(@"installed_bundle_required");
     NSArray<NSRunningApplication *> *running = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.mail"];
     if (running.count != 1) return Failure(running.count == 0 ? @"mail_not_running" : @"mail_instance_ambiguous");
-    NSDictionary *permission = Permission([op isEqualToString:@"authorize"]);
+    NSString *op = q[@"op"]; NSDictionary *permission = Permission([op isEqualToString:@"authorize"]);
     if ([@[@"permission",@"authorize"] containsObject:op]) return permission;
     if (![permission[@"permission"] isEqualToString:@"granted"]) return Failure(@"mail_permission_required");
-    NSString *mailbox = NormalizeEmail(input[@"mailbox"]);
+    NSString *email = NormalizeEmail(q[@"mailbox"]);
     MailApplication *app = [SBApplication applicationWithProcessIdentifier:running.firstObject.processIdentifier];
-    app.timeout = 15;
-    app.sendMode = kAEWaitReply | kAENeverInteract;
-    MailErrors *errors = [MailErrors new]; app.delegate = errors;
-    MailAccount *account = FindAccount(app,mailbox,errors);
-    if (errors.error) return Failure(@"mail_data_unavailable");
-    if (!account) return Failure(@"mail_receiver_not_found");
-    MailMailbox *inbox = FindInbox(account,errors);
-    if (errors.error) return Failure(@"mail_data_unavailable");
-    if (!inbox) return Failure(@"mail_inbox_unavailable");
-    if ([op isEqualToString:@"verify"]) return @{@"ok":@YES,@"mailbox":mailbox,@"permission":@"granted",@"inbox_found":@YES,@"online_delivery_proven":@NO};
+    app.timeout = 15; app.sendMode = kAEWaitReply | kAENeverInteract;
+    MailErrors *e = [MailErrors new]; app.delegate = e;
+    MailAccount *account = FindAccount(app,email,e);
+    if (e.error) return Failure(@"mail_data_unavailable"); if (!account) return Failure(@"mail_receiver_not_found");
+    MailMailbox *inbox = FindInbox(account,e);
+    if (e.error) return Failure(@"mail_data_unavailable"); if (!inbox) return Failure(@"mail_inbox_unavailable");
+    if ([op isEqualToString:@"verify"]) return @{@"ok":@YES,@"mailbox":email,@"permission":@"granted",@"inbox_found":@YES,@"online_delivery_proven":@NO};
     if ([op isEqualToString:@"check"]) {
-        [app checkForNewMailFor:account];
-        NSString *origin = NormalizeEmail(input[@"origin_email"]);
-        if (origin && ![origin isEqualToString:mailbox] && !errors.error) {
-            MailAccount *sourceAccount = FindAccount(app,origin,errors);
-            if (sourceAccount && !errors.error) [app checkForNewMailFor:sourceAccount];
+        [app checkForNewMailFor:account]; NSString *origin = NormalizeEmail(q[@"origin_email"]);
+        if (origin && ![origin isEqualToString:email] && !e.error) {
+            MailAccount *source = FindAccount(app,origin,e); if (source && !e.error) [app checkForNewMailFor:source];
         }
-        return errors.error ? Failure(@"mail_check_failed") : @{@"ok":@YES,@"check_requested":@YES,@"delivery_complete":@NO};
+        return e.error ? Failure(@"mail_check_failed") : @{@"ok":@YES,@"check_requested":@YES,@"delivery_complete":@NO};
     }
     NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    NSTimeInterval cutoff = [op isEqualToString:@"list"] ? [input[@"after"] doubleValue] : now-86400;
+    NSTimeInterval cutoff = [op isEqualToString:@"list"] ? [q[@"after"] doubleValue] : now-86400;
     if (cutoff < now-86400 || cutoff > now+15) return Failure(@"invalid_mail_window");
-    NSDate *after = [NSDate dateWithTimeIntervalSince1970:cutoff];
-    NSArray<MailMessage *> *messages = [inbox.messages filteredArrayUsingPredicate:
-        [NSPredicate predicateWithFormat:@"dateReceived >= %@ AND subject CONTAINS[cd] %@",after,@"GLaDOS Authentication Code"]];
-    if (errors.error) return Failure(@"mail_data_unavailable");
-    if (messages.count > 100) return Failure(@"mail_window_too_large");
+    NSArray<MailMessage *> *messages = [inbox.messages filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"dateReceived >= %@ AND subject CONTAINS[cd] %@",[NSDate dateWithTimeIntervalSince1970:cutoff],@"GLaDOS Authentication Code"]];
+    if (e.error) return Failure(@"mail_data_unavailable"); if (messages.count > 100) return Failure(@"mail_window_too_large");
     NSMutableArray *ids = [NSMutableArray array];
-    for (MailMessage *message in messages) {
-        NSString *subject = message.subject;
-        if (errors.error) return Failure(@"mail_data_unavailable");
-        if (!IsCodeSubject(subject)) continue;
-        NSInteger mid = message.id;
-        if (errors.error || mid < 1) return Failure(@"invalid_mail_id");
-        NSString *identifier = [NSString stringWithFormat:@"mail:%ld",(long)mid];
-        [ids addObject:identifier];
-        if ([op isEqualToString:@"read"] && [identifier isEqualToString:input[@"message_id"]]) {
-            NSString *source = message.source;
-            NSDate *received = message.dateReceived;
-            if (errors.error || !IsString(source) || ![received isKindOfClass:NSDate.class]) return Failure(@"mail_source_unavailable");
+    for (MailMessage *m in messages) {
+        NSString *subject = m.subject; if (e.error) return Failure(@"mail_data_unavailable"); if (!IsCodeSubject(subject)) continue;
+        NSInteger mid = m.id; if (e.error || mid < 1) return Failure(@"invalid_mail_id");
+        NSString *identifier = [NSString stringWithFormat:@"mail:%ld",(long)mid]; [ids addObject:identifier];
+        if ([op isEqualToString:@"read"] && [identifier isEqualToString:q[@"message_id"]]) {
+            NSString *source = m.source; NSDate *received = m.dateReceived;
+            if (e.error || !IsString(source) || ![received isKindOfClass:NSDate.class]) return Failure(@"mail_source_unavailable");
             NSData *raw = [source dataUsingEncoding:NSUTF8StringEncoding];
-            if (!raw.length || raw.length > MaximumSourceBytes) return Failure(@"invalid_mail_size");
-            return @{@"ok":@YES,@"mailbox":mailbox,@"message_id":identifier,
-                     @"received_at":@(received.timeIntervalSince1970),@"source_base64":[raw base64EncodedStringWithOptions:0]};
+            if (!raw.length || raw.length > 524288) return Failure(@"invalid_mail_size");
+            return @{@"ok":@YES,@"mailbox":email,@"message_id":identifier,@"received_at":@(received.timeIntervalSince1970),@"source_base64":[raw base64EncodedStringWithOptions:0]};
         }
     }
     if ([op isEqualToString:@"read"]) return Failure(@"mail_message_unavailable");
-    return @{@"ok":@YES,@"mailbox":mailbox,@"message_ids":ids};
+    return @{@"ok":@YES,@"mailbox":email,@"message_ids":ids};
 }
 int main(int argc,const char *argv[]) {
     @autoreleasepool {
         NSDictionary *result;
         if (argc == 2 && strcmp(argv[1],"--self-test") == 0) {
-            BOOL passed = IsCodeSubject(@"Fwd: GLaDOS Authentication Code") &&
-                !IsCodeSubject(@"GLaDOS Authentication Code marketing") &&
-                [NormalizeEmail(@" Person@Example.com ") isEqualToString:@"person@example.com"] &&
-                ValidateRequest(@{@"op":@"read",@"mailbox":@"codes@example.net",@"message_id":@"../private"}) != nil &&
-                ValidateRequest(@{@"op":@"verify",@"mailbox":@"codes@example.net",@"service":@"other"}) != nil;
-            result = @{@"ok":@(passed),@"self_test":@"syntax_and_scope",@"mail_contacted":@NO,@"ui_requested":@NO};
+            BOOL pass = IsCodeSubject(@"Fwd: GLaDOS Authentication Code") && !IsCodeSubject(@"GLaDOS Authentication Code marketing") && [NormalizeEmail(@" Person@Example.com ") isEqualToString:@"person@example.com"] && ValidateRequest(@{@"op":@"read",@"mailbox":@"codes@example.net",@"message_id":@"../private"}) && ValidateRequest(@{@"op":@"verify",@"mailbox":@"codes@example.net",@"service":@"other"});
+            result = @{@"ok":@(pass),@"self_test":@"syntax_and_scope",@"mail_contacted":@NO,@"ui_requested":@NO};
         } else if (argc != 1) result = Failure(@"stdin_only");
         else {
             @try {
                 NSMutableData *data = [NSMutableData data];
                 while (data.length <= 16384) {
-                    NSData *part = [NSFileHandle.standardInput readDataOfLength:MIN((NSUInteger)4096,16385-data.length)];
-                    if (!part.length) break;
-                    [data appendData:part];
+                    NSData *part = [[NSFileHandle fileHandleWithStandardInput] readDataOfLength:MIN((NSUInteger)4096,16385-data.length)];
+                    if (!part.length) break; [data appendData:part];
                 }
-                id input = data.length <= 16384 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-                result = Perform(input);
+                id q = data.length <= 16384 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil; result = Perform(q);
             } @catch (__unused NSException *exception) { result = Failure(@"mail_data_unavailable"); }
         }
-        NSData *encoded = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
-        [NSFileHandle.standardOutput writeData:encoded];
-        [NSFileHandle.standardOutput writeData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        NSData *data = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingSortedKeys error:nil];
+        [[NSFileHandle fileHandleWithStandardOutput] writeData:data];
+        [[NSFileHandle fileHandleWithStandardOutput] writeData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
         return [result[@"ok"] boolValue] ? 0 : 1;
     }
 }
