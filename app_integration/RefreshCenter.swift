@@ -140,7 +140,8 @@ private final class RefreshModel: ObservableObject {
                 }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 380) { [weak self, weak child] in
+        let timeout: Double = ["refresh_one", "refresh_all"].contains(request["action"] as? String ?? "") ? 900 : 380
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self, weak child] in
             guard let self, self.generation == token, child?.isRunning == true else { return }
             self.cancel(); self.error = true; self.message = "本次操作超时，已停止等待。"
         }
@@ -273,8 +274,13 @@ private struct RefreshCenterView: View {
                                 Text(account.policyTitle).font(.callout)
                                 Text(account.auto_exchange ? "自动兑换开" : "自动兑换关").font(.caption).foregroundStyle(.secondary)
                             }
-                            Button(account.email.isEmpty ? "填写邮箱" : "查看邮箱") { model.editingAccount = account }
-                                .disabled(model.busy)
+                            VStack(spacing: 6) {
+                                Button(account.email.isEmpty ? "填写邮箱" : "查看邮箱") { model.editingAccount = account }
+                                    .disabled(model.busy)
+                                Button("登录并验证") { model.run(["action":"refresh_one", "key":account.key], reloadAfter:true) }
+                                    .disabled(model.busy || account.email.isEmpty || model.snapshot?.gmail.authorized != true || model.snapshot?.mail_running != true)
+                                    .help("使用此账号已保存邮箱收取新验证码；核对真实身份后更新原 Secret，并执行云端只读验证。")
+                            }
                         }.padding(12).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
                     }
                 }
@@ -327,11 +333,24 @@ private struct RefreshCenterView: View {
             statusLine("收码邮箱", model.snapshot?.gmail.authorized == true ? "已有授权" : "需要首次授权")
             statusLine("GitHub 账号目录", model.snapshot?.repository_source == "github" ? "刚从 GitHub 读取" : "上次保存的目录")
             Divider()
-            Text("批量与每月自动刷新尚未启用").font(.headline)
+            Text(model.snapshot?.schedule_enabled == true ? "每月串行维护已启用" : "每月串行维护未启用").font(.headline)
             Text(model.snapshot?.automation_reason ?? "需要先完成单账号真实登录与云端验证。")
                 .foregroundStyle(.secondary)
             Text(model.snapshot?.last_live_gate ?? "网站要求人机验证时，只能由你在正常页面完成。")
                 .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Button("继续本轮待办") { model.run(["action":"refresh_all"], reloadAfter:true) }
+                    .disabled(model.busy || model.snapshot?.automation_ready != true)
+                if model.snapshot?.schedule_enabled == true {
+                    Button("停用每月维护") { model.run(["action":"disable_monthly"], reloadAfter:true) }.disabled(model.busy)
+                } else {
+                    Button("启用每月维护") { model.run(["action":"enable_monthly"], reloadAfter:true) }
+                        .disabled(model.busy || model.snapshot?.automation_ready != true)
+                }
+                Button("打开官方登录页") { NSWorkspace.shared.open(URL(string:"https://glados.cloud/login")!) }
+            }
+            Text("每次仅处理一个账号；后台定期续接队列，同一月份已完成的账号不重复登录。失败分轮冷却，最多三次；人机验证立即暂停。Mail 关闭时暂停，当前版本不会强行重开窗口。")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false, vertical:true)
             Text("现有 GitHub 自动签到和每账号兑换方案保持原样。本窗口不会为了测试触发兑换。")
                 .font(.callout)
             Spacer()

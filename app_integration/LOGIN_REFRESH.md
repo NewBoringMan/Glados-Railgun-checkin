@@ -1,4 +1,63 @@
-# Account Center login refresh — candidate integration contract
+# Account Center login refresh — implementation and acceptance record
+
+## Installed update: 2.0.10 / Build 20014
+
+The previously installed 2.0.9 / Build 20011 bundle was used as the update base. The
+same path and bundle identifier were retained. `build_maintenance.py` compiled the
+in-process maintenance UI, existing policy UI with persistent emails, menu integration
+and scoped Keychain helper, then copied the maintained Python modules into the bundle.
+`install_maintenance.py` replaced the closed app atomically with rollback on failure.
+It did not launch or terminate any GUI application.
+
+Verified on the actual installed bundle:
+- Code signature passes deep/strict validation.
+- Original `GLaDOSAccountCenter.real` SHA-256 remains
+  `1a2fe7eeeb27c2315b40b07cf4fc0d3f159bbd75045bc3471e283f5fe067a455`.
+- Every original browser script/resource and Safari extension file is byte-identical
+  to the source 2.0.9 bundle. No extra or nested `.app` exists.
+- The installed Python entry point returns 26 accounts, five saved email identities,
+  Mail running, Gmail authorization not configured, and monthly scheduling disabled.
+  Installed Python module hashes match this source checkout.
+- The installed native Keychain helper passes its noninteractive synthetic
+  put/get/update/delete test and removes the synthetic record.
+- 306 test executions pass, including app/runner/scheduler fixtures. These are offline
+  workflow tests, NOT a new successful GLaDOS or Google login.
+
+New orchestration connects email-code polling, authenticated identity verification,
+existing-Secret-only publication and a new single-account cloud status run. Candidate
+credentials are protected in Keychain; interrupted uploads resume verification rather
+than logging in again. The loopback OAuth setup is available through Login Maintenance.
+The user-specified receiving Gmail address is prefilled in private local settings only.
+No actual Secret or existing exchange strategy was modified during this installation.
+
+A local launchd schedule can be enabled from the UI only after one real cloud acceptance
+and usable Gmail authorization. It processes one due account per tick, preserving
+monthly cycles, cooldowns, three-attempt limits and manual holds. No schedule was
+registered or activated during deployment.
+
+### Explicit remaining gaps — do not claim unattended completion
+
+- Gmail's own desktop OAuth client/consent has not yet been configured in this app.
+- The last live GLaDOS request required a human challenge; it was not repeated or
+  bypassed. Complete a normal fresh login and cloud check before bulk enablement.
+- DCF's connector route still returns Resource not found. No foreground/native GUI
+  workaround was used. The main window's buttons have been compiled/linked, but
+  post-install click/screenshot interaction has not been executed.
+- Mail cold-start is not wired to an available DCF-approved launch action. This build
+  safely pauses while Mail is closed; it DOES NOT yet automatically open closed Mail.
+- Manual failures and summaries persist in the UI. Out-of-app proactive notifications
+  have not been connected or live-tested. Do not describe this as a completed alert
+  system or a completely unattended end-to-end monthly service.
+- The original compiled main account-card view is unchanged. Persistent email display
+  is present in the integrated Login Maintenance and Policy Editor windows.
+
+One compressed pre-update Build 20011 bundle is retained for rollback until GUI/live
+acceptance. This is not an indexed application or a second management app. Disposable
+staging bundles, compiler caches and synthetic Keychain records are cleaned after
+verification; source and private identity data remain.
+
+The older incremental notes below are history; this installed-status section takes
+precedence where a prior note says packaging or installation has not been performed.
 
 ## Same-app UI integration increment (not installed)
 

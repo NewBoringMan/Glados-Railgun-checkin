@@ -56,6 +56,27 @@ MESSAGES = {
     'source_file_unavailable':'所选配置文件无法读取。',
     'invalid_request':'无法识别此操作，请更新 Account Center 后重试。',
     'read_only_identity':'这是已确认的邮箱身份，不能直接改成另一邮箱；请使用正常登录重新核对。',
+    'missing_identity':'此账号尚未保存邮箱，请先填写并核对。',
+    'unfinished_job_requires_resume':'已有账号等待收码或云端验证，请先继续该账号，避免串号。',
+    'preexisting_secret_required':'未找到此账号原有的 GitHub Secret，已停止，未创建新账号。',
+    'cloud_operation_uncertain':'GitHub 操作结果暂不明确，已保留恢复记录；不会重复登录或盲目覆盖。',
+    'cloud_status_busy':'已有状态查询正在运行，稍后继续本次验证，不重新发码。',
+    'cloud_dispatch_uncertain':'云端验证任务是否创建暂不明确，需要核对后继续，不重复发送。',
+    'cloud_verification_failed':'云端验证未通过；新登录不能标为恢复成功，请核对任务结果。',
+    'cloud_identity_unverified':'云端结果尚不能确认账号邮箱；没有把账号标为恢复成功。',
+    'production_changed_recheck_required':'执行期间账号、策略或生产版本发生变化；已暂停发布以免覆盖其他修改。',
+    'verified_candidate_required':'缺少可恢复的已验证登录信息，已停止发布。',
+    'authorization_context_requires_manual':'当前登录还依赖额外的官方认证上下文，需要人工核对，未丢弃该要求。',
+    'mail_preflight_required':'发码前必须先准备 Mail，未发出验证码。',
+    'mail_preflight_stale':'Mail 检查过期或电脑刚刚唤醒，已暂停并保留原请求。',
+    'mail_stopped_resume_required':'Mail 已退出或重启；暂停队列，不反复抢开窗口。',
+    'permission_or_challenge':'服务要求人工验证或拒绝权限，已停止自动尝试。',
+    'login_business_rejected':'登录服务拒绝了本次请求；未将其他账号一并判定失效。',
+    'network_unavailable':'网络暂不可用，已保留请求状态，不立即重复发码。',
+    'rate_limited':'服务暂时限流，已暂停；不会更换域名或反复尝试。',
+    'installed_bundle_required':'需要从正式安装的 Account Center 启用该功能。',
+    'schedule_registration_failed':'本机定时任务注册失败，未宣称每月刷新已启用。',
+    'schedule_path_conflict':'同名本机任务与当前配置不一致，未覆盖其他配置。',
 }
 
 
@@ -165,11 +186,14 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
             except (OSError,ValueError,TypeError):pass
         # Only import authenticated historical cache values; never clear on failure.
         conflicts=0
-        with self.store.exclusive_run():
-            for key,row in cache.items():
-                if key not in snapshot['accounts'] or row.get('ok') is not True or not row.get('email'):continue
-                try:self.store.remember_verified_identity(key,row['email'],datetime.fromtimestamp(path.stat().st_mtime,timezone.utc))
-                except RefreshError:conflicts+=1
+        try:
+            with self.store.exclusive_run():
+                for key,row in cache.items():
+                    if key not in snapshot['accounts'] or row.get('ok') is not True or not row.get('email'):continue
+                    try:self.store.remember_verified_identity(key,row['email'],datetime.fromtimestamp(path.stat().st_mtime,timezone.utc))
+                    except RefreshError:conflicts+=1
+        except RefreshError as exc:
+            if str(exc) != 'already_running':raise
         rows=[]
         for key,record in snapshot['accounts'].items():
             known=self.store.identity(key)
@@ -190,17 +214,23 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
             try:
                 client=self.secrets.get('gmail-client');token=self.secrets.get('gmail-token')
                 mailbox=self.setting('mailbox','')
-                gmail={'configured':bool(client),'authorized':bool(client and token and token.get('mailbox')==mailbox),
-                       'reason':'' if client and token and token.get('mailbox')==mailbox else 'mail_auth_required'}
+                matched=bool(client and token and token.get('mailbox')==mailbox and token.get('client_id')==client.get('client_id'))
+                gmail={'configured':bool(client),'authorized':matched,
+                       'reason':'' if matched else 'mail_auth_required'}
                 if gmail['authorized'] and token.get('refresh_expires_at') and token['refresh_expires_at']<=time.time()+60:
                     gmail.update(authorized=False,reason='mail_reauthorization_required')
             except RefreshError as exc:gmail['reason']=str(exc) if str(exc) in MESSAGES else 'keychain_unavailable'
+        acceptance=self.setting('live_acceptance',{})
+        accepted=isinstance(acceptance,dict) and acceptance.get('runner_version')==1 and acceptance.get('cloud_verified') is True
         return {'ok':True,'event':'snapshot','accounts':rows,'repository_source':source,
                 'mail_running':mail_running,'mail_reason':mail_error,'mailbox':self.setting('mailbox',''),
                 'gmail':gmail,'identity_conflicts':conflicts,'confirmed_count':sum(r['identity_kind']=='confirmed' for r in rows),
-                'schedule_enabled':False,'automation_ready':False,
-                'automation_reason':'单账号真实登录与云端验证尚未通过，月度刷新未启用。',
-                'last_live_gate':'网站最近一次实测要求人机验证；不会自动绕过。'}
+                'schedule_enabled':self.setting('monthly_enabled',False) is True,
+                'automation_ready':accepted and gmail['authorized'],
+                'automation_reason':'已通过单账号验证；批量队列可继续处理已保存邮箱的账号。' if accepted else '请先完成收码授权并通过一个账号的真实登录与云端验证。',
+                'last_live_gate':'网站要求人机验证时，该账号暂停并交给人工；不会自动绕过。',
+                'last_summary':self.setting('last_refresh_summary',{}),
+                'last_result':self.setting('last_refresh_result',{})}
 
     def save_email(self,key,value):
         key,email=account_key(key),email_address(value)
@@ -252,6 +282,26 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
         if email_address(provider.profile_check(token))!=provider.mailbox:raise RefreshError('wrong_mailbox')
         return {'ok':True,'message':'收码邮箱授权及在线身份检查通过。此检查未发出验证码。'}
 
+    def maintain(self,key=None,batch=False,output=emit):
+        from login_refresh_runner import RefreshRunner
+        runner=RefreshRunner(self)
+        return runner.one(key,batch=batch,output=output)
+
+    def set_monthly(self,enabled):
+        from login_refresh_runner import RefreshRunner
+        from login_refresh_schedule import LocalSchedule
+        if type(enabled) is not bool:raise RefreshError('invalid_request')
+        if enabled:
+            if not RefreshRunner(self).accepted():raise RefreshError('live_acceptance_required')
+            self.check_mailbox()
+            if not self.mail_probe():raise RefreshError('mail_background_start_unavailable')
+            LocalSchedule().enable()
+            self.put_setting('monthly_enabled',True)
+            return {'ok':True,'message':'每月串行维护已启用；Mail 或网络不可用时暂停，不会批量消耗重试次数。'}
+        self.put_setting('monthly_enabled',False)
+        LocalSchedule().disable()
+        return {'ok':True,'message':'每月自动维护已停用；已保存邮箱、登录资料和 GitHub 签到不受影响。'}
+
     def dispatch(self,request):
         action=request.get('action')
         if action=='snapshot':return self.snapshot()
@@ -260,16 +310,26 @@ CREATE TABLE IF NOT EXISTS ui_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)
         if action=='import_client':return self.import_client(request.get('config'))
         if action=='authorize_mailbox':return self.consent()
         if action=='check_mailbox':return self.check_mailbox()
-        if action in {'refresh_all','enable_monthly'}:raise RefreshError('live_acceptance_required')
+        if action=='refresh_one':return self.maintain(request.get('key',''))
+        if action=='refresh_all':return self.maintain(batch=True)
+        if action=='enable_monthly':return self.set_monthly(True)
+        if action=='disable_monthly':return self.set_monthly(False)
+        if action=='scheduled_tick':
+            if self.setting('monthly_enabled',False) is not True:return {'ok':True,'event':'schedule_disabled'}
+            return self.maintain(batch=True)
         raise RefreshError('invalid_request')
 
 
 def main():
     service=None
     try:
-        line=sys.stdin.buffer.readline(MAX_JSON+1)
-        if len(line)>MAX_JSON:raise RefreshError('invalid_request')
-        request=json.loads(line)
+        if sys.argv[1:]==['--tick']:
+            request={'action':'scheduled_tick'}
+        elif len(sys.argv)==1:
+            line=sys.stdin.buffer.readline(MAX_JSON+1)
+            if len(line)>MAX_JSON:raise RefreshError('invalid_request')
+            request=json.loads(line)
+        else:raise RefreshError('invalid_request')
         if not isinstance(request,dict):raise RefreshError('invalid_request')
         # Bundled layout: Resources/LoginRefresh/*.py; MacOS/RefreshSecretStore.
         root=Path(__file__).resolve().parent
