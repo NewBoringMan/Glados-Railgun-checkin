@@ -1,0 +1,45 @@
+name: Mail-only integration checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'login_refresh_*.py'
+      - 'app_integration/**'
+      - 'tests/test_login_refresh*.py'
+      - '.github/workflows/mail-integration-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  mac-native:
+    runs-on: macos-14
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: Offline regression
+        run: python -B -m unittest discover -s tests -q
+      - name: Compile Mail integration when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f tools/test_local_mail_native.py ]; then
+            python -B tools/test_local_mail_native.py
+          fi
+      - name: Export exact public candidate source for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mail-review"
+          git archive --format=tar HEAD -o "$RUNNER_TEMP/mail-review/candidate-source.tar"
+          git rev-parse HEAD > "$RUNNER_TEMP/mail-review/commit.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mail-integration-review
+          path: ${{ runner.temp }}/mail-review/
+          retention-days: 1

@@ -235,6 +235,9 @@ final class PolicyEditorModel: ObservableObject {
                         }
                     }
                 }
+                // A failed live status refresh must not erase the account's name.
+                // Reuse the private durable directory shared with Login Maintenance.
+                emailsByKey.merge(AccountEmailDirectory.load()) { _, durable in durable }
                 return (accounts, catalog, policies, policySHA, emailsByKey)
             }.value
 

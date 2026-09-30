@@ -1,0 +1,311 @@
+import Foundation
+import SwiftUI
+import AppKit
+import UserNotifications
+
+private struct RefreshAccount: Decodable, Identifiable {
+    let key: String
+    let label: String
+    let email: String
+    let identity_kind: String
+    let enabled: Bool
+    let auto_exchange: Bool
+    let policy: String
+    let points: Double?
+    let last_status_ok: Bool
+    let maintenance_phase: String?
+    let maintenance_attempts: Int?
+    let maintenance_message: String?
+    var id: String { key }
+    var title: String { email.isEmpty ? label : email }
+    var policyTitle: String {
+        switch policy {
+        case "plan100": return "100 积分 → 10 天"
+        case "plan200": return "200 积分 → 30 天"
+        case "plan500": return "500 积分 → 100 天"
+        default: return "智能最优"
+        }
+    }
+}
+private struct MailAuthorization: Decodable {
+    let ready: Bool
+    let permission: String
+    let reason: String
+}
+private struct RefreshNotificationStatus: Decodable {
+    let authorization: String
+    let pending: Int
+}
+private struct RefreshSnapshot: Decodable {
+    let accounts: [RefreshAccount]
+    let repository_source: String
+    let mail_running: Bool
+    let mail_reason: String
+    let mailbox: String
+    let mail_access: MailAuthorization
+    let confirmed_count: Int
+    let schedule_enabled: Bool
+    let automation_ready: Bool
+    let automation_reason: String
+    let last_live_gate: String
+    let notifications: RefreshNotificationStatus?
+}
+
+@MainActor
+private final class RefreshModel: ObservableObject {
+    @Published var snapshot: RefreshSnapshot?
+    @Published var busy = false
+    @Published var message = ""
+    @Published var error = false
+    @Published var mailbox = ""
+    @Published var filter = ""
+    @Published var selectedTab = 0
+    @Published var editingAccount: RefreshAccount?
+    private var process: Process?
+    private var generation = UUID()
+    var accounts: [RefreshAccount] {
+        guard let all = snapshot?.accounts else { return [] }
+        let q = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        return q.isEmpty ? all : all.filter { $0.title.localizedCaseInsensitiveContains(q) || $0.key.localizedCaseInsensitiveContains(q) || $0.label.localizedCaseInsensitiveContains(q) }
+    }
+    func cancel() {
+        generation = UUID(); process?.terminate(); process = nil; busy = false
+        message = "操作已取消。不会删除已保存邮箱或授权。"
+    }
+    func load() { run(["action":"snapshot"]) }
+    func run(_ request: [String:Any], reloadAfter: Bool = false) {
+        guard !busy else { return }
+        guard let resource = Bundle.main.resourceURL?.appendingPathComponent("LoginRefresh/login_refresh_app.py"), FileManager.default.fileExists(atPath:resource.path) else {
+            error = true; message = "应用内登录维护模块缺失，请检查安装完整性。"; return
+        }
+        let python = Bundle.main.object(forInfoDictionaryKey:"GLaDOSRefreshPython") as? String ?? "/opt/homebrew/bin/python3"
+        guard FileManager.default.isExecutableFile(atPath:python), let inputData = try? JSONSerialization.data(withJSONObject:request) else {
+            error = true; message = "现有 Python 运行环境不可用，未自动安装其他软件。"; return
+        }
+        let child = Process(); let output = Pipe(), input = Pipe()
+        child.executableURL = URL(fileURLWithPath:python); child.arguments = ["-I","-B",resource.path]
+        child.standardOutput = output; child.standardError = FileHandle.nullDevice; child.standardInput = input
+        child.environment = ["PATH":"/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin","HOME":NSHomeDirectory(),"PYTHONDONTWRITEBYTECODE":"1","LANG":"en_US.UTF-8"]
+        let token = UUID(); generation = token; process = child; busy = true; error = false
+        message = request["action"] as? String == "snapshot" ? "读取账号与已保存邮箱…" : "正在处理…"
+        DispatchQueue.global(qos:.userInitiated).async { [weak self] in
+            do {
+                try child.run(); input.fileHandleForWriting.write(inputData + Data([10])); try? input.fileHandleForWriting.close()
+                var pending = Data(); var received = false
+                while true {
+                    let part = output.fileHandleForReading.availableData
+                    if part.isEmpty { break }
+                    pending.append(part)
+                    guard pending.count <= 2 * 1024 * 1024 else { child.terminate(); break }
+                    while let index = pending.firstIndex(of:10) {
+                        let line = pending.prefix(upTo:index); pending.removeSubrange(...index)
+                        if let value = try? JSONSerialization.jsonObject(with:line) as? [String:Any] {
+                            received = true
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.generation == token else { return }; self.consume(value)
+                            }
+                        }
+                    }
+                }
+                child.waitUntilExit()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == token else { return }
+                    self.process = nil; self.busy = false
+                    if !received { self.error = true; self.message = "模块未返回有效结果；账号和兑换设置未被改动。" }
+                    if reloadAfter && !self.error { self.load() }
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == token else { return }
+                    self.process = nil; self.busy = false; self.error = true; self.message = "无法启动应用内部维护模块，请检查运行环境。"
+                }
+            }
+        }
+        let timeout: Double = ["refresh_one","refresh_all"].contains(request["action"] as? String ?? "") ? 900 : 380
+        DispatchQueue.main.asyncAfter(deadline:.now()+timeout) { [weak self, weak child] in
+            guard let self, self.generation == token, child?.isRunning == true else { return }
+            self.cancel(); self.error = true; self.message = "本次操作超时，已停止等待。"
+        }
+    }
+    private func consume(_ value:[String:Any]) {
+        error = (value["ok"] as? Bool) != true
+        if value["event"] as? String == "snapshot", let data = try? JSONSerialization.data(withJSONObject:value), let decoded = try? JSONDecoder().decode(RefreshSnapshot.self,from:data) {
+            snapshot = decoded; mailbox = decoded.mailbox
+            let pending = decoded.accounts.filter { $0.identity_kind == "pending" }.count
+            message = "\(decoded.accounts.count) 个账号 · 已确认邮箱 \(decoded.confirmed_count) 个 · 待登录核实 \(pending) 个。邮箱只保存在本机。"
+            if decoded.repository_source != "github" { message += " 当前显示上次保存的账号列表。" }
+        } else if let text = value["message"] as? String { message = text }
+    }
+    func authorizeNotifications() {
+        guard !busy else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options:[.alert]) { [weak self] granted, failure in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.error = !granted || failure != nil
+                self.message = granted ? "系统通知权限已开启，可发送测试通知。" : "系统通知未获允许；任务失败记录仍保留在本机。"
+                self.load()
+            }
+        }
+    }
+}
+private final class EmailFieldModel: ObservableObject {
+    @Published var value:String
+    init(_ value:String) { self.value = value }
+}
+private struct EmailEditView: View {
+    let account: RefreshAccount
+    let save: (String)->Void
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var field: EmailFieldModel
+    init(account:RefreshAccount,save:@escaping (String)->Void) {
+        self.account = account; self.save = save; _field = StateObject(wrappedValue:EmailFieldModel(account.email))
+    }
+    var body: some View {
+        VStack(alignment:.leading,spacing:14) {
+            Text("保存账号邮箱").font(.title2.bold())
+            Text(account.label).font(.headline)
+            Text(account.key).font(.caption.monospaced()).foregroundStyle(.secondary)
+            TextField("完整邮箱地址",text:$field.value).textFieldStyle(.roundedBorder).disabled(account.identity_kind == "confirmed")
+            Text("仅保存到这台 Mac。新填写的邮箱标记为待登录核实；在验证真实账号身份前，不会据此覆盖 Cookie 或 Secret。")
+                .foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            HStack { Spacer(); Button("取消") { dismiss() }; Button("保存") { save(field.value); dismiss() }.keyboardShortcut(.defaultAction) }
+        }.padding(22).frame(width:460)
+    }
+}
+private struct RefreshCenterView: View {
+    @StateObject private var model = RefreshModel()
+    var body: some View {
+        VStack(alignment:.leading,spacing:14) {
+            HStack(alignment:.top) {
+                VStack(alignment:.leading,spacing:4) {
+                    Text("登录维护").font(.title2.bold())
+                    Text("邮箱长期保存 · 本机 Mail 收码 · 登录依赖检查").foregroundStyle(.secondary)
+                }
+                Spacer(); Button("刷新") { model.load() }.disabled(model.busy)
+            }
+            Picker("页面",selection:$model.selectedTab) { Text("账号邮箱").tag(0); Text("收码设置").tag(1); Text("运行状态").tag(2) }.pickerStyle(.segmented)
+            Divider()
+            if model.selectedTab == 0 { accountPage } else if model.selectedTab == 1 { settingsPage } else { statusPage }
+            Spacer(minLength:0); Divider()
+            HStack(spacing:10) {
+                if model.busy { ProgressView().controlSize(.small) }
+                Text(model.message).font(.callout).foregroundStyle(model.error ? Color.red : Color.secondary).lineLimit(3).frame(maxWidth:.infinity,alignment:.leading)
+                if model.busy { Button("取消等待") { model.cancel() } }
+                Button("关闭") { NSApp.keyWindow?.performClose(nil) }
+            }
+        }.padding(20).frame(minWidth:800,idealWidth:900,minHeight:580,idealHeight:660)
+        .task { model.load() }
+        .sheet(item:$model.editingAccount) { account in
+            EmailEditView(account:account) { value in model.run(["action":"save_email","key":account.key,"email":value],reloadAfter:true) }
+        }
+    }
+    private var accountPage: some View {
+        VStack(alignment:.leading,spacing:10) {
+            TextField("按邮箱、备注或账号代号查找",text:$model.filter).textFieldStyle(.roundedBorder)
+            ScrollView {
+                LazyVStack(spacing:7) {
+                    ForEach(model.accounts) { account in
+                        HStack(spacing:12) {
+                            VStack(alignment:.leading,spacing:3) {
+                                Text(account.title).font(.body.weight(.medium)).textSelection(.enabled)
+                                Text("\(account.label) · \(account.key)").font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                                if account.identity_kind == "missing" { Text("尚未保存邮箱").font(.caption).foregroundStyle(.orange) }
+                                else if account.identity_kind == "pending" { Text("邮箱已保存 · 待登录核实").font(.caption).foregroundStyle(.secondary) }
+                                else { Text("邮箱已确认 · 登录失效也不会清空").font(.caption).foregroundStyle(.secondary) }
+                                if let maintenance = account.maintenance_message, !maintenance.isEmpty { Text(maintenance).font(.caption).foregroundStyle(.orange).fixedSize(horizontal:false,vertical:true) }
+                                if let attempts = account.maintenance_attempts, attempts > 0 { Text("本轮尝试 \(attempts)/3 次").font(.caption).foregroundStyle(.secondary) }
+                            }.frame(maxWidth:.infinity,alignment:.leading)
+                            VStack(alignment:.trailing,spacing:4) {
+                                Text(account.policyTitle).font(.callout)
+                                Text(account.auto_exchange ? "自动兑换开" : "自动兑换关").font(.caption).foregroundStyle(.secondary)
+                            }
+                            VStack(spacing:6) {
+                                Button(account.email.isEmpty ? "填写邮箱" : "查看邮箱") { model.editingAccount = account }.disabled(model.busy)
+                                Button("登录并验证") { model.run(["action":"refresh_one","key":account.key],reloadAfter:true) }
+                                    .disabled(model.busy || account.email.isEmpty || model.snapshot?.mail_access.ready != true || model.snapshot?.mail_running != true)
+                                    .help("从本机 Mail 获取此账号的新验证码；核对真实身份后更新原 Secret，并执行云端只读验证。")
+                            }
+                        }.padding(12).background(.quaternary.opacity(0.35),in:RoundedRectangle(cornerRadius:9))
+                    }
+                }
+            }
+        }
+    }
+    private var settingsPage: some View {
+        VStack(alignment:.leading,spacing:18) {
+            GroupBox("使用这台 Mac 自带的邮件 App") {
+                VStack(alignment:.leading,spacing:12) {
+                    Text("直接复用邮件 App 已登录的账号及现有转发规则。不需要 Google Cloud、OAuth 客户端、JSON 文件或邮箱密码。")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    HStack {
+                        TextField("在 Mail 中接收转发验证码的邮箱地址",text:$model.mailbox).textFieldStyle(.roundedBorder)
+                        Button("保存邮箱") { model.run(["action":"configure_mailbox","mailbox":model.mailbox],reloadAfter:true) }.disabled(model.busy)
+                    }
+                    HStack {
+                        Button("连接本机 Mail") { model.run(["action":"authorize_mailbox"],reloadAfter:true) }
+                            .disabled(model.busy || model.mailbox.isEmpty || model.snapshot?.mail_running != true)
+                        Button("检查收信") { model.run(["action":"check_mailbox"]) }.disabled(model.busy || model.snapshot?.mail_access.ready != true)
+                    }
+                    Text(model.snapshot?.mail_access.ready == true ? "已定位本机接收邮箱，可以进行单账号登录验证。" : "首次连接时，macOS 可能请求允许 Account Center 访问邮件。未获允许前不会读取邮件或发码。")
+                        .font(.callout).fixedSize(horizontal:false,vertical:true)
+                }.padding(8)
+            }
+            GroupBox("只处理当前账号的新验证码") {
+                Text("只读取所选邮箱收件箱内的 GLaDOS 验证邮件。按照原始收件人、发码时间和邮件编号匹配；旧验证码、重复转发和错误账号邮件不会用于登录。检查收信不会触发签到或兑换。")
+                    .font(.callout).foregroundStyle(.secondary).padding(8)
+            }
+            Text("本机接口不读取 Mail 的密码或私有数据库，不导出整个邮箱、不更改规则、不标记邮件已读，也不会切换 Mail 到前台。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+    private var statusPage: some View {
+        VStack(alignment:.leading,spacing:18) {
+            statusLine("Mail",model.snapshot?.mail_running == true ? "正在运行" : "未运行或无法确认")
+            Text("Mail 打开不等于全部邮箱已联网。关闭、休眠或转发延迟时，发码流程必须暂停；过期验证码不会重新使用。")
+                .font(.callout).foregroundStyle(.secondary)
+            statusLine("收码邮箱",model.snapshot?.mail_access.ready == true ? "本机 Mail 已连接" : "需要连接本机 Mail")
+            statusLine("GitHub 账号目录",model.snapshot?.repository_source == "github" ? "刚从 GitHub 读取" : "上次保存的目录")
+            statusLine("系统通知",["authorized","provisional"].contains(model.snapshot?.notifications?.authorization ?? "") ? "已授权" : "需要授权或组件不可用")
+            HStack {
+                Button("开启通知权限") { model.authorizeNotifications() }.disabled(model.busy)
+                Button("发送测试通知") { model.run(["action":"test_notification"]) }
+                    .disabled(model.busy || !["authorized","provisional"].contains(model.snapshot?.notifications?.authorization ?? ""))
+                Text("待投递提醒 \(model.snapshot?.notifications?.pending ?? 0) 条").font(.caption).foregroundStyle(.secondary)
+            }
+            Divider()
+            Text(model.snapshot?.schedule_enabled == true ? "每月串行维护已启用" : "每月串行维护未启用").font(.headline)
+            Text(model.snapshot?.automation_reason ?? "需要先完成单账号真实登录与云端验证。").foregroundStyle(.secondary)
+            Text(model.snapshot?.last_live_gate ?? "网站要求人机验证时，只能由你在正常页面完成。").font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Button("继续本轮待办") { model.run(["action":"refresh_all"],reloadAfter:true) }.disabled(model.busy || model.snapshot?.automation_ready != true)
+                if model.snapshot?.schedule_enabled == true {
+                    Button("停用每月维护") { model.run(["action":"disable_monthly"],reloadAfter:true) }.disabled(model.busy)
+                } else {
+                    Button("启用每月维护") { model.run(["action":"enable_monthly"],reloadAfter:true) }.disabled(model.busy || model.snapshot?.automation_ready != true)
+                }
+                Button("打开官方登录页") { NSWorkspace.shared.open(URL(string:"https://glados.cloud/login")!) }
+            }
+            Text("每次仅处理一个账号；后台定期续接队列，同一月份已完成的账号不重复登录。失败分轮冷却，最多三次；人机验证立即暂停。Mail 关闭时暂停，当前版本不会强行重开窗口。")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            Text("现有 GitHub 自动签到和每账号兑换方案保持原样。本窗口不会为了测试触发兑换。").font(.callout)
+            Spacer()
+        }
+    }
+    private func statusLine(_ name:String,_ value:String)->some View {
+        HStack { Text(name).fontWeight(.medium); Spacer(); Text(value).foregroundStyle(.secondary) }
+    }
+}
+@MainActor private var refreshController: NSWindowController?
+@_cdecl("GLaDOSShowRefreshCenter")
+public func GLaDOSShowRefreshCenter() {
+    DispatchQueue.main.async {
+        if let controller = refreshController { controller.showWindow(nil); controller.window?.makeKeyAndOrderFront(nil); return }
+        let view = NSHostingController(rootView:RefreshCenterView())
+        let window = NSWindow(contentViewController:view)
+        window.title = "GLaDOS 登录维护"; window.styleMask = [.titled,.closable,.miniaturizable,.resizable]
+        window.setContentSize(NSSize(width:900,height:660)); window.isReleasedWhenClosed = false; window.center()
+        let controller = NSWindowController(window:window); refreshController = controller; controller.showWindow(nil)
+        // Only invoked by an explicit user button/menu action, never by the worker.
+        window.makeKeyAndOrderFront(nil)
+    }
+}
