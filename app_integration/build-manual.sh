@@ -112,6 +112,8 @@ for name in ('Contents/Info.plist', 'Contents/MacOS/GLaDOSAccountCenter',
              'Contents/MacOS/GLaDOSAccountCenter.real',
              'Contents/Frameworks/GLaDOSPolicyEditor.dylib',
              'Contents/Frameworks/PolicyMenuPlugin.dylib',
+             'Contents/Frameworks/GLaDOSNotifications.dylib',
+             'Contents/Resources/checkin_watch.py',
              'Contents/Resources/AppIcon.icns', 'Contents/Resources/manual-build-origin.json',
              'Contents/_CodeSignature/CodeResources', 'Contents/MacOS/RefreshSecretStore'):
     writable_path(name)
@@ -120,18 +122,20 @@ for resource in Path(sys.argv[3]).glob('*.js'):
 
 # Only the rebuilt nested code will be signed below. Retain the helper's bytes
 # and designated requirement so existing Keychain ACL references stay intact.
-helper=app/'Contents/MacOS/RefreshSecretStore'
-retained=None
-if helper.exists():
+retained={}
+for name in ('Contents/MacOS/RefreshSecretStore', 'Contents/Frameworks/GLaDOSNotifications.dylib'):
+    helper=app/name
+    if not helper.exists():
+        continue
     subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(helper)], check=True)
     result=subprocess.run(['/usr/bin/codesign', '-d', '-r-', str(helper)],
                           check=True, capture_output=True, text=True)
     requirement=[line for line in (result.stdout+'\n'+result.stderr).splitlines()
                  if line.startswith('designated =>')]
     if len(requirement) != 1:
-        raise SystemExit('Could not record the retained Keychain helper signature.')
-    retained={'sha256':hashlib.sha256(helper.read_bytes()).hexdigest(),
-              'designatedRequirement':requirement[0]}
+        raise SystemExit('Could not record a retained helper signature.')
+    retained[name]={'sha256':hashlib.sha256(helper.read_bytes()).hexdigest(),
+                    'designatedRequirement':requirement[0]}
 Path(sys.argv[5]).write_text(json.dumps(retained)+'\n', encoding='utf-8')
 
 for name in ('Contents/MacOS', 'Contents/Frameworks', 'Contents/Resources', 'Contents/PlugIns'):
@@ -139,6 +143,8 @@ for name in ('Contents/MacOS', 'Contents/Frameworks', 'Contents/Resources', 'Con
 for name in (
     'Contents/Resources/LoginRefresh',
     'Contents/Frameworks/GLaDOSRefreshCenter.dylib',
+    'Contents/Frameworks/GLaDOSLocalMail.dylib',
+    'Contents/Resources/edge_login_support.js',
     'Contents/MacOS/RefreshNotifications',
     'Contents/MacOS/LocalMailReader',
     'Contents/Applications/GLaDOS Safari Bridge.app',
@@ -162,6 +168,17 @@ PY
 
 cp "$PROJECT_DIR/macos/Resources/"*.js "$RESOURCES/"
 cp "$PROJECT_DIR/macos/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+cp "$SCRIPT_DIR/checkin_watch.py" "$RESOURCES/checkin_watch.py"
+
+# The installed notification library is retained byte-for-byte. A source-only
+# CI build compiles the recovered notification ABI for packaging validation.
+if [[ ! -e "$FRAMEWORKS/GLaDOSNotifications.dylib" ]]; then
+  xcrun swiftc -swift-version 5 -O -parse-as-library -emit-library \
+    -D REFRESH_NOTIFICATION_LIBRARY -module-name GLaDOSNotifications \
+    -target "$GLADOS_ARCH-apple-macos13.0" -framework Foundation -framework UserNotifications \
+    -o "$FRAMEWORKS/GLaDOSNotifications.dylib" "$SCRIPT_DIR/RefreshNotifications.swift"
+  /usr/bin/codesign --force --sign - "$FRAMEWORKS/GLaDOSNotifications.dylib"
+fi
 
 xcrun swiftc -swift-version 5 -O -parse-as-library \
   -target "$GLADOS_ARCH-apple-macos13.0" \
@@ -216,7 +233,7 @@ PY
 # Do not recursively re-sign preserved helpers or other unchanged nested code.
 /usr/bin/codesign --force --sign - "$STAGE_APP"
 /usr/bin/codesign --verify --deep --strict "$STAGE_APP"
-python3 - "$MACOS/RefreshSecretStore" "$BUILD_TMP/retained-helper.json" "$EMBEDDED_SAFARI" <<'PY'
+python3 - "$STAGE_APP" "$BUILD_TMP/retained-helper.json" "$EMBEDDED_SAFARI" <<'PY'
 import hashlib, json, plistlib, subprocess, sys
 from pathlib import Path
 # Apple TN3125: request XML instead of the default human-readable DER dump.
@@ -227,16 +244,16 @@ if any(entitlements.get(key) is not True for key in (
         'com.apple.security.app-sandbox', 'com.apple.security.network.client')):
     raise SystemExit('The Safari extension is missing its sandbox or loopback client capability.')
 expected=json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
-if expected is not None:
-    helper=Path(sys.argv[1])
+for name, signature in expected.items():
+    helper=Path(sys.argv[1])/name
     result=subprocess.run(['/usr/bin/codesign', '-d', '-r-', str(helper)],
                           check=True, capture_output=True, text=True)
     requirement=[line for line in (result.stdout+'\n'+result.stderr).splitlines()
                  if line.startswith('designated =>')]
     actual={'sha256':hashlib.sha256(helper.read_bytes()).hexdigest(),
             'designatedRequirement':requirement[0] if len(requirement) == 1 else None}
-    if actual != expected:
-        raise SystemExit('The retained Keychain helper changed during the build.')
+    if actual != signature:
+        raise SystemExit('A retained helper changed during the build: '+name)
 PY
 python3 "$PROJECT_DIR/macos/Tests/validate_package.py" --app "$STAGE_APP" --bundle-only
 

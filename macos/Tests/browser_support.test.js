@@ -35,6 +35,7 @@ test('Firefox capabilities preserve the selected binary', () => {
   const firefox = buildBrowserCatalog('/Users/test').find((item) => item.id === 'firefox');
   const caps = webdriverCapabilities(firefox, '/Applications/Firefox.app/Contents/MacOS/firefox');
   assert.equal(caps.capabilities.alwaysMatch.browserName, 'firefox');
+  assert.equal(caps.capabilities.alwaysMatch.webSocketUrl, true);
   assert.equal(caps.capabilities.alwaysMatch['moz:firefoxOptions'].binary, '/Applications/Firefox.app/Contents/MacOS/firefox');
 });
 

@@ -52,9 +52,9 @@ class InstallerFixture(unittest.TestCase):
         self.app = self.root / "physical" / "GLaDOS Account Center.app"
         self.candidate = self.root / "build" / "Candidate.app"
         self.backups = self.root / "backups"
-        self.make_app(self.app, "20016", b"original executable")
+        self.make_app(self.app, "20042", b"original executable")
         self.expected = installer.fingerprint(self.app)
-        self.make_app(self.candidate, "20017", b"new executable")
+        self.make_app(self.candidate, "20043", b"new executable")
         self.origin_path = self.candidate / "Contents/Resources/manual-build-origin.json"
         self.origin_path.write_text(json.dumps({
             "schema": "glados.manual-build-origin", "version": 1,
@@ -66,6 +66,9 @@ class InstallerFixture(unittest.TestCase):
         self.table = {}
         self.commands = []
         self.launch_results = []
+        self.watch_loaded = False
+        self.watch_pid = None
+        self.on_watch_bootstrap = lambda: None
         self.on_staged_copy = lambda: None
         self.on_verify = lambda path: None
         self.on_bootout = lambda: None
@@ -90,11 +93,14 @@ class InstallerFixture(unittest.TestCase):
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
             "CFBundleIdentifier": installer.APP_ID,
             "CFBundleVersion": build,
-            "CFBundleShortVersionString": "synthetic",
+            "CFBundleShortVersionString": "2.0.11" if build == "20043" else "2.0.10",
             "CFBundleExecutable": "GLaDOSAccountCenter",
         }))
         (app / "Contents/MacOS/GLaDOSAccountCenter").write_bytes(executable)
         (app / "Contents/Resources/kept.txt").write_text("unrelated original resource")
+        (app / "Contents/Frameworks").mkdir()
+        (app / "Contents/Frameworks/GLaDOSNotifications.dylib").write_bytes(b"retained notification library")
+        (app / "Contents/Resources/checkin_watch.py").write_text("# synthetic offline helper")
 
     def fake_run(self, *args, **kwargs):
         self.commands.append(args)
@@ -107,14 +113,28 @@ class InstallerFixture(unittest.TestCase):
             self.on_verify(Path(args[-1]))
             return completed(args)
         if args[:2] == ("/bin/launchctl", "print"):
+            if args[2] == installer.job_target(installer.WATCH_JOB):
+                if not self.watch_loaded:
+                    return missing_job()
+                pid_line = f"\tpid = {self.watch_pid}\n" if self.watch_pid else ""
+                return completed(stdout=args[2] + " = {\n\tstate = waiting\n" + pid_line + "}\n")
             self.assertEqual(args[2], installer.job_target())
             return self.launch_results.pop(0) if self.launch_results else missing_job()
         if args[:2] == ("/bin/launchctl", "bootout"):
+            if args[2] == installer.job_target(installer.WATCH_JOB):
+                self.watch_loaded = False
+                return completed(args)
             self.assertEqual(args[2], installer.job_target())
             self.on_bootout()
             return completed(args)
         if args[:2] == ("/bin/launchctl", "disable"):
             self.assertEqual(args[2], installer.job_target())
+            return completed(args)
+        if args[:2] == ("/bin/launchctl", "bootstrap"):
+            self.assertEqual(args[2], f"gui/{os.getuid()}")
+            self.assertEqual(Path(args[3]).name, installer.WATCH_JOB + ".plist")
+            self.watch_loaded = True
+            self.on_watch_bootstrap()
             return completed(args)
         raise AssertionError(f"Unexpected simulated command: {args}")
 
@@ -140,6 +160,97 @@ class InstallerFixture(unittest.TestCase):
         }))
 
 
+class IndependentWatchDeploymentTests(InstallerFixture):
+    @property
+    def watch_plist(self):
+        return self.launch_plist.with_name(installer.WATCH_JOB + ".plist")
+
+    def existing_watch(self):
+        content = plistlib.dumps({
+            "Label": installer.WATCH_JOB,
+            "ProgramArguments": [str(self.app / "Contents/MacOS/GLaDOSAccountCenter"), "--checkin-watch", "poll"],
+            "StartInterval": 900, "RunAtLoad": True, "OriginalSetting": "retained on rollback",
+        })
+        self.watch_plist.write_bytes(content)
+        self.watch_loaded = True
+        return content
+
+    def test_success_deploys_readonly_watch_without_app_support_or_auto_enable(self):
+        result = self.install()
+        value = installer.plist(self.watch_plist)
+        self.assertEqual(value["ProgramArguments"][1:], ["--checkin-watch", "poll"])
+        self.assertEqual(value["StartInterval"], 900)
+        self.assertIs(value["RunAtLoad"], True)
+        self.assertTrue(self.watch_loaded)
+        self.assertFalse((self.user_home / "Library/Application Support").exists())
+        self.assertFalse(any(command[:2] == ("/bin/launchctl", "enable") for command in self.commands))
+        record = json.loads(Path(result["checkin_watch"]["deployment_record"]).read_text())
+        self.assertEqual(record["state"], "deployed")
+
+    def test_bootstrap_failure_rolls_back_app_and_removes_new_job_plist(self):
+        self.on_watch_bootstrap = lambda: (_ for _ in ()).throw(subprocess.CalledProcessError(5, "synthetic bootstrap"))
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.install()
+        self.assert_original()
+        self.assertFalse(self.watch_plist.exists())
+        self.assertFalse(self.watch_loaded)
+        self.assertEqual(self.staging_dirs(), [])
+
+    def test_interrupt_after_watch_bootstrap_restores_app_and_watch(self):
+        original = self.existing_watch()
+        calls = 0
+        def interrupt_first():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise KeyboardInterrupt()
+        self.on_watch_bootstrap = interrupt_first
+        with self.assertRaises(KeyboardInterrupt):
+            self.install()
+        self.assert_original()
+        self.assertEqual(self.watch_plist.read_bytes(), original)
+        self.assertTrue(self.watch_loaded)
+        self.assertEqual(calls, 2)
+        self.assertFalse(any(command[:3] == ("/bin/launchctl", "bootstrap", installer.job_target()) for command in self.commands))
+
+    def test_unknown_existing_watch_is_not_overwritten_or_stopped(self):
+        self.watch_plist.write_bytes(plistlib.dumps({"Label": installer.WATCH_JOB, "ProgramArguments": ["/foreign/program"]}))
+        with self.assertRaisesRegex(ValueError, "Unexpected existing"):
+            self.install()
+        self.assert_original()
+        self.assertFalse(any(command[1] == "bootout" for command in self.commands if command[0] == "/bin/launchctl"))
+
+    def test_dangling_watch_plist_blocks_installation(self):
+        self.watch_plist.symlink_to(self.user_home / "missing")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.install()
+        self.assert_original()
+
+    def test_changed_retained_notification_library_rejects_candidate(self):
+        (self.candidate / "Contents/Frameworks/GLaDOSNotifications.dylib").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "retained helper"):
+            self.install()
+        self.assert_original()
+
+    def test_old_candidate_version_rejected_before_launchd(self):
+        info_path = self.candidate / "Contents/Info.plist"
+        value = installer.plist(info_path)
+        value["CFBundleVersion"] = "20017"
+        info_path.write_bytes(plistlib.dumps(value))
+        with self.assertRaisesRegex(ValueError, "verified manual-login build"):
+            self.install()
+        self.assertEqual(self.commands, [])
+
+    def test_watch_restore_failure_keeps_displaced_app_and_verified_backup(self):
+        self.existing_watch()
+        self.on_watch_bootstrap = lambda: (_ for _ in ()).throw(subprocess.CalledProcessError(5, "synthetic bootstrap"))
+        with self.assertRaisesRegex(RuntimeError, "restoration needs attention"):
+            self.install()
+        self.assert_original()
+        self.assertEqual(len(self.staging_dirs()), 1)
+        self.assertEqual(len(list(self.backups.glob("manual-rollback-*/GLaDOS Account Center.app"))), 1)
+
+
 class ReplacementTests(InstallerFixture):
     def test_success_keeps_logical_app_symlink_and_verified_rollback(self):
         alias = self.root / "Applications" / self.app.name
@@ -149,7 +260,7 @@ class ReplacementTests(InstallerFixture):
         result = self.install()
         self.assertTrue(alias.is_symlink())
         self.assertEqual(alias.resolve(), self.app)
-        self.assertEqual(installer.plist(self.app / "Contents/Info.plist")["CFBundleVersion"], "20017")
+        self.assertEqual(installer.plist(self.app / "Contents/Info.plist")["CFBundleVersion"], "20043")
         self.assertEqual(installer.fingerprint(Path(result["rollback_app"])), self.expected)
         self.assertEqual(self.staging_dirs(), [])
 

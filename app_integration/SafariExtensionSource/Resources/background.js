@@ -5,6 +5,8 @@ const ALLOWED_HOSTS = ['glados.cloud', 'railgun.info'];
 const PENDING_KEY = 'gladosAssistantManualPendingV1';
 const NATIVE_APP_ID = 'com.enoch.glados-account-center.safari-bridge';
 const PENDING_TTL_MS = 30 * 60 * 1000;
+// Keep in sync with core.js MANUAL_SESSION_PATHS: manual-session v1 has one header.
+const MANUAL_SESSION_PATHS = ['/api/user/status', '/api/user/session', '/api/user/points', '/api/user/checkin', '/api/user/exchange'];
 
 function allowedHost(host) {
   const value = String(host || '').toLowerCase();
@@ -92,11 +94,26 @@ async function captureCurrentAccount() {
   let cookies;
   try {
     const before = await readContext();
-    const allCookies = await api.cookies.getAll({ url: `${pageUrl.origin}/api/user/status` });
+    const scopes = [];
+    for (const path of MANUAL_SESSION_PATHS) {
+      // Read the cookie store only. This does not request or navigate any endpoint.
+      const applicable = await api.cookies.getAll({ url: `${pageUrl.origin}${path}` });
+      scopes.push(applicable.filter((cookie) => !cookie.partitionKey && !cookie.partitioned));
+    }
     const after = await readContext();
     if (before.userAgent !== after.userAgent) return { ok: false, reason: 'context_changed' };
     context = after;
-    cookies = allCookies.filter((cookie) => !cookie.partitionKey && !cookie.partitioned).map((cookie) => ({
+    const canonical = (items) => JSON.stringify(items.map(({ name, value }) => [name, value]).sort((a, b) => a[0].localeCompare(b[0])));
+    if (scopes.some((items) => new Set(items.map((cookie) => cookie.name)).size !== items.length)) return { ok: false, reason: 'ambiguous_cookies' };
+    const expected = canonical(scopes[0]);
+    if (scopes.slice(1).some((items) => canonical(items) !== expected)) return { ok: false, reason: 'cookie_scope_mismatch' };
+    // A single header cannot preserve path-specific variants even when values happen to match.
+    const matchesPath = (cookie, requestPath) => {
+      const path = cookie.path || '/';
+      return requestPath === path || (requestPath.startsWith(path) && (path.endsWith('/') || requestPath[path.length] === '/'));
+    };
+    if (scopes[0].some((cookie) => MANUAL_SESSION_PATHS.some((path) => !matchesPath(cookie, path)))) return { ok: false, reason: 'cookie_scope_mismatch' };
+    cookies = scopes[0].map((cookie) => ({
       name: cookie.name, value: cookie.value, domain: cookie.domain, path: cookie.path,
       hostOnly: cookie.hostOnly, secure: cookie.secure, httpOnly: cookie.httpOnly,
       session: cookie.session, expirationDate: cookie.expirationDate,

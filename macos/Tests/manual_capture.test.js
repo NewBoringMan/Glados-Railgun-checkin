@@ -2,8 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { selectSessionCookies, composeCookieHeader, accountKeyFromSecretName, accountSecretNameFromUserId } = require('../Resources/core');
-const { assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, expectedCaptureIdentity, normalizeBrowserContext, verifyCookie } = require('../Resources/capture_account');
+const fs = require('node:fs');
+const path = require('node:path');
+const { MANUAL_SESSION_PATHS, selectSessionCookies, composeCookieHeader, accountKeyFromSecretName, accountSecretNameFromUserId } = require('../Resources/core');
+const { assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, expectedCaptureIdentity, normalizeBrowserContext, readCDPSessionCookies, verifyCookie } = require('../Resources/capture_account');
 
 function acquired() {
   const parts = selectSessionCookies([
@@ -130,6 +132,8 @@ test('existing account captures reuse the native account-specific browser profil
 });
 
 test('capture failures expose only fixed safe codes to the native app', () => {
+  assert.equal(captureFailureCode({ code: 'GLADOS_COOKIE_SCOPE_MISMATCH' }), 'cookie_scope_mismatch');
+  assert.equal(captureFailureCode({ code: 'GLADOS_COOKIE_SCOPE_UNAVAILABLE' }), 'cookie_scope_unavailable');
   assert.equal(captureFailureCode({ code: 'GLADOS_BROWSER_CONNECTION', message: 'synthetic-secret' }), 'browser_connection');
   assert.equal(captureFailureCode({ code: 'INCOMPLETE_API_IDENTITY' }), 'missing_identity');
   assert.equal(captureFailureCode(new Error('新旧会话的账号身份不一致，已停止保存。')), 'identity_mismatch');
@@ -137,4 +141,43 @@ test('capture failures expose only fixed safe codes to the native app', () => {
   assert.equal(captureFailureCode(new Error('状态接口拒绝会话认证，请手动重新登录并读取。')), 'verification_required');
   assert.equal(captureFailureCode(new Error('应用内嵌的 Safari 扩展组件缺失。')), 'safari_extension_unavailable');
   assert.equal(captureFailureCode(new Error('synthetic-secret / unexpected transport response')), 'invalid_capture');
+});
+
+test('capture path coverage matches only the Python status/checkin endpoints that reuse v1', () => {
+  const paths = new Set();
+  for (const name of ['checkin.py', 'status.py']) {
+    const source = fs.readFileSync(path.join(__dirname, '..', '..', name), 'utf8');
+    for (const match of source.matchAll(/["'](\/api\/user\/[a-z]+)["']/g)) paths.add(match[1]);
+  }
+  assert.deepEqual([...MANUAL_SESSION_PATHS].sort(), [...paths].sort());
+});
+
+test('CDP reads cookies for every pinned API URL without requesting those endpoints or exporting their union', async () => {
+  const base = acquired();
+  for (const scopedPath of [null, ...MANUAL_SESSION_PATHS]) {
+    const inventory = [...base.parts.cookies];
+    if (scopedPath) inventory.push({ name: 'endpoint_only', value: 'synthetic-extra', domain: 'glados.cloud', path: scopedPath });
+    let calls = 0;
+    const call = async (websocket, method, params) => {
+      calls += 1;
+      assert.equal(websocket, 'synthetic-page-socket');
+      assert.equal(method, 'Network.getCookies');
+      assert.deepEqual(params.urls, MANUAL_SESSION_PATHS.map((path) => `https://glados.cloud${path}`));
+      return { cookies: inventory };
+    };
+    const result = readCDPSessionCookies(base.pageUrl, 'synthetic-page-socket', call);
+    if (scopedPath) await assert.rejects(result, { code: 'GLADOS_COOKIE_SCOPE_MISMATCH' });
+    else assert.equal(composeCookieHeader(await result), base.cookieHeader);
+    assert.equal(calls, 1);
+  }
+});
+
+test('path-incompatible snapshots stop before identity requests or capture export', async () => {
+  const input = acquired();
+  input.parts.cookies.push({ name: 'status_only', value: 'synthetic', domain: 'glados.cloud', path: '/api/user/status' });
+  input.cookieHeader = composeCookieHeader(input.parts);
+  await assert.rejects(verifyCookie(input.host, input.cookieHeader, input.userAgent, input.parts, {
+    fetchImpl: async () => assert.fail('must stop before a real or mock request'),
+  }), { code: 'GLADOS_COOKIE_SCOPE_MISMATCH' });
+  assert.throws(() => buildCapturePayload(input, {}, 'Synthetic Browser'), { code: 'GLADOS_COOKIE_SCOPE_MISMATCH' });
 });

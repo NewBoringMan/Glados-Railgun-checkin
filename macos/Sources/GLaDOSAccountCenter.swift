@@ -225,10 +225,11 @@ final class GitHubClient: @unchecked Sendable {
     let repo: String
     let branch: String
     let gh: URL
+    let receiptStore: LocalManualAccountStore?
 
-    init(repo: String = defaultRepository, branch: String = defaultBranch) throws {
+    init(repo: String = defaultRepository, branch: String = defaultBranch, receiptStore: LocalManualAccountStore? = nil) throws {
         guard let gh = ProcessRunner.executable("gh") else { throw AppError.message("未找到 GitHub CLI。请先运行安装依赖脚本。") }
-        self.repo = repo; self.branch = branch; self.gh = gh
+        self.repo = repo; self.branch = branch; self.gh = gh; self.receiptStore = receiptStore
     }
 
     func ensureReady() throws {
@@ -271,7 +272,8 @@ final class GitHubClient: @unchecked Sendable {
     func setSecret(name: String, value: String) throws {
         guard name.range(of: "^GLADOS_ACCOUNT_[A-F0-9]{16}$", options: .regularExpression) != nil else { throw AppError.message("Secret 名称未通过安全校验。") }
         guard value.utf8.count <= 48 * 1024 - 1 else { throw AppError.message("登录资料超过 GitHub Secret 的容量限制；完整资料已保存在本机，未发送截断内容。") }
-        if try ManualSessionFormatGate.requiresRemoteSupport(value) {
+        let structured = try ManualSessionFormatGate.requiresRemoteSupport(value)
+        if structured {
             do {
                 // Secrets are shared by repository: a candidate App must verify
                 // production master on every write, regardless of its UI branch.
@@ -279,8 +281,19 @@ final class GitHubClient: @unchecked Sendable {
                 try ManualSessionFormatGate.validateMarker(Data(marker.utf8))
             } catch { throw ManualAccountError.remoteSessionFormat }
         }
-        let result = try ProcessRunner.run(gh, ["secret", "set", name, "--repo", repo], input: Data((value + "\n").utf8), timeout: 60)
-        guard result.exitCode == 0 else { throw AppError.message("更新 GitHub Secret 未完成；已保存的本机登录资料保留，可手动重试同步。") }
+        let key = String(name.dropFirst("GLADOS_ACCOUNT_".count))
+        if structured {
+            guard let receiptStore else { throw ManualAccountError.storage }
+            try receiptStore.recordPublication(key: key, state: "pending")
+        }
+        do {
+            let result = try ProcessRunner.run(gh, ["secret", "set", name, "--repo", repo], input: Data((value + "\n").utf8), timeout: 60)
+            guard result.exitCode == 0 else { throw AppError.message("更新 GitHub Secret 未完成；已保存的本机登录资料保留，可手动重试同步。") }
+            if structured { try receiptStore?.recordPublication(key: key, state: "acknowledged") }
+        } catch {
+            if structured { try receiptStore?.recordPublication(key: key, state: "uncertain") }
+            throw AppError.message("此次发布结果尚不确定；本机登录资料已保留，可查看阶段回执后手动同步。")
+        }
     }
 
     func deleteSecret(name: String) throws {
@@ -331,47 +344,6 @@ final class GitHubClient: @unchecked Sendable {
         let created = try apiJSON("git/commits", method: "POST", payload: ["message": message, "tree": newTreeSHA, "parents": [head]])
         guard let newSHA = created["sha"] as? String else { throw AppError.message("无法创建账号配置版本。") }
         _ = try apiJSON("git/refs/heads/\(branch)", method: "PATCH", payload: ["sha": newSHA, "force": false])
-    }
-
-    func triggerWorkflow(_ workflow: String, account: String) throws -> (Int, String) {
-        let start = Date()
-        let trigger = try ProcessRunner.run(gh, ["workflow", "run", workflow, "--repo", repo, "--ref", branch, "-f", "account=\(account)"], timeout: 45)
-        guard trigger.exitCode == 0 else { throw AppError.message(trigger.stderr.isEmpty ? "无法触发 \(workflow)。" : trigger.stderr) }
-        let formatter = ISO8601DateFormatter()
-        let deadline = Date().addingTimeInterval(90)
-        while Date() < deadline {
-            Thread.sleep(forTimeInterval: 2.0)
-            let list = try ProcessRunner.run(gh, ["run", "list", "--repo", repo, "--workflow", workflow, "--event", "workflow_dispatch", "--limit", "10", "--json", "databaseId,status,conclusion,url,createdAt,headBranch"], timeout: 45)
-            guard list.exitCode == 0 else { continue }
-            guard let array = try JSONSerialization.jsonObject(with: Data(list.stdout.utf8)) as? [[String: Any]] else { continue }
-            for item in array {
-                guard (item["headBranch"] as? String) == branch,
-                      let createdText = item["createdAt"] as? String,
-                      let created = formatter.date(from: createdText),
-                      created >= start.addingTimeInterval(-8),
-                      let id = item["databaseId"] as? Int else { continue }
-                return (id, item["url"] as? String ?? "")
-            }
-        }
-        throw AppError.message("工作流已触发，但未能定位新的运行记录。")
-    }
-
-    func waitForRun(_ id: Int, timeout: TimeInterval = 480) throws -> (String, String, String) {
-        let deadline = Date().addingTimeInterval(timeout)
-        var url = ""
-        while Date() < deadline {
-            let result = try ProcessRunner.run(gh, ["run", "view", String(id), "--repo", repo, "--json", "status,conclusion,url"], timeout: 45)
-            guard result.exitCode == 0 else { throw AppError.message(result.stderr) }
-            let object = try jsonObject(result.stdout)
-            url = object["url"] as? String ?? url
-            if (object["status"] as? String) == "completed" {
-                let conclusion = object["conclusion"] as? String ?? "unknown"
-                let log = try ProcessRunner.run(gh, ["run", "view", String(id), "--repo", repo, "--log"], timeout: 120)
-                return (conclusion, url, log.stdout + "\n" + log.stderr)
-            }
-            Thread.sleep(forTimeInterval: 3.0)
-        }
-        throw AppError.message("等待 GitHub Actions 完成超时。")
     }
 
     func recentRuns(workflow: String, limit: Int = 12) throws -> [RunInfo] {
@@ -458,6 +430,8 @@ final class CaptureService: @unchecked Sendable {
         switch captureErrorCode(text) {
         case "browser_connection": return "无法连接到该账号的浏览器读取窗口。请自行退出该账号的专属浏览器实例，再重新读取登录信息。"
         case "identity_mismatch": return "当前浏览器账号与待更新账号不一致。请切换到该账号正常登录后重新读取。"
+        case "cookie_scope_mismatch": return "各接口所需登录 Cookie 不一致，当前保存格式无法安全复用，未保存；请保留原网页登录。"
+        case "cookie_scope_unavailable": return "当前 Firefox 或 geckodriver 不支持所需的只读 Cookie 接口，或无法核实浏览器上下文。请升级后重试，或手动使用 Edge / Safari。"
         case "missing_identity": return "网站未返回可核验的账号标识和邮箱，此次读取暂时无法保存。已记录的账号资料保留。"
         case "verification_required": return "网站要求完成登录验证。请在所选浏览器中正常完成验证，再手动重新读取。"
         case "safari_extension_unavailable": return "Safari 登录读取扩展尚不可用。请在 Safari 设置中启用配套扩展，并允许访问对应的 GLaDOS 页面。"
@@ -569,6 +543,8 @@ final class AppModel: ObservableObject {
     @Published var catalog: PlanCatalog?
     @Published var statuses: [String: AccountStatus] = [:]
     @Published var runs: [RunInfo] = []
+    @Published var workflowReceipts: [WorkflowRunReceipt] = []
+    @Published var checkinWatch: CheckinWatchStatus?
     @Published var busyMessage: String?
     @Published var errorMessage: String?
     @Published var infoMessage: String?
@@ -601,6 +577,7 @@ final class AppModel: ObservableObject {
                 try? store.rememberEmail(key: status.accountKey, email: status.email, verified: true)
             }
             localAccounts = try store.records()
+            workflowReceipts = try store.workflowRecords()
         } catch { errorMessage = error.localizedDescription }
         Task { await bootstrap() }
     }
@@ -649,9 +626,10 @@ final class AppModel: ObservableObject {
         githubConnectionIssue = nil
         busyMessage = "正在连接 GitHub…"
         await Task.yield()
+        let receiptStore = localStore
         do {
             let result = try await Self.background { () -> (GitHubClient, RepositorySnapshot) in
-                let client = try GitHubClient()
+                let client = try GitHubClient(receiptStore: receiptStore)
                 try client.ensureReady()
                 return (client, try Self.fetchRepositoryState(client))
             }
@@ -725,22 +703,87 @@ final class AppModel: ObservableObject {
     private func refreshStatuses(account: String) async {
         guard let client else { return }
         await perform(account == "all" ? "正在只读刷新全部 GLaDOS 状态…" : "正在只读刷新账号状态…") {
-            let output = try await Self.background { () -> (String, [RunInfo]) in
-                let (id, _) = try client.triggerWorkflow(statusWorkflowName, account: account)
-                let (_, _, logs) = try client.waitForRun(id, timeout: 360)
-                return (logs, try client.recentRuns(workflow: checkinWorkflowName))
+            let output = try await Self.background { () -> (WorkflowRunReceipt, String) in
+                let receipt = try client.triggerWorkflow(statusWorkflowName, account: account)
+                let (_, _, logs) = try client.waitForRun(receipt, timeout: 360)
+                return (receipt, logs)
             }
-            let parsed = self.parseStatusLogs(output.0)
-            for status in parsed {
-                self.statuses[status.accountKey] = status
-                if status.ok, !status.email.isEmpty {
-                    try self.localStore?.rememberEmail(key: status.accountKey, email: status.email, verified: true)
-                }
+            try self.applyStatusLogs(output.1, receipt: output.0)
+        }
+    }
+
+    private func applyStatusLogs(_ logs: String, receipt: WorkflowRunReceipt) throws {
+        let parsed = parseStatusLogs(logs)
+        guard !parsed.isEmpty, parsed.allSatisfy({ status in
+            (try? ManualValidation.key(status.accountKey)) != nil && (receipt.account == "all" || status.accountKey == receipt.account)
+        }) else {
+            var pending = receipt; pending.queryState = .interrupted
+            try localStore?.saveWorkflow(pending)
+            throw WorkflowReceiptError.protocolError
+        }
+        for status in parsed {
+            statuses[status.accountKey] = status
+            if status.ok, !status.email.isEmpty {
+                try localStore?.rememberEmail(key: status.accountKey, email: status.email, verified: true)
             }
-            if let store = self.localStore { self.localAccounts = try store.records() }
-            self.saveStatusCache()
-            UserDefaults.standard.set(Date(), forKey: "lastStatusRefresh")
-            self.runs = output.1
+        }
+        if let store = localStore { localAccounts = try store.records() }
+        saveStatusCache()
+        UserDefaults.standard.set(Date(), forKey: "lastStatusRefresh")
+    }
+
+    func latestReceipt(for key: String) -> WorkflowRunReceipt? {
+        workflowReceipts.first { $0.account == key }
+    }
+    func accountStageText(_ key: String) -> String? {
+        guard let record = localAccounts[key], record.hasCredentials else { return nil }
+        let read = record.readState == "imported" ? "已导入本机" : "已读取并保存本机"
+        let publication: String
+        switch record.publicationState {
+        case "acknowledged": publication = "发布已确认"
+        case "pending", "uncertain": publication = "发布结果待核对"
+        case "skipped": publication = "已有账号，发布已跳过"
+        default: publication = record.pendingPublication ? "待手动发布" : "发布回执未记录"
+        }
+        let verification = workflowReceipts.first { $0.account == key && $0.workflow == statusWorkflowName && $0.credentialID == record.credentialID }
+        return "\(read) · \(publication) · \(verification?.stateText ?? "云端资料待查询")"
+    }
+
+    func retryExistingWorkflow(_ original: WorkflowRunReceipt) async {
+        guard let client else { return }
+        var suppliedID: Int?
+        if original.runID == nil {
+            let alert = NSAlert(); alert.messageText = "重查原任务"
+            alert.informativeText = "请输入此次派发在 GitHub 运行记录中的任务编号。应用会核对工作流、分支、时间和账号，且不会重新派发。"
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+            field.placeholderString = "GitHub Run ID"; alert.accessoryView = field
+            alert.addButton(withTitle: "核对并重查"); alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            do { suppliedID = try WorkflowRunRules.runID(field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            catch { errorMessage = error.localizedDescription; return }
+        }
+        let selectedID = suppliedID
+        await perform("正在只读重查已有任务…") {
+            let result = try await Self.background { () -> (WorkflowRunReceipt, String, String) in
+                let receipt = try selectedID.map { try client.bindExistingRun($0, to: original) } ?? original
+                let (conclusion, _, logs) = try client.waitForRun(receipt, timeout: 360)
+                return (receipt, conclusion, logs)
+            }
+            if result.0.workflow == statusWorkflowName { try self.applyStatusLogs(result.2, receipt: result.0) }
+            self.infoMessage = "原任务查询完成：\(result.1)。未重新读取登录信息、发布凭据或派发任务。"
+        }
+    }
+
+    func refreshCheckinWatch() async {
+        do { checkinWatch = try await Self.background { try CheckinWatchStatus.request("status") } }
+        catch { checkinWatch = nil }
+    }
+    func updateCheckinWatch(_ action: String, enabled: Bool? = nil) async {
+        await perform("正在更新签到失败通知设置…") {
+            let status = try await Self.background { try CheckinWatchStatus.request(action, enabled: enabled) }
+            self.checkinWatch = status
+            guard status.ok else { throw AppError.message(status.error ?? "签到失败通知设置未完成。") }
+            if action == "test" { self.infoMessage = "测试通知已提交给通知组件；是否显示取决于系统通知权限。" }
         }
     }
 
@@ -1007,17 +1050,19 @@ final class AppModel: ObservableObject {
 
     func runCheckin(_ key: String) async {
         guard let client else { return }
+        var completed = false
         await perform("正在手动执行该账号签到…") {
-            let output = try await Self.background { () -> (String, String, [RunInfo]) in
-                let (id, url) = try client.triggerWorkflow(checkinWorkflowName, account: key)
-                let (conclusion, finalURL, _) = try client.waitForRun(id)
-                return (conclusion, finalURL.isEmpty ? url : finalURL, try client.recentRuns(workflow: checkinWorkflowName))
+            let output = try await Self.background { () -> (String, String) in
+                let receipt = try client.triggerWorkflow(checkinWorkflowName, account: key)
+                let (conclusion, url, _) = try client.waitForRun(receipt)
+                return (conclusion, url)
             }
+            completed = true
             self.infoMessage = "手动签到已完成：\(output.0)"
             if let target = URL(string: output.1) { NSWorkspace.shared.open(target) }
-            self.runs = output.2
+            self.runs = (try? await Self.background { try client.recentRuns(workflow: checkinWorkflowName) }) ?? self.runs
         }
-        await refreshStatus(key: key)
+        if completed { await refreshStatus(key: key) }
     }
 
     func deleteAutomation(_ key: String) async {
@@ -1218,6 +1263,10 @@ final class AppModel: ObservableObject {
         await Task.yield()
         do { try await operation() }
         catch { errorMessage = error.localizedDescription }
+        if let store = localStore {
+            do { localAccounts = try store.records(); workflowReceipts = try store.workflowRecords() }
+            catch { errorMessage = error.localizedDescription }
+        }
         busyMessage = nil
     }
 }
@@ -1548,6 +1597,10 @@ struct AccountCard: View {
                     Button("移除自动化", role: .destructive) { deletingKey = key }.disabled(!model.isCloudAccount(key))
                 } label: { Image(systemName: "ellipsis.circle") }
             }
+            if let stages = model.accountStageText(key) { Text(stages).font(.caption).foregroundStyle(.secondary) }
+            if let receipt = model.latestReceipt(for: key) {
+                HStack { Text(receipt.stateText).font(.caption).foregroundStyle(.secondary); Spacer(); Button("重查已有任务") { Task { await model.retryExistingWorkflow(receipt) } }.disabled(!model.isGitHubReady) }
+            }
             if let error = status?.error, !error.isEmpty { Text(error).font(.caption).foregroundStyle(.orange) }
             if let warning = status?.statusWarning, !warning.isEmpty { Text(warning).font(.caption).foregroundStyle(.secondary) }
             if let warning = status?.sessionWarning, !warning.isEmpty { Text(warning).font(.caption).foregroundStyle(.orange) }
@@ -1680,8 +1733,27 @@ struct PunchesView: View {
 struct RunsView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        List(model.runs) { run in
-            HStack { Image(systemName: run.conclusion == "success" ? "checkmark.circle.fill" : run.status == "in_progress" ? "clock.fill" : "exclamationmark.circle.fill").foregroundStyle(run.conclusion == "success" ? .green : .orange); VStack(alignment: .leading) { Text("Run #\(run.id)").font(.headline); Text(run.createdAt).font(.caption).foregroundStyle(.secondary) }; Spacer(); Text(run.conclusion.isEmpty ? run.status : run.conclusion).foregroundStyle(.secondary); Button("打开") { model.openRun(run) } }
+        List {
+            if !model.workflowReceipts.isEmpty {
+                Section("本机任务回执") {
+                    ForEach(model.workflowReceipts.prefix(100)) { receipt in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(receipt.title + " · " + (receipt.account == "all" ? "全部账号" : model.accountDisplayName(receipt.account))).font(.headline)
+                                Text(receipt.stateText).font(.caption).foregroundStyle(.secondary)
+                                Text(receipt.dispatchedAt + (receipt.runID.map { " · Run #\($0)" } ?? " · 编号待核对")).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("重查已有任务") { Task { await model.retryExistingWorkflow(receipt) } }.disabled(!model.isGitHubReady)
+                        }
+                    }
+                }
+            }
+            Section("GitHub 最近签到") {
+                ForEach(model.runs) { run in
+                    HStack { Image(systemName: run.conclusion == "success" ? "checkmark.circle.fill" : run.status == "in_progress" ? "clock.fill" : "exclamationmark.circle.fill").foregroundStyle(run.conclusion == "success" ? .green : .orange); VStack(alignment: .leading) { Text("Run #\(run.id)").font(.headline); Text(run.createdAt).font(.caption).foregroundStyle(.secondary) }; Spacer(); Text(run.conclusion.isEmpty ? run.status : run.conclusion).foregroundStyle(.secondary); Button("打开") { model.openRun(run) } }
+                }
+            }
         }.navigationTitle("运行记录")
     }
 }
@@ -1779,12 +1851,23 @@ struct SettingsView: View {
                 HStack { Button("恢复 05:00 / 17:00") { model.restoreRecommendedSchedule() }; Spacer(); Button("保存时间") { Task { await model.saveSchedule() } }.buttonStyle(.borderedProminent) }
             }
             Section("仓库") { LabeledContent("GitHub", value: defaultRepository); LabeledContent("分支", value: defaultBranch); Button("打开仓库") { model.openRepository() } }
+            Section("签到失败通知") {
+                Toggle("监测定时签到失败", isOn: Binding(get: { model.checkinWatch?.enabled ?? false }, set: { enabled in Task { await model.updateCheckinWatch("set-enabled", enabled: enabled) } })).disabled(model.checkinWatch == nil || model.busyMessage != nil)
+                Text("独立只读检查 GitHub 定时签到结果并发送本机通知，不读取验证码或更新登录资料。").font(.caption).foregroundStyle(.secondary)
+                LabeledContent("通知权限", value: model.checkinWatch?.authorizationText ?? "组件暂不可用")
+                if let checked = model.checkinWatch?.lastCheckedAt { LabeledContent("最近检查", value: checked) }
+                HStack {
+                    Button("允许通知") { Task { await model.updateCheckinWatch("authorize") } }
+                    Button("测试通知") { Task { await model.updateCheckinWatch("test") } }
+                    Button("重新检测") { Task { await model.refreshCheckinWatch() } }
+                }
+            }
             Section("本机账号资料") {
                 Text("邮箱独立保存在本机，登录失效也会保留。手动读取的完整登录凭据由系统钥匙串保护；没有自动收验证码、自动登录或自动更新 Cookie。")
                 HStack { Button("导入账号…") { model.chooseImportFile() }; Button("加密导出账号…") { model.chooseExportFile() } }
             }
             Section("安全策略") { Text("手动保存的登录资料先写入本机钥匙串，再通过标准输入同步到该账号原有 GitHub Secret。不会写入公开账号配置、工作流或普通日志。资料刷新为只读，签到结果以实际签到运行记录为准。") }
-        }.formStyle(.grouped).padding().environment(\.timeZone, TimeZone(identifier: "Asia/Taipei")!).navigationTitle("设置")
+        }.formStyle(.grouped).padding().environment(\.timeZone, TimeZone(identifier: "Asia/Taipei")!).navigationTitle("设置").task { await model.refreshCheckinWatch() }
     }
 }
 

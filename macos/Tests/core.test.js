@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   ACCOUNT_SECRET_PREFIX,
+  MANUAL_SESSION_PATHS,
   accountKeyFromSecretName,
   accountSecretNameFromSession,
   accountSecretNameFromUserId,
@@ -21,6 +22,7 @@ const {
   parseGitHubRepo,
   redact,
   selectSessionCookies,
+  selectReusableSessionCookies,
   summarizeRunLog,
   validatePinnedPage,
 } = require('../Resources/core');
@@ -90,6 +92,25 @@ test('only include cookies applicable to the pinned status request', () => {
     { name: 'api_path', value: 'keep', domain: 'glados.cloud', hostOnly: true, path: '/api/user' },
   ]), 'glados.cloud');
   assert.deepEqual(parts.cookies.map((cookie) => cookie.name), ['gld:sess', 'gld:sess.sig', 'api_path']);
+});
+
+test('v1 reuse requires the same applicable cookies for every actual API path', () => {
+  const shared = gldCookies([
+    { name: 'api_setting', value: 'shared', domain: '.glados.cloud', path: '/api/user' },
+    { name: 'console_only', value: 'excluded', domain: '.glados.cloud', path: '/console' },
+    { name: 'not_a_parent', value: 'excluded', domain: '.glados.cloud', path: '/api/user/stat' },
+  ]);
+  assert.equal(selectReusableSessionCookies(shared, 'glados.cloud').cookies.length, 3);
+  for (const path of MANUAL_SESSION_PATHS) {
+    const scoped = { name: 'endpoint_only', value: 'synthetic-sensitive-value', domain: '.glados.cloud', path };
+    assert.throws(() => selectReusableSessionCookies([...shared, scoped], 'glados.cloud'), (error) => {
+      assert.equal(error.code, 'GLADOS_COOKIE_SCOPE_MISMATCH');
+      assert.equal(error.message.includes(scoped.value), false);
+      return true;
+    });
+  }
+  const statusOnlyAuth = gldCookies().map((cookie) => ({ ...cookie, path: '/api/user/status' }));
+  assert.throws(() => selectReusableSessionCookies(statusOnlyAuth, 'glados.cloud'), { code: 'GLADOS_COOKIE_SCOPE_MISMATCH' });
 });
 
 test('reject incomplete new sessions, duplicate names, and header injection', () => {

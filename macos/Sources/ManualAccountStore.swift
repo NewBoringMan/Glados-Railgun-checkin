@@ -162,6 +162,8 @@ struct ManualAccountRecord: Codable, Equatable, Sendable {
     var credentialSource: String?
     var publicationSkipped: Bool?
     var sessionHost: String?
+    var readState: String?
+    var publicationState: String?
     var updatedAt: String = ManualValidation.timestamp()
     var hasCredentials: Bool { credentialID != nil }
     var allowsManualCredentialReplacement: Bool {
@@ -366,7 +368,11 @@ final class NativeManualSessionVault: ManualSessionVault, @unchecked Sendable {
 }
 
 final class LocalManualAccountStore: @unchecked Sendable {
-    struct Index: Codable { var version = 1; var accounts: [String: ManualAccountRecord] = [:] }
+    struct Index: Codable {
+        var version = 1
+        var accounts: [String: ManualAccountRecord] = [:]
+        var workflowReceipts: [String: WorkflowRunReceipt]?
+    }
     let directory: URL
     private let vault: ManualSessionVault
     private let mutex = NSRecursiveLock()
@@ -399,11 +405,18 @@ final class LocalManualAccountStore: @unchecked Sendable {
             guard values.isSymbolicLink != true, (values.fileSize ?? Int.max) <= 2 * 1024 * 1024 else { throw ManualAccountError.storage }
             let index = try JSONDecoder().decode(Index.self, from: Data(contentsOf: indexURL))
             guard index.version == 1, index.accounts.count <= 1000 else { throw ManualAccountError.storage }
+            guard (index.workflowReceipts?.count ?? 0) <= 2000 else { throw ManualAccountError.storage }
+            for (id, receipt) in index.workflowReceipts ?? [:] {
+                guard receipt.id == id else { throw ManualAccountError.storage }
+                try receipt.validate()
+            }
             for (key, record) in index.accounts {
                 guard try ManualValidation.key(key) == key, record.accountKey == key else { throw ManualAccountError.storage }
                 if !record.email.isEmpty { _ = try ManualValidation.email(record.email) }
                 if let source = record.credentialSource, !["manual-capture", "import"].contains(source) { throw ManualAccountError.storage }
                 if let host = record.sessionHost, !ManualValidation.allowedHosts.contains(host) { throw ManualAccountError.storage }
+                if let read = record.readState, !["captured", "imported"].contains(read) { throw ManualAccountError.storage }
+                if let state = record.publicationState, !["local", "pending", "acknowledged", "uncertain", "skipped"].contains(state) { throw ManualAccountError.storage }
                 for id in [record.credentialID, record.previousCredentialID].compactMap({ $0 }) + (record.legacyCredentialIDs ?? []) {
                     guard id.hasPrefix(key + "."), id.range(of: "^[A-F0-9]{16}\\.[a-f0-9-]{36}$", options: .regularExpression) != nil else { throw ManualAccountError.storage }
                 }
@@ -429,6 +442,47 @@ final class LocalManualAccountStore: @unchecked Sendable {
         }
     }
     func records() throws -> [String: ManualAccountRecord] { try locked { try load().accounts } }
+    func workflowRecords() throws -> [WorkflowRunReceipt] {
+        try locked { Array((try load().workflowReceipts ?? [:]).values).sorted { $0.dispatchedAt > $1.dispatchedAt } }
+    }
+    /// Persist intent before a dispatch can leave this process. Unresolved intent
+    /// is reused even after a new capture, so a failed GET cannot cause a POST.
+    func prepareWorkflow(_ workflow: String, account: String) throws -> (WorkflowRunReceipt, Bool) {
+        try locked {
+            var index = try load()
+            var receipts = index.workflowReceipts ?? [:]
+            if let existing = receipts.values.filter({ $0.workflow == workflow && $0.account == account && !$0.queryState.finished }).sorted(by: { $0.dispatchedAt > $1.dispatchedAt }).first {
+                return (existing, false)
+            }
+            let current = index.accounts[account]
+            let receipt = WorkflowRunReceipt(workflow: workflow, account: account, credentialID: current?.publicationState == "acknowledged" ? current?.credentialID : nil)
+            try receipt.validate()
+            if receipts.count >= 2000 {
+                guard let oldest = receipts.values.filter({ $0.queryState.finished }).min(by: { $0.dispatchedAt < $1.dispatchedAt }) else { throw ManualAccountError.storage }
+                receipts.removeValue(forKey: oldest.id)
+            }
+            receipts[receipt.id] = receipt; index.workflowReceipts = receipts; try save(index)
+            return (receipt, true)
+        }
+    }
+    func saveWorkflow(_ receipt: WorkflowRunReceipt) throws {
+        try receipt.validate()
+        try locked {
+            var index = try load()
+            guard let old = index.workflowReceipts?[receipt.id], old.workflow == receipt.workflow,
+                  old.account == receipt.account, old.dispatchedAt == receipt.dispatchedAt,
+                  old.credentialID == receipt.credentialID, old.runID == nil || old.runID == receipt.runID else { throw WorkflowReceiptError.identity }
+            index.workflowReceipts?[receipt.id] = receipt; try save(index)
+        }
+    }
+    func recordPublication(key: String, state: String) throws {
+        guard ["pending", "acknowledged", "uncertain"].contains(state) else { throw ManualAccountError.storage }
+        try locked {
+            var index = try load()
+            guard index.accounts[key]?.credentialID != nil else { throw ManualAccountError.storage }
+            index.accounts[key]?.publicationState = state; try save(index)
+        }
+    }
     func session(for key: String) throws -> ManualSession? {
         try locked {
             let key = try ManualValidation.key(key)
@@ -480,6 +534,7 @@ final class LocalManualAccountStore: @unchecked Sendable {
             record.pendingPublication = pendingPublication; record.updatedAt = ManualValidation.timestamp()
             record.credentialSource = "manual-capture"; record.publicationSkipped = false
             record.sessionHost = valid.host
+            record.readState = "captured"; record.publicationState = "local"
             index.accounts[valid.accountKey] = record
             do { try save(index) } catch { try? vault.remove(newID); throw error }
             if let obsolete { try? vault.remove(obsolete) }
@@ -488,7 +543,7 @@ final class LocalManualAccountStore: @unchecked Sendable {
     func markPublished(_ keys: Set<String>) throws {
         try locked {
             var index = try load()
-            for key in keys { index.accounts[key]?.pendingPublication = false; index.accounts[key]?.publicationSkipped = false }
+            for key in keys { index.accounts[key]?.pendingPublication = false; index.accounts[key]?.publicationSkipped = false; index.accounts[key]?.publicationState = "acknowledged" }
             try save(index)
         }
     }
@@ -496,7 +551,7 @@ final class LocalManualAccountStore: @unchecked Sendable {
         guard !keys.isEmpty else { return }
         try locked {
             var index = try load()
-            for key in keys { index.accounts[key]?.pendingPublication = false; index.accounts[key]?.publicationSkipped = true }
+            for key in keys { index.accounts[key]?.pendingPublication = false; index.accounts[key]?.publicationSkipped = true; index.accounts[key]?.publicationState = "skipped" }
             try save(index)
         }
     }
@@ -547,6 +602,7 @@ final class LocalManualAccountStore: @unchecked Sendable {
                 for account in rechecked.additions {
                     var record = ManualAccountRecord(accountKey: account.accountKey, email: account.email, emailVerified: account.emailVerified, label: account.label, enabled: account.enabled, autoExchange: account.autoExchange)
                     record.credentialSource = "import"; record.publicationSkipped = false
+                    record.readState = "imported"; record.publicationState = "local"
                     if let session = account.session {
                         let id = account.accountKey + "." + UUID().uuidString.lowercased()
                         try vault.add(session.encoded(), id: id); staged.append(id)

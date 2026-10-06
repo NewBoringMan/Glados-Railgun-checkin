@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { normalizeSafariNativeCapture } = require('../Resources/safari_native_protocol');
 const { buildCapturePayload, verifyCookie } = require('../Resources/capture_account');
+const { MANUAL_SESSION_PATHS } = require('../Resources/core');
 
 const source = fs.readFileSync(path.join(__dirname, '..', '..', 'app_integration', 'SafariExtensionSource', 'Resources', 'background.js'), 'utf8');
 const token = 'c'.repeat(64);
@@ -17,7 +18,7 @@ const popupUrl = 'safari-web-extension://synthetic/popup.html';
 function harness() {
   const state = {
     tab: { id: 7, url: `https://glados.cloud/console/checkin#glados-assistant=${token}&port=${port}` },
-    store: {}, cookieReads: 0, contextReads: 0, nativeSends: [], capture: null,
+    store: {}, cookieReads: 0, cookiePaths: [], contextReads: 0, nativeSends: [], capture: null,
     userAgent: 'SyntheticSafari/1.0', contextOrigin: 'https://glados.cloud',
     cookies: [
       { name: 'gld:sess', value: 'synthetic-opaque-session', domain: '.glados.cloud', path: '/', hostOnly: false, session: true },
@@ -45,7 +46,17 @@ function harness() {
       },
     },
     cookies: {
-      getAll: async (filter) => { state.cookieReads += 1; assert.equal(filter.url, 'https://glados.cloud/api/user/status'); return state.cookies; },
+      getAll: async (filter) => {
+        state.cookieReads += 1;
+        const url = new URL(filter.url);
+        assert.equal(url.origin, 'https://glados.cloud');
+        assert.equal(MANUAL_SESSION_PATHS.includes(url.pathname), true);
+        state.cookiePaths.push(url.pathname);
+        return state.cookies.filter((cookie) => {
+          const path = cookie.path || '/';
+          return url.pathname === path || (url.pathname.startsWith(path) && (path.endsWith('/') || url.pathname[path.length] === '/'));
+        });
+      },
     },
     runtime: {
       id: extensionId, getURL: () => popupUrl,
@@ -78,7 +89,8 @@ test('Safari only transports complete cookies and actual UA after an explicit po
   assert.equal((await flow.send({ type: 'GET_STATUS' })).pending, true);
   assert.equal(flow.state.cookieReads, 0);
   assert.equal((await flow.send({ type: 'MANUAL_CAPTURE' })).ok, true);
-  assert.equal(flow.state.cookieReads, 1);
+  assert.equal(flow.state.cookieReads, 5);
+  assert.deepEqual(flow.state.cookiePaths, [...MANUAL_SESSION_PATHS]);
   assert.equal(flow.state.contextReads, 2);
   assert.equal(flow.state.nativeSends.length, 1);
   const sent = flow.state.nativeSends[0];
@@ -131,4 +143,27 @@ test('missing actual UA, context changes, and ambiguous cookies stop transport',
     assert.equal((await flow.send({ type: 'MANUAL_CAPTURE' })).ok, false);
     assert.equal(flow.state.nativeSends.length, 0);
   }
+});
+
+test('Safari refuses endpoint-only cookies before Native Messaging and never combines endpoint headers', async () => {
+  for (const path of MANUAL_SESSION_PATHS) {
+    const flow = harness();
+    await flow.register();
+    flow.state.cookies.push({ name: 'endpoint_only', value: 'synthetic-private', domain: '.glados.cloud', path });
+    const result = await flow.send({ type: 'MANUAL_CAPTURE' });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'cookie_scope_mismatch');
+    assert.equal(flow.state.nativeSends.length, 0);
+    assert.equal(flow.state.capture, null);
+  }
+});
+
+test('Safari retains common API cookies and excludes console-only cookies', async () => {
+  const flow = harness();
+  await flow.register();
+  flow.state.cookies.push({ name: 'api_common', value: 'synthetic', domain: '.glados.cloud', path: '/api/user' });
+  flow.state.cookies.push({ name: 'console_only', value: 'excluded', domain: '.glados.cloud', path: '/console' });
+  assert.equal((await flow.send({ type: 'MANUAL_CAPTURE' })).ok, true);
+  assert.equal(flow.state.capture.cookieHeader.includes('api_common=synthetic'), true);
+  assert.equal(flow.state.capture.cookieHeader.includes('console_only'), false);
 });

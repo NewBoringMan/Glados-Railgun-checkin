@@ -1,8 +1,8 @@
-# GLaDOS Account Center 2.0.10：恢复手动登录管理
+# GLaDOS Account Center 2.0.11：恢复手动登录管理
 
 ## 此次范围
 
-此版本恢复同一个 Account Center 的手动登录管理，移除自动收验证码、自动登录和自动更新 Cookie 的启动链与界面。保留账号清单、每日签到、独立账号开关、每账号兑换策略、全局兑换档位、连续签到、日历、运行记录、台北时区排程、独立 Edge 资料目录和内嵌 Safari 扩展。
+此版本恢复同一个 Account Center 的手动登录管理，移除自动收验证码、自动登录和自动更新 Cookie 的启动链与界面。保留账号清单、每日签到、独立账号开关、每账号兑换策略、全局兑换档位、连续签到、日历、运行记录、台北时区排程、独立 Edge 资料目录和内嵌 Safari 扩展。以实际已安装的 2.0.10 / build 20042 为兼容基准，另行保留其中的签到失败通知、通知开关和已派发任务的查询恢复能力。
 
 完整原生源恢复在 `macos/Sources`，手动读取资源在 `macos/Resources`。原单 App 的 bundle identifier 不变。主程序从源构建为 `GLaDOSAccountCenter.real`，沿用原 launcher 和独立的 PolicyMenuPlugin / PolicyEditor，避免丢失已有的每账号兑换入口。
 
@@ -25,7 +25,13 @@
 
 恢复的 App 源码还有一个 15 分钟的资料刷新门槛：启动或重新连接时，如果距离上次刷新超过 15 分钟，就重新查询状态。这可能影响用户何时看到错误，但它不是 Cookie 过期计时器，也不是每 15 分钟自动登录的任务。
 
-旧代码确有三项可核查缺陷：捕获只关注旧会话字段；云端使用固定 Chrome/150 User-Agent，没有保存真实登录浏览器；多个域名尝试仅保留最后一个错误。公开的新版实现说明也记录了 `gld:sess` / `gld:sess.sig` 与真实 User-Agent 的变化，但这不是官方的过期时间政策：
+对实际安装的 build 20042 源码检查确认：CDP 手动读取已支持 `gld`，但浏览器内验证使用完整 Cookie 与实际 UA，保存时却经 `edge_login_support.js` 缩为 `koa` 或 `gld` 中的一组两枚 Cookie，没有保存真实 UA、采集时间与完整会话上下文。非 CDP 旧路径仍只识别 `koa`，使用固定 Chrome/150 UA，并可能把积分可读取误当作完整认证通过。旧云端多域名尝试还只保留最后一个错误。
+
+这些是可修复的实现缺陷，但尚不能证明某一项单独导致了这次十几分钟后的授权拒绝。原 HTTP 自动登录传输使用 CookieJar，登录时确实接受 Set-Cookie，不能笼统声称整个 App 不处理 Set-Cookie。原时间模块安排按月或已知到期时间维护，没有设置十几分钟的登录寿命。
+
+实际项目的 `BUILD_20042_ACCEPTANCE.md` 还记录过旧 worker 删除共享 Edge 资料中的同域 Cookie，造成其他账号本地登录受影响；记录称 20042 已改为临时隔离 BrowserContext，但未完成真实新凭据和云端验收。这项历史本地破坏机制也不等于已经证明服务端会短时撤销会话。此次不再保留该自动登录 worker。
+
+公开的新版实现说明也记录了 `gld:sess` / `gld:sess.sig` 与真实 User-Agent 的变化，但这不是官方的过期时间政策：
 
 - [2026-glados-checkin v2026.9.30](https://github.com/lankerr/2026-glados-checkin/releases/tag/v2026.9.30)
 - [GLaDOS 公开登录前端](https://glados.cloud/app.bundle.js)：前端调用同源 `/api/user/session` 并以 `code === 0` 判断登录状态；这只证明端点及认证语义存在，不承诺所有响应都有 ID、邮箱。
@@ -67,13 +73,15 @@ python3 app_integration/install-manual.py install \
   --backup-dir '/existing/project/build/rollback'
 ```
 
-安装器不会启动 GUI。应先按本机允许的后台 GUI 流程关闭 App，再执行已经核对过的安装步骤。只停止 `com.enoch.glados-account-center.login-refresh`，保留旧数据库和钥匙串；不触碰其他定时任务。
+安装器不会启动 GUI。应先按本机允许的后台 GUI 流程关闭 App，再执行已经核对过的安装步骤。停用 `com.enoch.glados-account-center.login-refresh`，保留旧数据库和钥匙串。签到失败提醒使用独立的只读监测入口，不再经过会自动维护登录的旧 `--tick`；原关闭或缺失的开关维持关闭，不主动开启提醒。
+
+本轮已确认原 App 的物理路径是 `/Users/enoch/Applications/GLaDOS Account Center.app`，不是符号链接。原项目 `/Volumes/MacData/Projects/GLaDOS-Account-Center-integration` 有后续未提交修改，保持原样；本次修复在它的 `build/manual-restore-20261006/source` 隔离 worktree 中构建。MacData 已核实为 USB 外置卷。候选包与回滚副本也置于该任务目录。
 
 ## 仍需实际电脑验收
 
-- 当前已安装 App 的位置、版本、组件差异，以及现有本机凭据是否能读回。
+- 现有本机凭据是否能通过允许的数据入口读回；位置、版本及组件差异已确认。
 - 原位安装后，账号/兑换策略/排程/日历保持，失效账号仍显示邮箱。
 - 在实际钥匙串中保存、重启后读取；导出、再导入的去重和缺凭据提示。
 - 从用户正常登录的浏览器手动读取一次，验证服务端身份、只读状态和后续真实签到结果；记录同一凭据指纹的时间线，才能继续判断是否存在真实短时撤销。
 
-2026-10-06 本轮修复时，Mac 连接返回 404/429，因此代码和 CI 的结果不代表上述本机验收已经完成。不要把候选包的编译成功写成已经安装或已经证实有效期问题解决。
+2026-10-06 前期 Mac 连接曾返回 404/429，随后恢复并已成功读取实际安装版源码。当前 DCF 后台控制的状态查询正常，但界面读取曾超时；LocalAnt 的 APP_DATA_GUARD 要求使用专门的 app_data_* 接口读取受保护账号目录，该接口尚未在本轮工具中暴露。本轮不通过通用 shell 或其他通道绕过该规则。代码、合成测试与构建结果不能代替实际安装、钥匙串和真实会话验收；各步骤以实际完成的记录为准。

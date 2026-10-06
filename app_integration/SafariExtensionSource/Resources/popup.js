@@ -17,6 +17,7 @@ const messages = {
   context_changed: '读取期间浏览器信息发生变化，请手动重新读取。',
   context_unavailable: '无法读取当前登录页面的浏览器信息，请刷新原页面后手动重新发送。',
   ambiguous_cookies: '当前域名存在重名 Cookie，无法安全确定会话，请手动重新登录后再读取。',
+  cookie_scope_mismatch: '各接口适用的登录 Cookie 不一致，当前保存格式无法安全复用，已停止且未保存。请保留原网页登录。',
   capture_in_progress: '本次手动读取正在进行中，请稍候。',
   native_messaging_failed: 'Safari Native Messaging 未连接，请确认应用内嵌的扩展已启用。',
   native_bridge_rejected: 'GLaDOS Account Center拒绝了此次数据。',

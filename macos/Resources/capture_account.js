@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const {
   ACCOUNT_SECRET_PREFIX,
   MANAGED_WORKFLOW_NAME,
+  MANUAL_SESSION_PATHS,
   accountKeyFromSecretName,
   buildManagedWorkflow,
   composeCookieHeader,
@@ -23,7 +24,7 @@ const {
   normalizeUserAgent,
   parseGitHubRepo,
   redact,
-  selectSessionCookies,
+  selectReusableSessionCookies,
   summarizeRunLog,
   validatePinnedPage,
 } = require('./core');
@@ -33,6 +34,7 @@ const {
   unwrapWebDriverValue,
   webdriverCapabilities,
 } = require('./browser_support');
+const { bidiUnavailableError, captureFirefoxSession, extractBidiWebSocketUrl } = require('./firefox_bidi_support');
 
 const APP_TITLE = 'GLaDOS Account Center';
 const DEFAULT_REPO = 'NewBoringMan/Glados-Railgun-checkin';
@@ -68,6 +70,8 @@ function browserProfileDirectory(browserId, env = process.env) {
 }
 
 function captureFailureCode(error) {
+  if (error?.code === 'GLADOS_COOKIE_SCOPE_MISMATCH') return 'cookie_scope_mismatch';
+  if (error?.code === 'GLADOS_COOKIE_SCOPE_UNAVAILABLE') return 'cookie_scope_unavailable';
   if (error?.code === 'INCOMPLETE_API_IDENTITY') return 'missing_identity';
   if (error?.code === 'GLADOS_BROWSER_CONNECTION') return 'browser_connection';
   const message = String(error?.message || '');
@@ -314,6 +318,7 @@ async function startWebDriverBrowser(browser) {
     );
     sessionId = extractSessionId(response);
     if (!sessionId) throw new Error('浏览器驱动没有返回有效的自动化会话。');
+    const bidiUrl = extractBidiWebSocketUrl(response, sessionId);
     await localJsonRequest(
       port,
       'POST',
@@ -326,6 +331,7 @@ async function startWebDriverBrowser(browser) {
       browser,
       port,
       sessionId,
+      bidiUrl,
       close: async () => {
         try {
           if (sessionId) {
@@ -338,6 +344,8 @@ async function startWebDriverBrowser(browser) {
   } catch (error) {
     const diagnostics = driverProcess.diagnostics();
     driverProcess.stop();
+    if (error?.code === 'GLADOS_COOKIE_SCOPE_UNAVAILABLE') throw error;
+    if (/webSocketUrl|\bBiDi\b/i.test(String(error?.message || ''))) throw bidiUnavailableError();
     throw new Error(`${error.message}${diagnostics ? `\n${diagnostics}` : ''}`);
   }
 }
@@ -784,33 +792,25 @@ async function acquireCookieFromCDP(session) {
     return normalizeBrowserContext(response.result?.value, page.host);
   };
   const before = await readContext();
-  const result = await cdpCall(selectedTab.webSocketDebuggerUrl, 'Network.getCookies', { urls: [`${page.origin}/api/user/status`] });
+  const parts = await readCDPSessionCookies(page.pageUrl, selectedTab.webSocketDebuggerUrl);
   const after = await readContext();
   assertSameBrowserContext(before, after);
-  const parts = selectSessionCookies(result.cookies, page.host);
   const cookieHeader = composeCookieHeader(parts);
   return { cookieHeader, parts, ...after, capturedAt: new Date().toISOString() };
 }
 
+async function readCDPSessionCookies(pageUrl, websocket, call = cdpCall) {
+  const page = validatePinnedPage(pageUrl);
+  const result = await call(websocket, 'Network.getCookies', { urls: MANUAL_SESSION_PATHS.map((requestPath) => `${page.origin}${requestPath}`) });
+  return selectReusableSessionCookies(result.cookies, page.host);
+}
+
 async function acquireCookieFromWebDriver(session) {
-  const encoded = encodeURIComponent(session.sessionId);
-  const currentUrlResponse = await localJsonRequest(session.port, 'GET', `/session/${encoded}/url`, null, 15000);
-  const currentUrl = String(unwrapWebDriverValue(currentUrlResponse) || '');
-  const page = validatePinnedPage(currentUrl, expectedCaptureIdentity().host);
-  const readContext = async () => {
-    const response = await localJsonRequest(session.port, 'POST', `/session/${encoded}/execute/sync`, {
-      script: 'return {userAgent:navigator.userAgent,pageUrl:location.href};', args: [],
-    }, 15000);
-    return normalizeBrowserContext(unwrapWebDriverValue(response), page.host);
-  };
-  const before = await readContext();
-  const cookiesResponse = await localJsonRequest(session.port, 'GET', `/session/${encoded}/cookie`, null, 15000);
-  const cookies = unwrapWebDriverValue(cookiesResponse);
-  const after = await readContext();
-  assertSameBrowserContext(before, after);
-  const parts = selectSessionCookies(cookies, page.host);
-  const cookieHeader = composeCookieHeader(parts);
-  return { cookieHeader, parts, ...after, capturedAt: new Date().toISOString() };
+  return captureFirefoxSession(session, {
+    expectedHost: expectedCaptureIdentity().host,
+    webdriver: (method, endpoint) => localJsonRequest(session.port, method, endpoint, null, 15000),
+    request: (websocket, payload) => new MinimalWebSocket(websocket).request(payload, 12000),
+  });
 }
 
 function normalizeBrowserContext(value, expectedHost = '') {
@@ -850,6 +850,7 @@ async function verifyCookie(host, cookieHeader, userAgent, parts, options = {}) 
   const page = validatePinnedPage(`https://${host}/console/checkin`, options.expectedHost || '');
   const actualUserAgent = normalizeUserAgent(userAgent);
   if (composeCookieHeader(parts) !== cookieHeader) throw new Error('登录 Cookie 与本次手动读取的会话不一致。');
+  selectReusableSessionCookies(parts.cookies, page.host);
   const fetchImpl = options.fetchImpl || fetch;
   const readIdentityEndpoint = async (endpoint) => {
     const controller = new AbortController();
@@ -892,6 +893,7 @@ function buildCapturePayload(acquired, verified, browser, capturedAt = acquired.
   const page = validatePinnedPage(acquired.pageUrl || `https://${acquired.host}/console/checkin`, acquired.host);
   if (typeof capturedAt !== 'string' || !Number.isFinite(Date.parse(capturedAt))) throw new Error('读取时间无效。');
   if (composeCookieHeader(acquired.parts) !== acquired.cookieHeader) throw new Error('登录 Cookie 与手动读取结果不一致。');
+  selectReusableSessionCookies(acquired.parts.cookies, page.host);
   return {
     accountKey: verified.accountKey,
     secretName: verified.secretName,
@@ -1366,4 +1368,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, expectedCaptureIdentity, normalizeBrowserContext, verifyCookie };
+module.exports = { assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, expectedCaptureIdentity, normalizeBrowserContext, readCDPSessionCookies, verifyCookie };

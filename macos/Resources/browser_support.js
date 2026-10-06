@@ -147,6 +147,7 @@ function webdriverCapabilities(browser, binaryPath) {
       capabilities: {
         alwaysMatch: {
           browserName: 'firefox',
+          webSocketUrl: true,
           acceptInsecureCerts: false,
           'moz:firefoxOptions': firefoxOptions,
         },

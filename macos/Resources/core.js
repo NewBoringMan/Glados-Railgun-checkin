@@ -3,6 +3,8 @@
 const crypto = require('crypto');
 
 const ALLOWED_HOSTS = ['glados.cloud', 'glados.network', 'glados.rocks', 'glados.one', 'glados.space', 'glados.vip', 'glados-facility.com', 'railgun.info'];
+// The single Cookie header in manual-session v1 is reused by status.py/checkin.py.
+const MANUAL_SESSION_PATHS = Object.freeze(['/api/user/status', '/api/user/session', '/api/user/points', '/api/user/checkin', '/api/user/exchange']);
 const MAX_COOKIE_HEADER_BYTES = 32 * 1024;
 const ACCOUNT_SECRET_PREFIX = 'GLADOS_ACCOUNT_';
 const MANAGED_WORKFLOW_NAME = 'gladosAccounts.yml';
@@ -105,6 +107,28 @@ function composeCookieHeader(parts) {
   const header = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
   if (Buffer.byteLength(header, 'utf8') > MAX_COOKIE_HEADER_BYTES) throw new Error('Cookie 总长度异常，已停止读取。');
   return header;
+}
+
+function cookieScopeError() {
+  const error = new Error('各接口适用的登录 Cookie 不一致，当前保存格式无法安全复用，已停止且未保存。请保留原网页登录。');
+  error.code = 'GLADOS_COOKIE_SCOPE_MISMATCH';
+  return error;
+}
+
+function selectReusableSessionCookies(cookies, host, options = {}) {
+  // Input must cover every path above (CDP URLs or the extension's explicit reads).
+  // Never concatenate the union into a header: independently select each path.
+  const nowMs = options.nowMs ?? Date.now();
+  const first = selectSessionCookies(cookies, host, { nowMs, requestPath: MANUAL_SESSION_PATHS[0] });
+  const canonical = (parts) => JSON.stringify(parts.cookies.map(({ name, value }) => [name, value]).sort((a, b) => a[0].localeCompare(b[0])));
+  const expected = canonical(first);
+  for (const requestPath of MANUAL_SESSION_PATHS.slice(1)) {
+    let next;
+    try { next = selectSessionCookies(cookies, host, { nowMs, requestPath }); }
+    catch { throw cookieScopeError(); }
+    if (canonical(next) !== expected) throw cookieScopeError();
+  }
+  return first;
 }
 
 function parseGitHubRepo(urlText) {
@@ -379,6 +403,7 @@ module.exports = {
   ACCOUNT_SECRET_PREFIX,
   ALLOWED_HOSTS,
   MANAGED_WORKFLOW_NAME,
+  MANUAL_SESSION_PATHS,
   accountKeyFromSecretName,
   accountSecretNameFromSession,
   accountSecretNameFromUserId,
@@ -396,6 +421,7 @@ module.exports = {
   parseGitHubRepo,
   redact,
   selectSessionCookies,
+  selectReusableSessionCookies,
   summarizeRunLog,
   validatePinnedPage,
 };

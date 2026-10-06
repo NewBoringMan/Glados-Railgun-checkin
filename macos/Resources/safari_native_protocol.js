@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { composeCookieHeader, normalizeUserAgent, selectSessionCookies, validatePinnedPage } = require('./core');
+const { composeCookieHeader, normalizeUserAgent, selectReusableSessionCookies, validatePinnedPage } = require('./core');
 
 const TOKEN_PATTERN = /^[a-f0-9]{64}$/i;
 const MIN_PORT = 1024;
@@ -39,7 +39,7 @@ function normalizeSafariNativeCapture(payload, expectedToken, expectedPort, expe
   const page = validatePinnedPage(payload.pageUrl, host);
   const userAgent = normalizeUserAgent(payload.userAgent);
   if (!Array.isArray(payload.cookies) || payload.cookies.length > 256) throw new Error('Safari 扩展没有返回完整 Cookie 列表。');
-  const parts = selectSessionCookies(payload.cookies, host);
+  const parts = selectReusableSessionCookies(payload.cookies, host);
   const capturedAt = new Date().toISOString();
   return {
     host,
