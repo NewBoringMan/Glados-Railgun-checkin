@@ -445,20 +445,31 @@ final class LocalManualAccountStore: @unchecked Sendable {
     func workflowRecords() throws -> [WorkflowRunReceipt] {
         try locked { Array((try load().workflowReceipts ?? [:]).values).sorted { $0.dispatchedAt > $1.dispatchedAt } }
     }
-    /// Persist intent before a dispatch can leave this process. Unresolved intent
-    /// is reused even after a new capture, so a failed GET cannot cause a POST.
-    func prepareWorkflow(_ workflow: String, account: String) throws -> (WorkflowRunReceipt, Bool) {
+    /// Persist intent before a dispatch can leave this process. Only an explicit
+    /// user refresh may replace an unidentified, read-only status query.
+    func prepareWorkflow(_ workflow: String, account: String, replaceUnidentifiedStatus: Bool = false) throws -> (WorkflowRunReceipt, Bool) {
         try locked {
+            guard !replaceUnidentifiedStatus || workflow == "gladosStatus.yml" else { throw WorkflowReceiptError.identity }
             var index = try load()
             var receipts = index.workflowReceipts ?? [:]
-            if let existing = receipts.values.filter({ $0.workflow == workflow && $0.account == account && !$0.queryState.finished }).sorted(by: { $0.dispatchedAt > $1.dispatchedAt }).first {
+            let unresolved = receipts.values.filter { $0.workflow == workflow && $0.account == account && !$0.isResolved }
+            // A known task always resumes by ID, including after a user refresh.
+            if let bound = unresolved.filter({ $0.runID != nil }).sorted(by: { $0.dispatchedAt > $1.dispatchedAt }).first {
+                return (bound, false)
+            }
+            if !replaceUnidentifiedStatus, let existing = unresolved.sorted(by: { $0.dispatchedAt > $1.dispatchedAt }).first {
                 return (existing, false)
             }
             let current = index.accounts[account]
             let receipt = WorkflowRunReceipt(workflow: workflow, account: account, credentialID: current?.publicationState == "acknowledged" ? current?.credentialID : nil)
             try receipt.validate()
+            for var old in unresolved {
+                old.supersededBy = receipt.id
+                try old.validate()
+                receipts[old.id] = old
+            }
             if receipts.count >= 2000 {
-                guard let oldest = receipts.values.filter({ $0.queryState.finished }).min(by: { $0.dispatchedAt < $1.dispatchedAt }) else { throw ManualAccountError.storage }
+                guard let oldest = receipts.values.filter({ $0.isResolved && $0.supersededBy != receipt.id }).min(by: { $0.dispatchedAt < $1.dispatchedAt }) else { throw ManualAccountError.storage }
                 receipts.removeValue(forKey: oldest.id)
             }
             receipts[receipt.id] = receipt; index.workflowReceipts = receipts; try save(index)
@@ -471,7 +482,9 @@ final class LocalManualAccountStore: @unchecked Sendable {
             var index = try load()
             guard let old = index.workflowReceipts?[receipt.id], old.workflow == receipt.workflow,
                   old.account == receipt.account, old.dispatchedAt == receipt.dispatchedAt,
-                  old.credentialID == receipt.credentialID, old.runID == nil || old.runID == receipt.runID else { throw WorkflowReceiptError.identity }
+                  old.credentialID == receipt.credentialID, old.runID == nil || old.runID == receipt.runID,
+                  old.supersededBy == nil, receipt.supersededBy == nil,
+                  !old.dispatchAcknowledged || receipt.dispatchAcknowledged else { throw WorkflowReceiptError.identity }
             index.workflowReceipts?[receipt.id] = receipt; try save(index)
         }
     }

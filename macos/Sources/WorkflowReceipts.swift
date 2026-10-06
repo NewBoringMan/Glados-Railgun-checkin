@@ -1,7 +1,7 @@
 import Foundation
 
 enum WorkflowReceiptError: LocalizedError, Equatable {
-    case identity, protocolError, interrupted, missingRunID, dispatchUncertain
+    case identity, protocolError, interrupted, missingRunID, dispatchUncertain, statusDispatchUncertain
     var errorDescription: String? {
         switch self {
         case .identity: return "任务归属未通过核对。已保存的登录资料和发布回执保留；未重新派发任务。"
@@ -9,6 +9,7 @@ enum WorkflowReceiptError: LocalizedError, Equatable {
         case .interrupted: return "GitHub 查询暂未完成。可重查已有任务；本机登录资料和发布状态未改变。"
         case .missingRunID: return "此次派发未返回可核对的任务编号。请在运行记录中指定原任务编号；应用不会自动再次派发。"
         case .dispatchUncertain: return "此次任务派发结果尚不确定。回执已保存在本机，请重查原任务；应用不会自动再次派发。"
+        case .statusDispatchUncertain: return "此次刷新尚未取得可核对的任务编号。可以再次手动刷新；本机账号和登录资料已保留。"
         }
     }
 }
@@ -28,8 +29,14 @@ struct WorkflowRunReceipt: Codable, Equatable, Identifiable, Sendable {
     var dispatchAcknowledged = false
     var queryState: WorkflowQueryState = .pending
     var conclusion: String?
+    // Optional metadata keeps existing receipt files readable. The original
+    // unknown query remains unknown; replacement does not claim it failed.
+    var supersededBy: String?
+    var isResolved: Bool { queryState.finished || supersededBy != nil }
+    var retryTitle: String { workflow == "gladosStatus.yml" && runID == nil ? "重新刷新" : "重查已有任务" }
     var title: String { workflow == "gladosStatus.yml" ? "资料查询" : "手动签到" }
     var stateText: String {
+        if supersededBy != nil { return "已由新的资料查询替代" }
         switch queryState {
         case .succeeded: return workflow == "gladosStatus.yml" ? "资料查询任务成功（非签到认证）" : "签到任务成功"
         case .failed: return "任务已完成，结果需要处理"
@@ -47,6 +54,10 @@ struct WorkflowRunReceipt: Codable, Equatable, Identifiable, Sendable {
         if let credentialID {
             guard account != "all", credentialID.hasPrefix(account + "."), UUID(uuidString: String(credentialID.dropFirst(17))) != nil else { throw WorkflowReceiptError.protocolError }
         }
+        if let supersededBy {
+            guard workflow == "gladosStatus.yml", runID == nil, !queryState.finished,
+                  conclusion == nil, supersededBy != id, UUID(uuidString: supersededBy) != nil else { throw WorkflowReceiptError.protocolError }
+        }
     }
 }
 
@@ -59,20 +70,27 @@ enum WorkflowRunRules {
         guard text.range(of: "^[1-9][0-9]{0,17}$", options: .regularExpression) != nil, let id = Int(text), validID(id) else { throw WorkflowReceiptError.protocolError }
         return id
     }
-    // Use only the URL returned by this dispatch. A recent matching run is not
-    // evidence that it belongs to this invocation.
-    static func dispatchedID(stdout: String, repository: String) throws -> Int {
-        let regex = try NSRegularExpression(pattern: "https://github\\.com/[^\\s<>\\\"']+/actions/runs/[0-9]+(?:[^\\s<>\\\"']*)")
-        let range = NSRange(stdout.startIndex..<stdout.endIndex, in: stdout)
-        var ids = Set<Int>()
-        for match in regex.matches(in: stdout, range: range) {
-            guard let range = Range(match.range, in: stdout), let url = URLComponents(string: String(stdout[range])),
-                  url.scheme == "https", url.host == "github.com", url.port == nil, url.user == nil, url.password == nil,
-                  url.query == nil, url.fragment == nil,
-                  url.path.hasPrefix("/\(repository)/actions/runs/") else { throw WorkflowReceiptError.identity }
-            ids.insert(try runID(String(url.path.dropFirst("/\(repository)/actions/runs/".count))))
+    // Consume the documented REST response from this POST, never optional CLI
+    // presentation text or a guessed recent run from another invocation.
+    static func dispatchedID(response: Data, repository: String) throws -> Int {
+        struct Dispatch: Decodable {
+            let workflow_run_id: Int
+            let run_url: String
+            let html_url: String
         }
-        guard ids.count == 1, let id = ids.first else { throw WorkflowReceiptError.missingRunID }
+        guard !response.isEmpty else { throw WorkflowReceiptError.missingRunID }
+        guard let value = try? JSONDecoder().decode(Dispatch.self, from: response), validID(value.workflow_run_id) else {
+            throw WorkflowReceiptError.protocolError
+        }
+        let id = value.workflow_run_id
+        for (text, host, path) in [
+            (value.run_url, "api.github.com", "/repos/\(repository)/actions/runs/\(id)"),
+            (value.html_url, "github.com", "/\(repository)/actions/runs/\(id)")
+        ] {
+            guard let url = URLComponents(string: text), url.scheme == "https", url.host == host,
+                  url.port == nil, url.user == nil, url.password == nil, url.query == nil,
+                  url.fragment == nil, url.path == path else { throw WorkflowReceiptError.identity }
+        }
         return id
     }
     struct Run: Decodable {

@@ -15,8 +15,10 @@ NATIVE_TEST_ARCH="$(uname -m)"
     -framework Foundation -framework Security -framework CryptoKit -lsqlite3 \
     "$ROOT/macos/Sources/ManualAccountStore.swift" \
     "$ROOT/macos/Sources/WorkflowReceipts.swift" \
+    "$ROOT/macos/Sources/WorkflowRunClient.swift" \
     "$ROOT/macos/Tests/manual_accounts_native.swift" \
     "$ROOT/macos/Tests/workflow_receipts_native.swift" \
+    "$ROOT/macos/Tests/workflow_run_client_native.swift" \
     -o "$NATIVE_TEST_DIR/manual-accounts-tests"
 
 "$NATIVE_TEST_DIR/manual-accounts-tests" "$NATIVE_TEST_DIR/isolated-fixtures"
