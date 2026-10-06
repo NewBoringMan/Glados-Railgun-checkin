@@ -67,9 +67,16 @@ struct ManualAccountsNativeTests {
         try rejects("reject partial session pair") { _ = try bad.validated() }
         bad = first; bad.cookieHeader += "; locale=zh"
         try rejects("reject duplicate cookies") { _ = try bad.validated() }
+        var compatible = first; compatible.cookieHeader = "gld:sess=x; gld:sess.sig=y; koa:sess=old; locale="
+        try expect(compatible.validated().cookieHeader == compatible.cookieHeader, "complete gld accepts residual koa half-pair and empty auxiliary value")
+        bad = first; bad.cookieHeader = "gld:sess=; gld:sess.sig=y; koa:sess=x; koa:sess.sig=z"
+        try rejects("empty current session cannot fall back to legacy pair") { _ = try bad.validated() }
+        bad = first; bad.cookieHeader = "koa:sess=x; locale="
+        try rejects("legacy-only session still requires both nonempty values") { _ = try bad.validated() }
 
         try store.saveCapture(first, label: "GLaDOS fixture", enabled: true, autoExchange: false, pendingPublication: true)
         try expect(store.session(for: firstKey) == first, "manual capture locally recoverable")
+        try expect(store.records()[firstKey]?.allowsManualCredentialReplacement == true, "explicit capture may replace the same registered account")
         let metadataURL = directory.appendingPathComponent("accounts.json")
         let before = try Data(contentsOf: metadataURL)
         try expect(!String(decoding: before, as: UTF8.self).contains("fixture-session"), "metadata has no cookie")
@@ -77,6 +84,7 @@ struct ManualAccountsNativeTests {
         try expect(permissions?.intValue == 0o600, "owner-only metadata")
         let reopened = try LocalManualAccountStore(directory: directory, vault: vault)
         try expect(reopened.records()[firstKey]?.email == first.email, "email persists across reopen")
+        try expect(reopened.records()[firstKey]?.sessionHost == first.host, "verified host persists for subsequent explicit browser actions")
         try rejects("blank failure cannot clear identity") { try store.rememberEmail(key: firstKey, email: "", verified: false) }
         bad = first; bad.email = "wrong@example.test"
         try rejects("capture cannot replace another email") { try store.saveCapture(bad, label: "fixture", enabled: true, autoExchange: true, pendingPublication: true) }
@@ -89,6 +97,8 @@ struct ManualAccountsNativeTests {
         let third = session(thirdKey, email: "third@example.test")
         let distinct = ManualArchiveContents(accounts: [account(second), account(third)])
         let plan = try ManualImportPlan.make(distinct, existing: [firstKey: first.email])
+        let secretOnly = try ManualImportPlan.make(ManualArchiveContents(accounts: [account(second)]), existing: [:], additionalKeys: [secondKey])
+        try expect(secretOnly.additions.isEmpty && secretOnly.skipped == 1, "secret-only cloud records are existing accounts even without workflow config")
         vault.failAt = vault.additions + 2
         try rejects("batch storage failure") { _ = try store.applyImport(plan, externalKeys: []) }
         try expect(Data(contentsOf: metadataURL) == before, "failed batch preserves every old record")
@@ -96,6 +106,13 @@ struct ManualAccountsNativeTests {
         vault.failAt = nil
         let applied = try store.applyImport(plan, externalKeys: [])
         try expect(applied.count == 2 && store.records().count == 3, "only new accounts added")
+        try expect(store.records()[secondKey]?.credentialSource == "import" && store.records()[secondKey]?.allowsManualCredentialReplacement == false, "import never authorizes replacement of existing cloud secrets")
+        try store.markPublicationSkipped([secondKey])
+        try expect(store.records()[secondKey]?.pendingPublication == false && store.records()[secondKey]?.publicationSkipped == true, "concurrent cloud registration disables imported credential retry")
+        var legacyRecord = ManualAccountRecord(accountKey: thirdKey, label: "fixture")
+        legacyRecord.pendingPublication = true
+        let sourceLess = try JSONDecoder().decode(ManualAccountRecord.self, from: JSONEncoder().encode(legacyRecord))
+        try expect(!sourceLess.allowsManualCredentialReplacement, "old source-less metadata remains readable and never grants replacement permission")
         try expect(store.session(for: firstKey) == first, "import leaves original credential untouched")
         let conflicted = ManualArchiveContents(accounts: [account(session("DDDDDDDDDDDDDDDD", email: first.email))])
         try rejects("reject cross-account email conflicts") { _ = try ManualImportPlan.make(conflicted, existing: [firstKey: first.email]) }
@@ -111,6 +128,7 @@ struct ManualAccountsNativeTests {
         try expect(vault.legacy["active-" + firstKey] == oldJSON, "old keychain source left intact")
 
         let password = "fixture-password-2026"
+        try rejects("short multibyte password is not twelve characters") { _ = try ManualArchiveCrypto.encrypt(contents, password: "密码四字") }
         let encrypted = try ManualArchiveCrypto.encrypt(contents, password: password)
         let decoded = try ManualArchiveCrypto.decrypt(encrypted, password: password)
         try expect(decoded.accounts == contents.accounts, "encrypted backup lossless roundtrip")

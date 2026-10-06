@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo
 
 from checkin import (
     AuthenticationError, ChallengeError, DEFAULT_DOMAINS, GladosAPI, NetworkError,
-    ProtocolError, IdentityMismatchError, error_kind, is_terminal_session_error, safe_payload_summary,
+    ProtocolError, IdentityMismatchError, error_kind, is_terminal_session_error,
+    result_for_action_log, safe_payload_summary,
 )
 from session_context import SessionContextError, parse_session
 
@@ -376,7 +377,7 @@ def main() -> int:
         if value.strip()
     )
     result = _error_result(account_key, "", "GLADOS_COOKIES 为空") if not cookie else read_status(cookie, account_key, domains)
-    print("GLADOS_STATUS_JSON=" + json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    print("GLADOS_STATUS_JSON=" + json.dumps(result_for_action_log(result, cookie), ensure_ascii=False, separators=(",", ":")))
     return 0 if result["ok"] else 1
 
 

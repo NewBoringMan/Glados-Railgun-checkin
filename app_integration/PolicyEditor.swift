@@ -82,7 +82,7 @@ private enum PolicyEmailDirectory {
         // Reading this directory never opens the credential vault or changes it.
         if let data = boundedData(at: manualAccountsURL),
            let directory = try? decoder.decode(ManualDirectory.self, from: data),
-           directory.version == 1, directory.accounts.count <= 500 {
+           directory.version == 1, directory.accounts.count <= 1000 {
             for (dictionaryKey, entry) in directory.accounts {
                 guard let key = normalizedKey(dictionaryKey), dictionaryKey == key, entry.accountKey == key,
                       let email = normalizedEmail(entry.email) else { continue }

@@ -1,11 +1,15 @@
 import json
+import io
+import os
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import status
 from checkin import (
     AuthenticationRejected, ChallengeError, Config, DeviceMismatchError,
-    ExchangePlan, GladosAPI, IdentityMismatchError, NetworkError, run_one_account,
+    ExchangePlan, GladosAPI, IdentityMismatchError, IdentityUnverifiedError,
+    NetworkError, ProtocolError, result_for_action_log, run_one_account,
 )
 from session_context import (
     SessionContextError, account_key_from_user_id, parse_session, split_sessions,
@@ -38,6 +42,10 @@ class Response:
         if self.payload is None:
             raise ValueError("synthetic non-JSON response")
         return self.payload
+
+
+def verified_identity():
+    return Response({"code": 0, "data": {"userId": "synthetic-manual-account", "email": "synthetic@example.com"}})
 
 
 class Session:
@@ -84,7 +92,7 @@ class ManualContextTests(unittest.TestCase):
     def test_context_validation_rejects_incomplete_or_unsafe_data(self):
         invalid_cases = [
             {"cookieHeader": "gld:sess=only-half"},
-            {"cookieHeader": "gld:sess=a; gld:sess.sig=b; koa:sess=only-half"},
+            {"cookieHeader": "gld:sess=a; koa:sess=legacy; koa:sess.sig=signature"},
             {"cookieHeader": "gld:sess=a; gld:sess.sig=b; gld:sess=c"},
             {"cookieHeader": "gld:sess=a\r\nX-Leak: value; gld:sess.sig=b"},
             {"userAgent": ""}, {"userAgent": "browser\nX-Forged: 1"},
@@ -96,6 +104,10 @@ class ManualContextTests(unittest.TestCase):
         for override in invalid_cases:
             with self.subTest(field=next(iter(override))), self.assertRaises(SessionContextError):
                 parse_session(packet(**override))
+
+    def test_complete_gld_tolerates_residual_koa_and_empty_non_session_cookies(self):
+        header = "gld:sess=a; gld:sess.sig=b; koa:sess=old-half; preference="
+        self.assertEqual(parse_session(packet(cookieHeader=header)).cookie_header, header)
 
     def test_wrong_account_is_rejected_before_any_request(self):
         calls = []
@@ -122,11 +134,23 @@ class ManualContextTests(unittest.TestCase):
 
 
 class ManualAuthenticationTests(unittest.TestCase):
+    def test_new_local_email_is_not_published_in_github_action_result(self):
+        original = {"email": "synthetic@example.com", "points_total": 9, "ok": True}
+        stream = io.StringIO()
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(stream):
+            public = result_for_action_log(original, packet())
+        self.assertEqual(public["email"], "")
+        self.assertEqual(public["points_total"], 9)
+        self.assertEqual(original["email"], "synthetic@example.com")
+        self.assertIn("::add-mask::", stream.getvalue())
+
     def test_actual_browser_ua_cookie_origin_and_no_redirects(self):
-        session = Session([Response({"code": 1, "message": "already"})])
+        session = Session([verified_identity(), Response({"code": 1, "message": "already"})])
         api = GladosAPI("glados.cloud", packet(), session=session)
         api.checkin()
-        request = session.calls[0][2]
+        request = session.calls[1][2]
+        self.assertEqual(session.calls[0][:2], ("GET", "https://glados.cloud/api/user/status"))
+        self.assertEqual(session.calls[1][0], "POST")
         self.assertEqual(request["headers"]["user-agent"], "Synthetic browser / 1.0")
         self.assertIn("opaque&test=1", request["headers"]["cookie"])
         self.assertEqual(request["headers"]["origin"], "https://glados.cloud")
@@ -146,21 +170,21 @@ class ManualAuthenticationTests(unittest.TestCase):
         self.assertNotIn("缺少 points", str(caught.exception))
 
     def test_device_mismatch_reason_survives_even_with_http_403(self):
-        session = Session([Response({"code": -2, "message": "No permission", "reason": "device-mismatch"}, status_code=403)])
+        session = Session([verified_identity(), Response({"code": -2, "message": "No permission", "reason": "device-mismatch"}, status_code=403)])
         api = GladosAPI("glados.cloud", packet(), session=session)
         with self.assertRaises(DeviceMismatchError):
             api.checkin()
-        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(len(session.calls), 2)
 
     def test_anti_automation_and_browser_challenge_stop_without_retry(self):
         for response in [
             Response({"code": -2, "message": "Automated check-in detected"}),
             Response(status_code=403, text="<html>Cloudflare challenge</html>"),
         ]:
-            session = Session([response])
+            session = Session([verified_identity(), response])
             with self.subTest(response=response.status_code), self.assertRaises(ChallengeError):
                 GladosAPI("glados.cloud", packet(), session=session).checkin()
-            self.assertEqual(len(session.calls), 1)
+            self.assertEqual(len(session.calls), 2)
 
     def test_redirect_is_not_followed(self):
         session = Session([Response(status_code=302, text="")])
@@ -225,6 +249,7 @@ class ManualAuthenticationTests(unittest.TestCase):
 
     def test_successful_checkin_auth_error_stops_further_exchange_requests(self):
         session = Session([
+            verified_identity(),
             Response({"code": 0, "message": "ok", "points": 1}),
             Response({"code": -2, "reason": "device-mismatch"}),
         ])
@@ -236,7 +261,7 @@ class ManualAuthenticationTests(unittest.TestCase):
         self.assertEqual(result.checkin, "success")
         self.assertEqual(result.error_kind, "device_mismatch")
         self.assertEqual(result.exchange, "check_failed")
-        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(len(session.calls), 3)
         self.assertFalse(result.success)
 
     def test_optional_status_identity_conflict_cannot_be_downgraded_to_warning(self):
@@ -252,6 +277,7 @@ class ManualAuthenticationTests(unittest.TestCase):
 
     def test_checkin_optional_status_identity_conflict_is_visible(self):
         session = Session([
+            verified_identity(),
             Response({"code": 1, "message": "already"}),
             Response({"points": 9}),
             Response({"data": {"userId": "different-synthetic-account"}}),
@@ -285,12 +311,54 @@ class ManualAuthenticationTests(unittest.TestCase):
         self.assertIn("[redacted]", result["error"])
 
     def test_api_diagnostics_redact_cookie_values_and_email(self):
-        session = Session([Response({"code": 88, "message": "invalid opaque&test=1 for synthetic@example.com"})])
+        session = Session([verified_identity(), Response({"code": 88, "message": "invalid opaque&test=1 for synthetic@example.com"})])
         api = GladosAPI("glados.cloud", packet(), session=session)
-        with self.assertRaises(Exception) as caught:
+        with self.assertRaises(ProtocolError) as caught:
             api.checkin()
         self.assertNotIn("opaque&test=1", str(caught.exception))
         self.assertNotIn("synthetic@example.com", str(caught.exception))
+
+    def test_imported_cookie_identity_is_checked_before_any_write(self):
+        session = Session([Response({"code": 0, "data": {"userId": "another-account", "email": "other@example.com"}})])
+        api = GladosAPI("glados.cloud", packet(), session=session)
+        with self.assertRaises(IdentityMismatchError):
+            api.checkin()
+        self.assertTrue(all(method == "GET" for method, _, _ in session.calls))
+
+    def test_confirmed_session_endpoint_can_complete_missing_status_identity(self):
+        session = Session([
+            Response({"code": 0, "data": {"email": "synthetic@example.com"}}),
+            Response({"code": 0, "user": {"id": "synthetic-manual-account"}}),
+            Response({"code": 1, "message": "already"}),
+        ])
+        result = GladosAPI("glados.cloud", packet(), session=session).checkin()
+        self.assertEqual(result["state"], "already")
+        self.assertEqual([url.rsplit("/", 1)[-1] for _, url, _ in session.calls], ["status", "session", "checkin"])
+        self.assertTrue(all(call[2]["headers"]["cookie"] == parse_session(packet()).cookie_header for call in session.calls))
+
+    def test_missing_identity_does_not_trigger_checkin_or_exchange(self):
+        for action in (lambda api: api.checkin(), lambda api: api.exchange("plan500")):
+            session = Session([Response({"code": 0, "data": {"email": "synthetic@example.com"}}), Response({"code": 0})])
+            api = GladosAPI("glados.cloud", packet(), session=session)
+            with self.assertRaises(IdentityUnverifiedError):
+                action(api)
+            self.assertTrue(all(method == "GET" for method, _, _ in session.calls))
+
+    def test_identity_fallback_never_bypasses_explicit_refusal(self):
+        session = Session([Response({"code": -2, "reason": "device-mismatch"})])
+        with self.assertRaises(DeviceMismatchError):
+            GladosAPI("glados.cloud", packet(), session=session).checkin()
+        self.assertEqual(len(session.calls), 1)
+
+    def test_session_identity_conflict_or_unconfirmed_code_is_terminal(self):
+        for second in (
+            Response({"code": 0, "user": {"id": "different-account"}}),
+            Response({"user": {"id": "synthetic-manual-account"}}),
+        ):
+            session = Session([Response({"code": 0, "email": "synthetic@example.com"}), second])
+            with self.assertRaises((IdentityMismatchError, IdentityUnverifiedError)):
+                GladosAPI("glados.cloud", packet(), session=session).checkin()
+            self.assertTrue(all(method == "GET" for method, _, _ in session.calls))
 
 
 if __name__ == "__main__":

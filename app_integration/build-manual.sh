@@ -22,7 +22,7 @@ if [[ "$OUTPUT_APP" != *.app ]]; then
   exit 2
 fi
 
-# Resolve Finder aliases implemented as symlinks before copying. Neither build
+# Resolve App symlink paths before copying. Neither build
 # scratch space nor the final output may be inside the inspected source bundle.
 SOURCE_APP="$(python3 - "$SCRIPT_DIR/install-manual.py" "$SOURCE_APP" "$OUTPUT_APP" "${TMPDIR:-/private/tmp}" <<'PY'
 import importlib.util, sys
@@ -197,16 +197,34 @@ SAFARI_PRODUCT="$SAFARI_TEMP/products/Release/GLaDOS Account Center Extension.ap
 EMBEDDED_SAFARI="$PLUGINS/GLaDOS Safari Bridge Extension.appex"
 /usr/bin/ditto "$SAFARI_PRODUCT" "$EMBEDDED_SAFARI"
 
-/usr/bin/codesign --force --sign - "$EMBEDDED_SAFARI"
+# xcodebuild signing is disabled above, so apply the extension's capabilities
+# explicitly. The native handler makes an outbound loopback TCP connection.
+# These entitlements belong to the extension, not to the containing App.
+SAFARI_ENTITLEMENTS="$BUILD_TMP/safari-entitlements.plist"
+python3 - "$SAFARI_ENTITLEMENTS" <<'PY'
+import plistlib, sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(plistlib.dumps({
+    'com.apple.security.app-sandbox':True,
+    'com.apple.security.network.client':True,
+}))
+PY
+/usr/bin/codesign --force --sign - --entitlements "$SAFARI_ENTITLEMENTS" --generate-entitlement-der "$EMBEDDED_SAFARI"
 /usr/bin/codesign --force --sign - "$FRAMEWORKS/GLaDOSPolicyEditor.dylib"
 /usr/bin/codesign --force --sign - "$FRAMEWORKS/PolicyMenuPlugin.dylib"
 /usr/bin/codesign --force --sign - "$MACOS/GLaDOSAccountCenter.real"
 # Do not recursively re-sign preserved helpers or other unchanged nested code.
 /usr/bin/codesign --force --sign - "$STAGE_APP"
 /usr/bin/codesign --verify --deep --strict "$STAGE_APP"
-python3 - "$MACOS/RefreshSecretStore" "$BUILD_TMP/retained-helper.json" <<'PY'
-import hashlib, json, subprocess, sys
+python3 - "$MACOS/RefreshSecretStore" "$BUILD_TMP/retained-helper.json" "$EMBEDDED_SAFARI" <<'PY'
+import hashlib, json, plistlib, subprocess, sys
 from pathlib import Path
+signed=subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', sys.argv[3]],
+                      check=True, capture_output=True)
+entitlements=plistlib.loads(signed.stdout)
+if any(entitlements.get(key) is not True for key in (
+        'com.apple.security.app-sandbox', 'com.apple.security.network.client')):
+    raise SystemExit('The Safari extension is missing its sandbox or loopback client capability.')
 expected=json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
 if expected is not None:
     helper=Path(sys.argv[1])

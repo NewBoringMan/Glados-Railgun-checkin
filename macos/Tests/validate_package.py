@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import plistlib
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,6 +59,10 @@ def validate_bundle(app: Path) -> None:
     assert info["CFBundleExecutable"] == "GLaDOSAccountCenter"
     assert info["CFBundleVersion"] == "20017"
     assert "GLaDOSRefreshPython" not in info
+    origin = json.loads((contents / "Resources/manual-build-origin.json").read_text())
+    assert origin.get("schema") == "glados.manual-build-origin" and type(origin.get("version")) is int and origin["version"] == 1
+    source_hash = origin.get("sourceFingerprint")
+    assert source_hash is None or (isinstance(source_hash, str) and re.fullmatch(r"[a-f0-9]{64}", source_hash))
     for name in (
         "MacOS/GLaDOSAccountCenter", "MacOS/GLaDOSAccountCenter.real",
         "Frameworks/PolicyMenuPlugin.dylib", "Frameworks/GLaDOSPolicyEditor.dylib",

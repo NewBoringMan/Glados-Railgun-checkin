@@ -59,6 +59,26 @@ function initialLoginUrl() {
   return `https://${expectedCaptureIdentity().host || 'glados.cloud'}/console/checkin`;
 }
 
+function browserProfileDirectory(browserId, env = process.env) {
+  if (!BROWSERS.some((browser) => browser.id === browserId && browser.kind === 'cdp')) throw new Error('浏览器资料目录无效。');
+  const { accountKey } = expectedCaptureIdentity(env);
+  return accountKey
+    ? path.join(SUPPORT_DIR, 'BrowserProfiles', 'accounts', accountKey, browserId)
+    : path.join(SUPPORT_DIR, 'BrowserProfiles', browserId);
+}
+
+function captureFailureCode(error) {
+  if (error?.code === 'INCOMPLETE_API_IDENTITY') return 'missing_identity';
+  if (error?.code === 'GLADOS_BROWSER_CONNECTION') return 'browser_connection';
+  const message = String(error?.message || '');
+  if (/账号.*不一致|身份不一致|相互冲突|原账号绑定的域名不一致|原域名不一致/.test(message)) return 'identity_mismatch';
+  if (/Safari.*扩展.*缺失|桥接组件缺失/.test(message)) return 'safari_extension_unavailable';
+  if (/拒绝.*认证|拒绝当前登录设备|缺少.*Cookie|缺少完整的.*登录会话/.test(message)) return 'verification_required';
+  if (/Native Messaging 桥接|浏览器调试接口|浏览器驱动/.test(message)) return 'browser_connection';
+  if (/取消/.test(message)) return 'cancelled';
+  return 'invalid_capture';
+}
+
 function run(command, args, options = {}) {
   return childProcess.spawnSync(command, args, {
     encoding: options.encoding || 'utf8',
@@ -147,10 +167,13 @@ function ensureDir(dir) {
 
 function launchControlledBrowser(browser, port) {
   ensureDir(SUPPORT_DIR);
-  const profileDir = path.join(SUPPORT_DIR, 'BrowserProfiles', browser.id);
+  const profileDir = browserProfileDirectory(browser.id);
   ensureDir(profileDir);
+  const executable = firstExistingPath(browser.paths);
+  if (!executable) throw new Error('所选浏览器当前不可用。');
+  const appPath = executable.split('/Contents/MacOS/')[0];
   const args = [
-    '-na', browser.appName,
+    '-na', appPath,
     '--args',
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
@@ -524,9 +547,14 @@ function openSafariExtensionSetup() {
 async function startBrowserSession(browser) {
   if (browser.kind === 'safari-extension') return startSafariExtensionSession(browser);
   if (browser.kind === 'cdp') {
-    const port = browser.preferredPort;
+    const port = await allocateLocalBrowserPort();
     launchControlledBrowser(browser, port);
-    await waitForCDP(port, 45000);
+    try { await waitForCDP(port, 45000); }
+    catch {
+      const error = new Error('浏览器连接失败。请自行退出该账号的专用浏览器实例，再手动重新读取登录信息；账号登录状态尚未验证。');
+      error.code = 'GLADOS_BROWSER_CONNECTION';
+      throw error;
+    }
     return {
       kind: 'cdp',
       browser,
@@ -536,6 +564,21 @@ async function startBrowserSession(browser) {
   }
   if (browser.kind === 'webdriver') return startWebDriverBrowser(browser);
   throw new Error(`不支持的浏览器连接方式：${browser.kind}`);
+}
+
+function allocateLocalBrowserPort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', () => {
+      const error = new Error('无法建立本机浏览器读取连接。');
+      error.code = 'GLADOS_BROWSER_CONNECTION';
+      reject(error);
+    });
+    probe.listen(0, '127.0.0.1', () => {
+      const port = probe.address().port;
+      probe.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
 }
 
 async function waitForCDP(port, timeoutMs = 30000) {
@@ -808,30 +851,41 @@ async function verifyCookie(host, cookieHeader, userAgent, parts, options = {}) 
   const actualUserAgent = normalizeUserAgent(userAgent);
   if (composeCookieHeader(parts) !== cookieHeader) throw new Error('登录 Cookie 与本次手动读取的会话不一致。');
   const fetchImpl = options.fetchImpl || fetch;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const readIdentityEndpoint = async (endpoint) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetchImpl(`${page.origin}${endpoint}`, {
+        method: 'GET',
+        redirect: 'error',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          cookie: cookieHeader,
+          origin: page.origin,
+          referer: `${page.origin}/console/checkin`,
+          'user-agent': actualUserAgent,
+        },
+        signal: controller.signal,
+      });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`GLaDOS 只读身份接口返回 HTTP ${response.status}。`);
+      try { return JSON.parse(body); } catch { throw new Error('GLaDOS 只读身份接口返回了无法解析的数据。'); }
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  const statusPayload = await readIdentityEndpoint('/api/user/status');
   try {
-    const response = await fetchImpl(`${page.origin}/api/user/status`, {
-      method: 'GET',
-      redirect: 'error',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        cookie: cookieHeader,
-        origin: page.origin,
-        referer: `${page.origin}/console/checkin`,
-        'user-agent': actualUserAgent,
-      },
-      signal: controller.signal,
-    });
-    const body = await response.text();
-    if (!response.ok) throw new Error(`GLaDOS 状态接口返回 HTTP ${response.status}。`);
-    let data;
-    try { data = JSON.parse(body); } catch { throw new Error('GLaDOS 状态接口返回了无法解析的数据。'); }
-    // Do not save response Set-Cookie or infer check-in success from this read-only endpoint.
-    return normalizeStatusIdentity(data, parts, options.expectedAccountKey || '');
-  } finally {
-    clearTimeout(timeout);
+    return normalizeStatusIdentity(statusPayload, parts, options.expectedAccountKey || '');
+  } catch (error) {
+    if (error.code !== 'INCOMPLETE_API_IDENTITY') throw error;
   }
+  // Official public app.bundle.js uses GET /api/user/session and code === 0 for session authentication.
+  // Source: https://glados.cloud/app.bundle.js (public frontend inspected 2026-10-06).
+  // It does not document identity fields: require actual explicit API identity, never localStorage or Cookie guesses.
+  const sessionPayload = await readIdentityEndpoint('/api/user/session');
+  // Keep the originally captured Cookie unchanged; never save response Set-Cookie or infer check-in success here.
+  return normalizeStatusIdentity(statusPayload, parts, options.expectedAccountKey || '', sessionPayload);
 }
 
 function buildCapturePayload(acquired, verified, browser, capturedAt = acquired.capturedAt || new Date().toISOString()) {
@@ -1128,13 +1182,17 @@ async function main() {
       alert('多账号版会为每个 GLaDOS 账号创建独立的 GitHub Secret 和独立签到任务。新增账号不会替换 GLADOS_COOKIES，也不会修改旧账号的 gladosCheck.yml。\n\n应用在你手动确认后读取当前 GLaDOS 登录域名的完整 Cookie 与实际浏览器 User-Agent，并通过账号状态接口核验身份。');
       const choiceLabels = installed.map(browserChoiceLabel);
       const browserLabel = choose(choiceLabels, '选择用于打开 GLaDOS 的浏览器：');
-      if (!browserLabel) return;
+      if (!browserLabel) {
+        if (process.env.GLADOS_CAPTURE_ONLY === '1') throw new Error('已取消选择浏览器。');
+        return;
+      }
       browser = installed[choiceLabels.indexOf(browserLabel)];
     }
 
     try {
       browserSession = await startBrowserSession(browser);
     } catch (error) {
+      if (process.env.GLADOS_CAPTURE_ONLY === '1') throw error;
       if (browser.id === 'safari' && /Safari|Native Messaging|Bridge|扩展|桥接/i.test(String(error.message))) {
         const setup = confirm(`${error.message}\n\n是否打开 Safari 扩展安装与设置入口？`, '打开扩展设置');
         if (setup) openSafariExtensionSetup();
@@ -1150,12 +1208,16 @@ async function main() {
         : '这是隔离自动化窗口；Firefox 可能需要每次重新登录。';
     const windowDescription = browser.id === 'safari' ? '普通 GLaDOS 窗口' : '受控 GLaDOS 窗口';
     const ready = confirm(`已打开 ${browser.label} 的${windowDescription}。\n\n请确认当前是需要新增或更新的账号，保持会员签到页面打开并等待加载完成。\n\n${persistenceNote}\n\n完成后点击“读取账号”。`, '读取账号');
-    if (!ready) return;
+    if (!ready) {
+      if (process.env.GLADOS_CAPTURE_ONLY === '1') throw new Error('已取消读取账号。');
+      return;
+    }
 
     let acquired;
     try {
       acquired = await acquireCookie(browserSession);
     } catch (error) {
+      if (process.env.GLADOS_CAPTURE_ONLY === '1') throw error;
       if (browser.id === 'safari' && /Safari|Native Messaging|Bridge|扩展|桥接/i.test(String(error.message))) {
         const setup = confirm(`${error.message}
 
@@ -1271,6 +1333,11 @@ async function main() {
       alert(lines.join('\n'), 'note');
     }
   } catch (error) {
+    if (process.env.GLADOS_CAPTURE_ONLY === '1') {
+      process.stderr.write(`GLADOS_CAPTURE_ERROR_CODE=${captureFailureCode(error)}\n`);
+      process.exitCode = 1;
+      return;
+    }
     const errorMessage = redact(error && error.message ? error.message : String(error));
     if (/workflow scope|Resource not accessible|refusing to allow an OAuth App to create or update workflow|OAuth App access restrictions/i.test(errorMessage)) {
       const fixScope = confirm(`GitHub 当前授权缺少 workflow 权限，无法创建多账号工作流。\n\n是否打开终端补充该权限？\n完成后请重新运行应用。\n\n${errorMessage}`, '补充权限');
@@ -1299,4 +1366,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { assertSameBrowserContext, buildCapturePayload, expectedCaptureIdentity, normalizeBrowserContext, verifyCookie };
+module.exports = { assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, expectedCaptureIdentity, normalizeBrowserContext, verifyCookie };

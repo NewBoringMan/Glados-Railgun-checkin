@@ -203,11 +203,14 @@ function statusScopes(payload) {
   return [payload, payload.data, payload.user, payload.data?.user].filter(object);
 }
 
-function normalizeStatusIdentity(payload, parts = null, expectedAccountKey = '') {
-  const scopes = statusScopes(payload);
-  for (const scope of [payload, payload.data].filter((value) => value && typeof value === 'object' && !Array.isArray(value))) {
+function normalizeStatusIdentity(payload, parts = null, expectedAccountKey = '', sessionPayload = null) {
+  if (sessionPayload !== null && sessionPayload?.code !== 0) throw new Error('会话接口拒绝认证，请手动重新登录并读取。');
+  const payloads = sessionPayload === null ? [payload] : [payload, sessionPayload];
+  const scopes = payloads.flatMap(statusScopes);
+  const userScopes = new Set(payloads.flatMap((item) => [item.user, item.data?.user]));
+  for (const scope of payloads.flatMap((item) => [item, item.data]).filter((value) => value && typeof value === 'object' && !Array.isArray(value))) {
     if ((scope.code !== undefined && scope.code !== 0) || scope.ok === false || scope.success === false) {
-      const device = payload.reason === 'device-mismatch' || /automated check-in detected/i.test(String(payload.message || ''));
+      const device = scope.reason === 'device-mismatch' || /automated check-in detected/i.test(String(scope.message || ''));
       throw new Error(device ? '状态接口拒绝当前登录设备，请手动重新登录并读取。' : '状态接口拒绝会话认证，请手动重新登录并读取。');
     }
   }
@@ -219,7 +222,7 @@ function normalizeStatusIdentity(payload, parts = null, expectedAccountKey = '')
       if (scope[field] !== undefined && scope[field] !== null) ids.push(normalizedUserId(scope[field]));
     }
     // A generic root `id` could identify a response or a plan; only `user.id` is unambiguous.
-    if ((scope === payload.user || scope === payload.data?.user) && scope.id !== undefined) ids.push(normalizedUserId(scope.id));
+    if (userScopes.has(scope) && scope.id !== undefined) ids.push(normalizedUserId(scope.id));
     for (const field of ['email', 'userEmail', 'user_email']) {
       const value = scope[field];
       if (value === undefined || value === null || value === '') continue;
@@ -233,13 +236,12 @@ function normalizeStatusIdentity(payload, parts = null, expectedAccountKey = '')
       days.push(Math.floor(Number(value)));
     }
   }
-  if (!ids.length || !emails.length) throw new Error('状态接口未提供可核验的账号 ID 与邮箱，已停止保存；积分可读不能替代身份验证。');
-  if (new Set(ids).size !== 1 || new Set(emails.map((email) => email.toLowerCase())).size !== 1 || new Set(days).size > 1) {
+  if (new Set(ids).size > 1 || new Set(emails.map((email) => email.toLowerCase())).size > 1 || new Set(days).size > 1) {
     throw new Error('状态接口返回了相互冲突的账号信息，已停止保存。');
   }
   const userId = ids[0];
   // Legacy metadata is an optional consistency check, never an identity source or a gld expiry gate.
-  if (parts?.session) {
+  if (userId && parts?.session) {
     let legacy = null;
     try { legacy = decodeBase64Json(parts.session); } catch { /* Opaque legacy cookies cannot be decoded. */ }
     if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
@@ -255,10 +257,15 @@ function normalizeStatusIdentity(payload, parts = null, expectedAccountKey = '')
       if (legacyIds.some((id) => id !== userId)) throw new Error('新旧会话的账号身份不一致，已停止保存。');
     }
   }
-  const secretName = accountSecretNameFromUserId(userId);
-  const accountKey = accountKeyFromSecretName(secretName);
-  if (expectedAccountKey && (!/^[A-F0-9]{16}$/.test(expectedAccountKey) || expectedAccountKey !== accountKey)) {
+  const secretName = userId ? accountSecretNameFromUserId(userId) : '';
+  const accountKey = secretName ? accountKeyFromSecretName(secretName) : '';
+  if (expectedAccountKey && (!/^[A-F0-9]{16}$/.test(expectedAccountKey) || (accountKey && expectedAccountKey !== accountKey))) {
     throw new Error('当前登录账号与要更新的账号不一致，已停止保存。');
+  }
+  if (!ids.length || !emails.length) {
+    const error = new Error('只读身份接口未提供可核验的账号 ID 与邮箱，已停止保存；积分可读不能替代身份验证。');
+    error.code = 'INCOMPLETE_API_IDENTITY';
+    throw error;
   }
   return { userId, accountKey, secretName, accountEmail: emails[0], leftDays: days.length ? days[0] : null };
 }

@@ -128,7 +128,12 @@ function buildBrowserCatalog(homeDir = os.homedir()) {
       ],
       loginPersistence: 'profile',
     },
-  ];
+  ].map((browser) => ({
+    ...browser,
+    paths: [...browser.paths, ...browser.paths
+      .filter((candidate) => candidate.startsWith('/Applications/') && browser.id !== 'safari')
+      .map((candidate) => candidate.replace(/^\/Applications\//, '/Volumes/MacData/Applications/'))],
+  }));
 }
 
 function webdriverCapabilities(browser, binaryPath) {

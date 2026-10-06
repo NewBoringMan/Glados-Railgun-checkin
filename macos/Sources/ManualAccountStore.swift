@@ -23,6 +23,7 @@ enum ManualAccountError: LocalizedError {
 }
 
 enum ManualValidation {
+    static let allowedHosts: Set<String> = ["glados.cloud", "glados.network", "glados.rocks", "glados.one", "glados.space", "glados.vip", "glados-facility.com", "railgun.info"]
     static func key(_ value: String) throws -> String {
         let key = value.uppercased()
         guard key.range(of: "^[A-F0-9]{16}$", options: .regularExpression) != nil else {
@@ -75,8 +76,7 @@ struct ManualSession: Codable, Equatable, Sendable {
         value.accountKey = try ManualValidation.key(accountKey)
         value.email = try ManualValidation.email(email)
         value.host = host.lowercased()
-        let allowed = ["glados.cloud", "glados.network", "glados.rocks", "glados.one", "glados.space", "glados.vip", "glados-facility.com", "railgun.info"]
-        guard allowed.contains(value.host),
+        guard ManualValidation.allowedHosts.contains(value.host),
               value.host.range(of: "^[a-z0-9.-]+$", options: .regularExpression) != nil,
               !userAgent.isEmpty, userAgent.utf8.count <= 2048,
               !userAgent.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
@@ -87,22 +87,23 @@ struct ManualSession: Codable, Equatable, Sendable {
               !cookieHeader.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
             throw ManualAccountError.invalid("登录资料缺少完整浏览器上下文，或字段格式无效。请手动重新读取该账号。")
         }
-        var names = Set<String>()
+        var cookies: [String: String] = [:]
         for raw in cookieHeader.split(separator: ";", omittingEmptySubsequences: true) {
             let part = raw.trimmingCharacters(in: .whitespaces)
             guard let equal = part.firstIndex(of: "=") else { throw ManualAccountError.invalid("Cookie 格式无效。") }
             let name = String(part[..<equal])
             let content = String(part[part.index(after: equal)...])
             guard name.range(of: "^[!#$%&'*+.^_`|~0-9A-Za-z:-]+$", options: .regularExpression) != nil,
-                  !content.isEmpty, names.insert(name).inserted else {
+                  cookies[name] == nil else {
                 throw ManualAccountError.invalid("Cookie 字段缺失或重复。")
             }
+            cookies[name] = content
         }
-        let koa = names.contains("koa:sess") && names.contains("koa:sess.sig")
-        let gld = names.contains("gld:sess") && names.contains("gld:sess.sig")
-        guard koa || gld,
-              names.contains("koa:sess") == names.contains("koa:sess.sig"),
-              names.contains("gld:sess") == names.contains("gld:sess.sig") else {
+        let hasGld = cookies["gld:sess"] != nil || cookies["gld:sess.sig"] != nil
+        let pair = hasGld ? ["gld:sess", "gld:sess.sig"] : ["koa:sess", "koa:sess.sig"]
+        // The current gld pair can coexist with an expired, partial legacy koa
+        // pair. Browser auxiliary cookies may legally have an empty value.
+        guard pair.allSatisfy({ cookies[$0]?.isEmpty == false }) else {
             throw ManualAccountError.invalid("登录 Cookie 不完整。请通过正常网页登录后重新读取。")
         }
         return value
@@ -126,8 +127,16 @@ struct ManualAccountRecord: Codable, Equatable, Sendable {
     var previousCredentialID: String?
     var legacyCredentialIDs: [String]?
     var pendingPublication: Bool = false
+    // Optional fields keep v1 local metadata readable. Only a fresh, explicit
+    // manual capture permits replacing an already registered cloud credential.
+    var credentialSource: String?
+    var publicationSkipped: Bool?
+    var sessionHost: String?
     var updatedAt: String = ManualValidation.timestamp()
     var hasCredentials: Bool { credentialID != nil }
+    var allowsManualCredentialReplacement: Bool {
+        credentialSource == "manual-capture" && pendingPublication && publicationSkipped != true
+    }
 }
 
 struct ManualArchiveAccount: Codable, Equatable, Sendable {
@@ -198,7 +207,7 @@ struct ManualImportPlan: Sendable {
     static func make(_ contents: ManualArchiveContents, existing: [String: String], additionalKeys: Set<String> = []) throws -> ManualImportPlan {
         guard contents.schema == "glados.account-backup.contents", contents.version == 1,
               ManualValidation.date(contents.createdAt) != nil, !contents.accounts.isEmpty,
-              contents.accounts.count <= 500 else { throw ManualAccountError.invalid("账号备份结构无效或账号数量超出限制。") }
+              contents.accounts.count <= 1000 else { throw ManualAccountError.invalid("账号备份结构无效或账号数量超出限制。") }
         // Validate the whole file before deriving a write plan, including skipped rows.
         let validated = try contents.accounts.map { try $0.validated() }
         let existingKeys = Set(existing.keys).union(additionalKeys)
@@ -363,6 +372,8 @@ final class LocalManualAccountStore: @unchecked Sendable {
             for (key, record) in index.accounts {
                 guard try ManualValidation.key(key) == key, record.accountKey == key else { throw ManualAccountError.storage }
                 if !record.email.isEmpty { _ = try ManualValidation.email(record.email) }
+                if let source = record.credentialSource, !["manual-capture", "import"].contains(source) { throw ManualAccountError.storage }
+                if let host = record.sessionHost, !ManualValidation.allowedHosts.contains(host) { throw ManualAccountError.storage }
                 for id in [record.credentialID, record.previousCredentialID].compactMap({ $0 }) + (record.legacyCredentialIDs ?? []) {
                     guard id.hasPrefix(key + "."), id.range(of: "^[A-F0-9]{16}\\.[a-f0-9-]{36}$", options: .regularExpression) != nil else { throw ManualAccountError.storage }
                 }
@@ -373,8 +384,10 @@ final class LocalManualAccountStore: @unchecked Sendable {
     private func save(_ index: Index) throws {
         let temporary = directory.appendingPathComponent("accounts-\(UUID().uuidString).tmp")
         do {
+            guard index.accounts.count <= 1000 else { throw ManualAccountError.storage }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             let data = try encoder.encode(index)
+            guard data.count <= 2 * 1024 * 1024 else { throw ManualAccountError.storage }
             let fd = Darwin.open(temporary.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
             guard fd >= 0 else { throw ManualAccountError.storage }
             let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -435,13 +448,27 @@ final class LocalManualAccountStore: @unchecked Sendable {
             record.email = valid.email; record.emailVerified = true; record.label = label
             record.enabled = enabled; record.autoExchange = autoExchange; record.visible = true
             record.pendingPublication = pendingPublication; record.updatedAt = ManualValidation.timestamp()
+            record.credentialSource = "manual-capture"; record.publicationSkipped = false
+            record.sessionHost = valid.host
             index.accounts[valid.accountKey] = record
             do { try save(index) } catch { try? vault.remove(newID); throw error }
             if let obsolete { try? vault.remove(obsolete) }
         }
     }
     func markPublished(_ keys: Set<String>) throws {
-        try locked { var index = try load(); for key in keys { index.accounts[key]?.pendingPublication = false }; try save(index) }
+        try locked {
+            var index = try load()
+            for key in keys { index.accounts[key]?.pendingPublication = false; index.accounts[key]?.publicationSkipped = false }
+            try save(index)
+        }
+    }
+    func markPublicationSkipped(_ keys: Set<String>) throws {
+        guard !keys.isEmpty else { return }
+        try locked {
+            var index = try load()
+            for key in keys { index.accounts[key]?.pendingPublication = false; index.accounts[key]?.publicationSkipped = true }
+            try save(index)
+        }
     }
     func hide(_ key: String) throws {
         try locked { var index = try load(); index.accounts[key]?.visible = false; index.accounts[key]?.pendingPublication = false; try save(index) }
@@ -483,14 +510,17 @@ final class LocalManualAccountStore: @unchecked Sendable {
         try locked {
             var index = try load()
             let rechecked = try ManualImportPlan.make(ManualArchiveContents(accounts: plan.additions), existing: index.accounts.mapValues(\.email), additionalKeys: externalKeys)
+            guard !rechecked.additions.isEmpty else { return [] }
+            guard index.accounts.count + rechecked.additions.count <= 1000 else { throw ManualAccountError.invalid("本机账号资料数量已达上限，未导入任何账号。") }
             var staged: [String] = []
             do {
                 for account in rechecked.additions {
                     var record = ManualAccountRecord(accountKey: account.accountKey, email: account.email, emailVerified: account.emailVerified, label: account.label, enabled: account.enabled, autoExchange: account.autoExchange)
+                    record.credentialSource = "import"; record.publicationSkipped = false
                     if let session = account.session {
                         let id = account.accountKey + "." + UUID().uuidString.lowercased()
                         try vault.add(session.encoded(), id: id); staged.append(id)
-                        record.credentialID = id; record.pendingPublication = true
+                        record.credentialID = id; record.pendingPublication = true; record.sessionHost = session.host
                     }
                     if let legacy = account.legacySessions, !legacy.isEmpty {
                         var ids: [String] = []
@@ -532,7 +562,7 @@ final class LocalManualAccountStore: @unchecked Sendable {
                 guard let keyBytes = sqlite3_column_text(statement, 0), let emailBytes = sqlite3_column_text(statement, 1),
                       let key = try? ManualValidation.key(String(cString: keyBytes)),
                       let email = try? ManualValidation.email(String(cString: emailBytes)) else { continue }
-                guard identities.count < 1000 else { throw ManualAccountError.storage }
+                guard identities[key] != nil || identities.count < 1000 else { throw ManualAccountError.storage }
                 identities[key] = (email, verified)
             }
         }
@@ -561,7 +591,7 @@ enum ManualArchiveCrypto {
         var authenticatedHeader: Data { Data("\(schema)|\(version)|\(cipher)|\(kdf)|\(iterations)|\(salt.base64EncodedString())".utf8) }
     }
     private static func key(password: String, salt: Data, iterations: Int) throws -> SymmetricKey {
-        guard password.utf8.count >= 12, password.utf8.count <= 1024, salt.count == 32, iterations == 600_000 else { throw ManualAccountError.password }
+        guard password.count >= 12, password.utf8.count <= 1024, salt.count == 32, iterations == 600_000 else { throw ManualAccountError.password }
         var output = Data(count: 32)
         let passwordData = Array(password.utf8)
         let status = output.withUnsafeMutableBytes { outputBytes in

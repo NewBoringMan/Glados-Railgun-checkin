@@ -270,6 +270,7 @@ final class GitHubClient: @unchecked Sendable {
 
     func setSecret(name: String, value: String) throws {
         guard name.range(of: "^GLADOS_ACCOUNT_[A-F0-9]{16}$", options: .regularExpression) != nil else { throw AppError.message("Secret 名称未通过安全校验。") }
+        guard value.utf8.count <= 48 * 1024 - 1 else { throw AppError.message("登录资料超过 GitHub Secret 的容量限制；完整资料已保存在本机，未发送截断内容。") }
         let result = try ProcessRunner.run(gh, ["secret", "set", name, "--repo", repo], input: Data((value + "\n").utf8), timeout: 60)
         guard result.exitCode == 0 else { throw AppError.message("更新 GitHub Secret 未完成；已保存的本机登录资料保留，可手动重试同步。") }
     }
@@ -400,11 +401,12 @@ final class CaptureService: @unchecked Sendable {
             if FileManager.default.fileExists(atPath: option.appPath) { return true }
             if option.id == "safari" && FileManager.default.fileExists(atPath: "/System/Applications/Safari.app") { return true }
             let userPath = "\(home)/Applications/\((option.appPath as NSString).lastPathComponent)"
-            return FileManager.default.fileExists(atPath: userPath)
+            let externalPath = "/Volumes/MacData/Applications/\((option.appPath as NSString).lastPathComponent)"
+            return FileManager.default.fileExists(atPath: userPath) || FileManager.default.fileExists(atPath: externalPath)
         }
     }
 
-    func capture(browserID: String, expectedAccountKey: String? = nil) throws -> CapturePayload {
+    func capture(browserID: String, expectedAccountKey: String? = nil, expectedHost: String? = nil) throws -> CapturePayload? {
         guard let node = ProcessRunner.executable("node") else { throw AppError.message("未找到 Node.js。请运行安装依赖脚本。") }
         guard let resourceURL = Bundle.main.resourceURL else { throw AppError.message("应用资源目录不可用。") }
         let helper = resourceURL.appendingPathComponent("capture_account.js")
@@ -412,9 +414,18 @@ final class CaptureService: @unchecked Sendable {
         var environment = ProcessInfo.processInfo.environment
         environment["GLADOS_CAPTURE_ONLY"] = "1"
         environment["GLADOS_BROWSER_ID"] = browserID
+        environment.removeValue(forKey: "GLADOS_EXPECTED_ACCOUNT_KEY")
+        environment.removeValue(forKey: "GLADOS_EXPECTED_HOST")
         if let expectedAccountKey { environment["GLADOS_EXPECTED_ACCOUNT_KEY"] = try ManualValidation.key(expectedAccountKey) }
+        if let expectedHost {
+            guard ManualValidation.allowedHosts.contains(expectedHost) else { throw ManualAccountError.conflict }
+            environment["GLADOS_EXPECTED_HOST"] = expectedHost
+        }
         let result = try ProcessRunner.run(node, [helper.path], environment: environment, timeout: 3600)
-        guard result.exitCode == 0 else { throw AppError.message(result.stderr.isEmpty ? "读取账号失败。" : redact(result.stderr)) }
+        guard result.exitCode == 0 else {
+            if captureErrorCode(result.stderr) == "cancelled" { return nil }
+            throw AppError.message(redact(result.stderr))
+        }
         guard let line = result.stdout.split(separator: "\n").map(String.init).first(where: { $0.hasPrefix("GLADOS_CAPTURE_JSON=") }) else { throw AppError.message("账号读取组件没有返回有效结果。") }
         let json = String(line.dropFirst("GLADOS_CAPTURE_JSON=".count))
         guard let object = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
@@ -424,12 +435,26 @@ final class CaptureService: @unchecked Sendable {
         let payload = CapturePayload(accountKey: key, secretName: secret, cookieHeader: cookie, email: object["email"] as? String ?? "", daysLeft: object["daysLeft"] as? Int, host: object["host"] as? String ?? "", browser: object["browser"] as? String ?? "", userAgent: object["userAgent"] as? String ?? "", capturedAt: object["capturedAt"] as? String)
         let session = try payload.manualSession()
         if let expectedAccountKey, session.accountKey != expectedAccountKey { throw ManualAccountError.conflict }
+        if let expectedHost, session.host != expectedHost { throw ManualAccountError.conflict }
         return payload
     }
 
+    private func captureErrorCode(_ text: String) -> String? {
+        let prefix = "GLADOS_CAPTURE_ERROR_CODE="
+        let codes = text.split(separator: "\n").map(String.init).filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
+        return codes.count == 1 ? codes[0] : nil
+    }
     private func redact(_ text: String) -> String {
-        // Helper stderr is not a data channel: never show raw browser/HTTP output.
-        "手动读取未完成。请确认已正常登录所选账号，并完成网站要求的验证。"
+        // Display only our own fixed messages for a strict helper-code whitelist;
+        // raw browser/HTTP stderr can contain credentials and is never shown.
+        switch captureErrorCode(text) {
+        case "browser_connection": return "无法连接到该账号的浏览器读取窗口。请自行退出该账号的专属浏览器实例，再重新读取登录信息。"
+        case "identity_mismatch": return "当前浏览器账号与待更新账号不一致。请切换到该账号正常登录后重新读取。"
+        case "missing_identity": return "网站未返回可核验的账号标识和邮箱，此次读取暂时无法保存。已记录的账号资料保留。"
+        case "verification_required": return "网站要求完成登录验证。请在所选浏览器中正常完成验证，再手动重新读取。"
+        case "safari_extension_unavailable": return "Safari 登录读取扩展尚不可用。请在 Safari 设置中启用配套扩展，并允许访问对应的 GLaDOS 页面。"
+        default: return "手动读取未完成。请确认已正常登录所选账号，并完成网站要求的验证。"
+        }
     }
 }
 
@@ -587,7 +612,12 @@ final class AppModel: ObservableObject {
         return email.isEmpty ? "待补邮箱" : email
     }
     func isCloudAccount(_ key: String) -> Bool { config.accounts[key] != nil }
-    func editEmail(_ key: String) { emailEditRequest = AccountEmailEditRequest(key: key, email: localAccounts[key]?.email ?? "") }
+    private func knownSessionHost(_ key: String) -> String? {
+        if let host = localAccounts[key]?.sessionHost, ManualValidation.allowedHosts.contains(host) { return host }
+        if let status = statuses[key], status.ok, ManualValidation.allowedHosts.contains(status.domain) { return status.domain }
+        return nil
+    }
+    func editEmail(_ key: String) { errorMessage = nil; emailEditRequest = AccountEmailEditRequest(key: key, email: localAccounts[key]?.email ?? "") }
     func saveEmail(_ key: String, email: String) {
         do {
             guard let localStore else { throw ManualAccountError.storage }
@@ -720,8 +750,10 @@ final class AppModel: ObservableObject {
         showBrowserPicker = false
         let service = captureService
         let expected = captureExpectedAccountKey
+        let host = expected.flatMap { knownSessionHost($0) }
         await perform("正在通过 \(browser.label) 读取 GLaDOS 登录信息…") {
-            let payload = try await Task.detached(priority: .userInitiated) { try service.capture(browserID: browser.id, expectedAccountKey: expected) }.value
+            let captured = try await Task.detached(priority: .userInitiated) { try service.capture(browserID: browser.id, expectedAccountKey: expected, expectedHost: host) }.value
+            guard let payload = captured else { return }
             let session = try payload.manualSession()
             if let oldEmail = self.localAccounts[session.accountKey]?.email, !oldEmail.isEmpty, oldEmail != session.email { throw ManualAccountError.conflict }
             self.pendingCapture = payload
@@ -773,6 +805,7 @@ final class AppModel: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         panel.title = "导入 GLaDOS 账号备份"; panel.message = "选择从 Account Center 导出的加密备份文件。"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        errorMessage = nil
         transferRequest = AccountTransferRequest(kind: .importFile, url: url)
     }
 
@@ -781,6 +814,7 @@ final class AppModel: ObservableObject {
         panel.nameFieldStringValue = "GLaDOS-accounts.gladosbackup"
         panel.message = "文件将使用你设置的密码加密，包含本机已保存的登录资料。"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        errorMessage = nil
         transferRequest = AccountTransferRequest(kind: .exportFile, url: url)
     }
 
@@ -830,8 +864,12 @@ final class AppModel: ObservableObject {
                     throw AppError.message("新账号已保存在本机，云端同步尚未完成；原账号未被覆盖。可在账号卡片点“同步本机资料”。\n" + error.localizedDescription)
                 }
             }
-            self.infoMessage = "新增 \(result.1.count) 个账号，跳过 \(result.0.skipped) 个已记录/重复账号。" +
-                (result.0.metadataOnly > 0 ? "其中 \(result.0.metadataOnly) 个缺少本机登录凭据，已在账号列表显示为待补登录信息。" : "") +
+            let skipped = result.0.skipped + result.0.additions.count - result.1.count
+            let metadataOnly = result.1.filter { $0.session == nil }.count
+            let cloudSkipped = complete.filter { self.localAccounts[$0.accountKey]?.publicationSkipped == true }.count
+            self.infoMessage = "本机新增 \(result.1.count) 个账号，跳过 \(skipped) 个已记录/重复账号。" +
+                (metadataOnly > 0 ? "其中 \(metadataOnly) 个缺少本机登录凭据，已在账号列表显示为待补登录信息。" : "") +
+                (cloudSkipped > 0 ? "同步前发现 \(cloudSkipped) 个账号已有云端记录，已跳过同步并保留本机备份，未覆盖云端登录信息。" : "") +
                 (client == nil && !complete.isEmpty ? "连接 GitHub 后，可逐账号手动同步本机资料。" : "")
         }
     }
@@ -842,36 +880,47 @@ final class AppModel: ObservableObject {
             let next = try await Self.background { () -> RepositoryConfig in
                 guard let record = try store.records()[key], let session = try store.session(for: key) else { throw AppError.message("此账号缺少本机登录信息，请手动重新读取。") }
                 let latest = try Self.readConfiguration(client)
-                if latest.accounts[key] != nil {
-                    // This button is for an explicitly pending manual capture. An
-                    // imported duplicate never reaches this path or changes a Secret.
-                    guard record.pendingPublication else { return latest }
+                if record.allowsManualCredentialReplacement {
+                    // The user explicitly captured this exact account. Restoring
+                    // an imported backup never grants permission to overwrite it.
                     try client.setSecret(name: "GLADOS_ACCOUNT_\(key)", value: String(decoding: session.encoded(), as: UTF8.self))
-                    try store.markPublished([key]); return latest
+                    var next = latest
+                    if latest.accounts[key] == nil {
+                        next.accounts[key] = AccountConfig(enabled: record.enabled, autoExchange: record.autoExchange, label: ManualValidation.safeLabel(record.label, key: key))
+                        try Self.appendConfiguration(next, addedKeys: [key], expected: latest, client: client)
+                    }
+                    try store.markPublished([key]); return next
                 }
+                guard record.pendingPublication, record.publicationSkipped != true else { return latest }
                 let account = ManualArchiveAccount(accountKey: key, email: record.email, emailVerified: record.emailVerified, label: record.label, enabled: record.enabled, autoExchange: record.autoExchange, session: session)
                 return try Self.publishNewAccounts([account], store: store, client: client)
             }
             self.config = next; try self.updateLocalSummaries(); self.saveRepositoryCache(); self.syncScheduleDates()
-            self.infoMessage = "该账号的本机资料已同步；其他账号和签到时间保持原样。"
+            self.infoMessage = self.localAccounts[key]?.publicationSkipped == true
+                ? "已发现此账号的云端记录，跳过导入同步；本机备份已保留，云端登录信息未被覆盖。需要更换登录信息时，请明确选择“重新读取登录信息”。"
+                : "该账号的本机资料已同步；其他账号和签到时间保持原样。"
         }
     }
 
     nonisolated private static func publishNewAccounts(_ accounts: [ManualArchiveAccount], store: LocalManualAccountStore, client: GitHubClient) throws -> RepositoryConfig {
         let latest = try readConfiguration(client)
-        var next = latest; var added = Set<String>()
+        let registered = Set(latest.accounts.keys).union(try client.managedAccountKeys())
+        var next = latest; var added = Set<String>(); var skipped = Set<String>()
         for raw in accounts {
             let account = try raw.validated()
-            // A concurrent or previous successful registration is always skipped.
-            if latest.accounts[account.accountKey] != nil { continue }
+            // Recheck names before publication as well as during initial import:
+            // a Secret can exist before its accounts.json entry is committed.
+            if registered.contains(account.accountKey) { skipped.insert(account.accountKey); continue }
             guard let session = account.session else { continue }
             guard let saved = try store.session(for: account.accountKey), saved == session else { throw ManualAccountError.conflict }
+            if try client.managedAccountKeys().contains(account.accountKey) { skipped.insert(account.accountKey); continue }
             try client.setSecret(name: "GLADOS_ACCOUNT_\(account.accountKey)", value: String(decoding: session.encoded(), as: UTF8.self))
             next.accounts[account.accountKey] = AccountConfig(enabled: account.enabled, autoExchange: account.autoExchange, label: ManualValidation.safeLabel(account.label, key: account.accountKey))
             added.insert(account.accountKey)
         }
+        try store.markPublicationSkipped(skipped)
         if !added.isEmpty { try appendConfiguration(next, addedKeys: added, expected: latest, client: client) }
-        try store.markPublished(added.union(accounts.map(\.accountKey).filter { latest.accounts[$0] != nil }))
+        try store.markPublished(added)
         return next
     }
 
@@ -1011,7 +1060,8 @@ final class AppModel: ObservableObject {
             let profile = home.appendingPathComponent("Library/Application Support/GLaDOS Account Center/BrowserProfiles/accounts/\(key)/edge", isDirectory: true)
             try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-na", browser.path, "--args", "--user-data-dir=\(profile.path)", "--no-first-run", "--no-default-browser-check", "https://glados.cloud/console/checkin"]
+            let host = knownSessionHost(key) ?? "glados.cloud"
+            process.arguments = ["-na", browser.path, "--args", "--user-data-dir=\(profile.path)", "--no-first-run", "--no-default-browser-check", "https://\(host)/console/checkin"]
             try process.run()
         } catch { errorMessage = error.localizedDescription }
     }
@@ -1321,8 +1371,10 @@ struct CaptureConfirmView: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             Text("凭据先保存到本机钥匙串，再同步此次手动操作。账号邮箱不会因登录失效而消失。").font(.caption).foregroundStyle(.secondary)
-            HStack { Spacer(); Button("取消") { model.cancelCapture(); dismiss() }; Button("保存账号") { Task { await model.commitCapture(autoExchange: autoExchange, enabled: enabled) } }.buttonStyle(.borderedProminent).disabled(model.busyMessage != nil) }
+            if let error = model.errorMessage { Text(error).font(.callout).foregroundStyle(.orange) }
+            HStack { Spacer(); Button("取消") { model.cancelCapture(); dismiss() }.disabled(model.busyMessage != nil); Button("保存账号") { Task { await model.commitCapture(autoExchange: autoExchange, enabled: enabled) } }.buttonStyle(.borderedProminent).disabled(model.busyMessage != nil) }
         }.padding(24).frame(width: 540)
+        .interactiveDismissDisabled(model.busyMessage != nil)
     }
 }
 
@@ -1351,7 +1403,7 @@ struct OverviewView: View {
                 LazyVGrid(columns: columns, spacing: 14) {
                     MetricCard(title: "账号总数", value: "\(model.accountsSorted.count)", icon: "person.2.fill")
                     MetricCard(title: "自动签到", value: "\(model.enabledCount)", icon: "checkmark.circle.fill")
-                    MetricCard(title: "状态正常", value: "\(model.healthyCount)", icon: "heart.fill")
+                    MetricCard(title: "资料可读取", value: "\(model.healthyCount)", icon: "heart.fill")
                     MetricCard(title: "自动兑换", value: "\(model.exchangeEnabledCount)", icon: "gift.fill")
                 }
                 if let best = model.catalog?.bestPlan {
@@ -1392,8 +1444,10 @@ struct AccountCompactRow: View {
             if let points = status?.pointsTotal { Label("\(points)", systemImage: "star.circle").foregroundStyle(.secondary) }
             if let days = status?.daysLeft { Label("\(days) 天", systemImage: "calendar").foregroundStyle(.secondary) }
             if let streak = status?.streak, streak > 0 { Label("\(streak) 连签", systemImage: "flame.fill").foregroundStyle(.orange) }
-            StatusPill(text: account.enabled ? "签到开" : "签到停", positive: account.enabled)
-            StatusPill(text: account.autoExchange ? "兑换开" : "兑换关", positive: account.autoExchange)
+            if model.isCloudAccount(key) {
+                StatusPill(text: account.enabled ? "签到开" : "签到停", positive: account.enabled)
+                StatusPill(text: account.autoExchange ? "兑换开" : "兑换关", positive: account.autoExchange)
+            } else { StatusPill(text: "仅本机", positive: false) }
         }.padding(14).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
     }
 }
@@ -1439,6 +1493,13 @@ struct AccountCard: View {
     let key: String; let account: AccountConfig; let status: AccountStatus?
     @Binding var deletingKey: String?
     @Binding var editingAccount: AccountEditBox?
+    private var statusText: String {
+        if !model.isCloudAccount(key) {
+            if model.localAccounts[key]?.publicationSkipped == true { return "已有云端记录，已跳过同步" }
+            return model.localAccounts[key]?.hasCredentials == true ? "待同步到 GitHub" : "待补登录信息"
+        }
+        return status?.ok == true ? "资料可读取" : status == nil ? "等待刷新" : "需要处理"
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
@@ -1448,7 +1509,7 @@ struct AccountCard: View {
                     if model.localAccounts[key]?.email.isEmpty != false { Button("补全邮箱") { model.editEmail(key) }.font(.caption) }
                 }
                 Spacer(); Circle().fill(status?.ok == true ? Color.green : status == nil ? Color.gray : Color.orange).frame(width: 11, height: 11)
-                Text(!model.isCloudAccount(key) ? (model.localAccounts[key]?.hasCredentials == true ? "待同步到 GitHub" : "待补登录信息") : status?.ok == true ? "资料可读取" : status == nil ? "等待刷新" : "需要处理").foregroundStyle(.secondary)
+                Text(statusText).foregroundStyle(.secondary)
             }
             HStack(spacing: 28) {
                 MiniStat(label: "积分", value: status?.pointsTotal.map(String.init) ?? "—")
@@ -1473,7 +1534,7 @@ struct AccountCard: View {
                     Button("编辑备注名称") { editingAccount = AccountEditBox(key: key, label: account.label) }
                     Button("重新读取登录信息") { Task { await model.startCapture(expectedAccountKey: key) } }
                     if model.localAccounts[key]?.pendingPublication == true || !model.isCloudAccount(key) {
-                        Button("同步本机资料") { Task { await model.synchronizeLocalAccount(key) } }.disabled(model.localAccounts[key]?.hasCredentials != true || !model.isGitHubReady)
+                        Button("同步本机资料") { Task { await model.synchronizeLocalAccount(key) } }.disabled(model.localAccounts[key]?.hasCredentials != true || model.localAccounts[key]?.publicationSkipped == true || !model.isGitHubReady)
                     }
                     Divider()
                     Button("移除自动化", role: .destructive) { deletingKey = key }.disabled(!model.isCloudAccount(key))
@@ -1482,6 +1543,9 @@ struct AccountCard: View {
             if let error = status?.error, !error.isEmpty { Text(error).font(.caption).foregroundStyle(.orange) }
             if let warning = status?.statusWarning, !warning.isEmpty { Text(warning).font(.caption).foregroundStyle(.secondary) }
             if let warning = status?.sessionWarning, !warning.isEmpty { Text(warning).font(.caption).foregroundStyle(.orange) }
+            if model.localAccounts[key]?.publicationSkipped == true {
+                Text("导入同步已跳过现有云端账号；本机备份已保留。需要更换该账号凭据时，请手动重新读取登录信息。").font(.caption).foregroundStyle(.secondary)
+            }
             if model.localAccounts[key]?.hasCredentials != true {
                 Text("本机尚未保存完整登录凭据；手动重新读取后可随加密备份一起导出。").font(.caption).foregroundStyle(.secondary)
             }

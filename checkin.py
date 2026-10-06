@@ -18,8 +18,8 @@ except ImportError:
 
 from logging_config import init_logger
 from session_context import (
-    SessionContext, SessionContextError, account_key_from_user_id, parse_session,
-    split_sessions,
+    SessionContext, SessionContextError, parse_session,
+    response_identity, split_sessions,
 )
 
 
@@ -56,6 +56,10 @@ class DeviceMismatchError(AuthenticationRejected):
 
 
 class IdentityMismatchError(AuthenticationRejected):
+    pass
+
+
+class IdentityUnverifiedError(AuthenticationRejected):
     pass
 
 
@@ -142,6 +146,7 @@ class Config:
 class GladosAPI:
     def __init__(self, domain: str, cookie: str | SessionContext, *, verbose: bool = False, session: Optional[requests.Session] = None):
         self.context = parse_session(cookie)
+        self._manual_identity_verified = False
         if self.context.structured and domain != self.context.host:
             raise SessionContextError("登录信息仅限原登录域名，已停止跨域请求")
         self.domain = domain
@@ -244,20 +249,36 @@ class GladosAPI:
     def _check_response_identity(self, payload: Dict[str, Any]) -> None:
         if not self.context.structured:
             return
-        for source in _candidate_dicts(payload):
-            for key in ("userId", "user_id", "uid"):
-                if source.get(key) is None:
-                    continue
-                try:
-                    actual_key = account_key_from_user_id(source[key])
-                except SessionContextError as exc:
-                    raise IdentityMismatchError("服务端返回无法核对的账号身份，已停止操作") from exc
-                if actual_key != self.context.account_key:
-                    raise IdentityMismatchError("服务端账号与已保存账号不一致，已停止操作")
-            for key in ("email", "userEmail", "accountEmail"):
-                value = source.get(key)
-                if isinstance(value, str) and value.strip() and value.strip().casefold() != self.context.email.casefold():
-                    raise IdentityMismatchError("服务端邮箱与已保存账号不一致，已停止操作")
+        try:
+            keys, emails = response_identity(payload)
+        except SessionContextError as exc:
+            raise IdentityMismatchError("服务端返回无法核对的账号身份，已停止操作") from exc
+        if keys - {self.context.account_key} or emails - {self.context.email.casefold()}:
+            raise IdentityMismatchError("服务端账号或邮箱与已保存账号不一致，已停止操作")
+
+    def _verify_manual_identity_before_write(self) -> None:
+        if not self.context.structured or self._manual_identity_verified:
+            return
+        keys: set[str] = set()
+        emails: set[str] = set()
+        for path in ("/api/user/status", "/api/user/session"):
+            payload = self._request_json("GET", path)
+            scopes = [payload]
+            if isinstance(payload.get("data"), dict):
+                scopes.append(payload["data"])
+            for scope in scopes:
+                code = scope.get("code")
+                if (code is not None and (isinstance(code, bool) or code != 0)) or scope.get("ok") is False or scope.get("success") is False:
+                    raise IdentityUnverifiedError(f"{self.domain} {path}：无法核实当前登录身份，未执行签到或兑换")
+            # The official public login client uses code===0 for /user/session.
+            if path.endswith("/session") and payload.get("code") != 0:
+                raise IdentityUnverifiedError(f"{self.domain} 会话接口未确认登录身份，未执行签到或兑换")
+            found_keys, found_emails = response_identity(payload)
+            keys.update(found_keys); emails.update(found_emails)
+            if keys == {self.context.account_key} and emails == {self.context.email.casefold()}:
+                self._manual_identity_verified = True
+                return
+        raise IdentityUnverifiedError(f"{self.domain} 资料接口未提供可核对的账号 ID 和邮箱，未执行签到或兑换；请在 App 中手动检查该账号")
 
     def safe_message(self, value: Any, limit: int = 120) -> str:
         message = str(value or "")
@@ -277,6 +298,7 @@ class GladosAPI:
         }
 
     def checkin(self) -> Dict[str, Any]:
+        self._verify_manual_identity_before_write()
         payload = self._request_json(
             "POST",
             "/api/user/checkin",
@@ -307,6 +329,7 @@ class GladosAPI:
         return points
 
     def exchange(self, plan_id: str) -> str:
+        self._verify_manual_identity_before_write()
         payload = self._request_json(
             "POST",
             "/api/user/exchange",
@@ -460,6 +483,8 @@ def error_kind(error: BaseException) -> str:
         return "device_mismatch"
     if isinstance(error, IdentityMismatchError):
         return "identity_mismatch"
+    if isinstance(error, IdentityUnverifiedError):
+        return "identity_unverified"
     if isinstance(error, SessionContextError):
         return "invalid_session_context"
     if isinstance(error, AuthenticationError):
@@ -513,8 +538,8 @@ def run_one_account(
     result.exchange_days = selected_plan.days
     result.exchange_cost_per_day = float(selected_plan.cost_per_day)
 
-    # The write path is intentionally first. Read-only status/points APIs must
-    # never gate the check-in request itself.
+    # Keep legacy write-first behavior. New structured manual credentials verify
+    # their bound identity inside GladosAPI before a write can be submitted.
     selected_api = None
     for domain in context.domains(domains):
         api = api_factory(domain, cookie)
@@ -679,7 +704,7 @@ def main() -> int:
         )
         results.append(result)
         LOGGER.info("\n%s", format_human_summary(result))
-        print("GLADOS_RESULT_JSON=" + json.dumps(asdict(result), ensure_ascii=False, separators=(",", ":")))
+        print("GLADOS_RESULT_JSON=" + json.dumps(result_for_action_log(asdict(result), cookie), ensure_ascii=False, separators=(",", ":")))
 
     success_count = sum(1 for result in results if result.success)
     failure_count = len(results) - success_count
@@ -687,6 +712,32 @@ def main() -> int:
     content = "\n\n".join(format_human_summary(item) for item in results)
     send_push(config.push_key, title, content)
     return 0 if failure_count == 0 else 1
+
+
+def result_for_action_log(result: Dict[str, Any], raw_session: str) -> Dict[str, Any]:
+    """The App already has the new local email; do not publish it in job results.
+
+    Old raw-cookie workflows keep their output contract. GitHub's exact Secret
+    mask covers JSON as a whole, so mask its credential values individually too.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return result
+    try:
+        context = parse_session(raw_session)
+    except SessionContextError:
+        return result
+    if not context.structured:
+        return result
+    private_values = [context.email, context.cookie_header]
+    for part in context.cookie_header.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and value and name in {"gld:sess", "gld:sess.sig", "koa:sess", "koa:sess.sig", "cf_clearance"}:
+            private_values.append(value)
+    for value in private_values:
+        print("::add-mask::" + value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+    public_result = dict(result)
+    public_result["email"] = ""
+    return public_result
 
 
 def _as_bool(value: Optional[str], default: bool) -> bool:

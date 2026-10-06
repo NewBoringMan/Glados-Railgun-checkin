@@ -68,16 +68,18 @@ def validate_cookie_header(value: Any) -> str:
         if not part:
             continue
         name, separator, cookie_value = part.partition("=")
-        if not separator or not _COOKIE_NAME.fullmatch(name) or not cookie_value:
+        if not separator or not _COOKIE_NAME.fullmatch(name):
             raise SessionContextError("手动登录信息的 Cookie 格式不完整")
+        if len(cookie_value) > 16384 or any(ord(char) < 33 or ord(char) > 126 or char == "," for char in cookie_value):
+            raise SessionContextError("手动登录信息的 Cookie 值格式不正确")
         if name in names:
             raise SessionContextError("手动登录信息包含重复 Cookie 名称，请重新手动读取")
         names[name] = cookie_value
     # gld values are opaque: do not decode them or use a legacy koa _expire as TTL.
-    for base in ("gld:sess", "koa:sess"):
-        if (base in names) != (f"{base}.sig" in names):
-            raise SessionContextError(f"手动登录信息缺少完整的 {base} 签名对")
-    if not any(base in names for base in ("gld:sess", "koa:sess")):
+    has_gld = "gld:sess" in names or "gld:sess.sig" in names
+    if has_gld and not (names.get("gld:sess") and names.get("gld:sess.sig")):
+        raise SessionContextError("手动登录信息缺少完整的 gld:sess 签名对")
+    if not has_gld and not (names.get("koa:sess") and names.get("koa:sess.sig")):
         raise SessionContextError("手动登录信息未包含 GLaDOS 会话 Cookie")
     return header
 
@@ -147,6 +149,30 @@ def account_key_from_user_id(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise SessionContextError("服务端账号 ID 格式不正确")
     user_id = str(value).strip()
-    if not user_id or len(user_id) > 128:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id) or (isinstance(value, int) and not 0 < value <= 2**53 - 1):
         raise SessionContextError("服务端账号 ID 格式不正确")
     return hashlib.sha256(f"glados-user:{user_id}".encode()).hexdigest()[:16].upper()
+
+
+def response_identity(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Only named account fields count; a generic root 'id' may be a plan ID."""
+    data = payload.get("data")
+    data = data if isinstance(data, dict) else {}
+    user_objects = [item for item in (payload.get("user"), data.get("user")) if isinstance(item, dict)]
+    keys: set[str] = set()
+    emails: set[str] = set()
+    for scope in [payload, data, *user_objects]:
+        for name in ("userId", "user_id", "uid"):
+            if scope.get(name) is not None:
+                keys.add(account_key_from_user_id(scope[name]))
+        if any(scope is user for user in user_objects) and scope.get("id") is not None:
+            keys.add(account_key_from_user_id(scope["id"]))
+        for name in ("email", "userEmail", "user_email", "accountEmail"):
+            value = scope.get(name)
+            if value is None or value == "":
+                continue
+            value = _text(value, "服务端邮箱", 320)
+            if not _EMAIL.fullmatch(value):
+                raise SessionContextError("服务端邮箱格式不正确")
+            emails.add(value.casefold())
+    return keys, emails

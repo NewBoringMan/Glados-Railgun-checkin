@@ -31,6 +31,7 @@ struct AccountEmailEditor: View {
             TextField("账号真实邮箱", text: $email).textFieldStyle(.roundedBorder)
             Text("邮箱只保存在这台 Mac，并随加密备份导出。补填邮箱不会登录网站或更新 Cookie；已核验的账号身份不会被另一邮箱覆盖。")
                 .font(.callout).foregroundStyle(.secondary)
+            if let error = model.errorMessage { Text(error).font(.callout).foregroundStyle(.orange) }
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }
@@ -49,7 +50,7 @@ struct AccountTransferView: View {
     @State private var confirmation = ""
     private var isExport: Bool { request.kind == .exportFile }
     private var ready: Bool {
-        password.utf8.count >= 12 && password.utf8.count <= 1024 && (!isExport || password == confirmation) && model.busyMessage == nil
+        password.count >= 12 && password.utf8.count <= 1024 && (!isExport || password == confirmation) && model.busyMessage == nil
     }
 
     var body: some View {
@@ -65,6 +66,7 @@ struct AccountTransferView: View {
                  : "含完整登录凭据的新账号会加入原账号列表和签到任务；只有邮箱资料的新账号会显示为待补登录信息。原有账号设置与签到时间保持不变。")
                 .font(.caption).foregroundStyle(.secondary)
             if let message = model.busyMessage { HStack { ProgressView().controlSize(.small); Text(message).font(.callout) } }
+            if let error = model.errorMessage { Text(error).font(.callout).foregroundStyle(.orange) }
             HStack {
                 Spacer()
                 Button("取消") { password = ""; confirmation = ""; dismiss() }.disabled(model.busyMessage != nil)

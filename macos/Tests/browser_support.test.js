@@ -22,6 +22,15 @@ test('Safari uses the normal-profile Native Messaging extension instead of WebDr
   assert.throws(() => webdriverCapabilities(safari, '/Applications/Safari.app/Contents/MacOS/Safari'), /不是 WebDriver/);
 });
 
+test('capture catalog recognizes the same existing MacData installation as the native picker', () => {
+  const edge = buildBrowserCatalog('/Users/test').find((item) => item.id === 'edge');
+  assert.deepEqual(edge.paths, [
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Users/test/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Volumes/MacData/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  ]);
+});
+
 test('Firefox capabilities preserve the selected binary', () => {
   const firefox = buildBrowserCatalog('/Users/test').find((item) => item.id === 'firefox');
   const caps = webdriverCapabilities(firefox, '/Applications/Firefox.app/Contents/MacOS/firefox');
