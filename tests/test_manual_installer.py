@@ -46,7 +46,7 @@ class InstallerFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="glados-installer-test-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.user_home = self.root / "home"
         self.user_home.mkdir()
         self.app = self.root / "physical" / "GLaDOS Account Center.app"
@@ -535,7 +535,7 @@ class ProcessInspectionTests(unittest.TestCase):
 
     def test_proc_pidpath_resolves_app_symlink(self):
         with tempfile.TemporaryDirectory(prefix="glados-proc-test-") as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             physical = root / "physical.app"
             (physical / "Contents/MacOS").mkdir(parents=True)
             executable = physical / "Contents/MacOS/GLaDOSAccountCenter"

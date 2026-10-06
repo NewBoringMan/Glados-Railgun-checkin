@@ -19,9 +19,9 @@ class WatchTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="glados-watch-test-")
         self.addCleanup(temporary.cleanup)
-        self.support = Path(temporary.name) / "support"
+        self.support = Path(temporary.name).resolve() / "support"
         self.support.mkdir()
-        self.app = Path(temporary.name) / "Example.app"
+        self.app = Path(temporary.name).resolve() / "Example.app"
         self.api = Mock(return_value={"workflow_runs": []})
         self.allowed = "authorized"
         self.accepted = True
