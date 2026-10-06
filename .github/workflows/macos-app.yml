@@ -1,0 +1,42 @@
+name: GLaDOS Account Center build
+
+on:
+  pull_request:
+    paths:
+      - 'macos/**'
+      - 'app_integration/**'
+      - '.github/workflows/macos-app.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Native App and manual-account checks
+    runs-on: macos-latest
+    env:
+      GLADOS_ARCH: arm64
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Check JavaScript, source package and offline fixtures
+        run: python3 macos/Tests/validate_package.py
+      - name: Native local-account and encrypted archive checks
+        run: bash app_integration/test-native.sh
+      - name: Independent watch and transactional installer fixtures
+        run: |
+          python3 -m unittest discover -s tests -p test_manual_installer.py -q
+          python3 -m unittest discover -s tests -p test_manual_watch.py -q
+      - name: Compile the single App and embedded Safari extension
+        run: bash app_integration/build-manual.sh "$RUNNER_TEMP/GLaDOS Account Center.app"
+      - name: Package compiled candidate
+        run: ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/GLaDOS Account Center.app" "$RUNNER_TEMP/GLaDOS-Account-Center-2.0.11.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GLaDOS-Account-Center-2.0.11
+          path: ${{ runner.temp }}/GLaDOS-Account-Center-2.0.11.zip
+          retention-days: 14
