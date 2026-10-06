@@ -697,14 +697,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func refreshAllStatuses() async { await refreshStatuses(account: "all") }
-    func refreshStatus(key: String) async { await refreshStatuses(account: key) }
+    func refreshAllStatuses(userInitiated: Bool = false) async { await refreshStatuses(account: "all", userInitiated: userInitiated) }
+    func refreshStatus(key: String, userInitiated: Bool = false) async { await refreshStatuses(account: key, userInitiated: userInitiated) }
 
-    private func refreshStatuses(account: String) async {
+    private func refreshStatuses(account: String, userInitiated: Bool = false) async {
         guard let client else { return }
         await perform(account == "all" ? "正在只读刷新全部 GLaDOS 状态…" : "正在只读刷新账号状态…") {
             let output = try await Self.background { () -> (WorkflowRunReceipt, String) in
-                let receipt = try client.triggerWorkflow(statusWorkflowName, account: account)
+                let receipt = try client.triggerWorkflow(statusWorkflowName, account: account, replaceUnidentifiedStatus: userInitiated)
                 let (_, _, logs) = try client.waitForRun(receipt, timeout: 360)
                 return (receipt, logs)
             }
@@ -733,7 +733,7 @@ final class AppModel: ObservableObject {
     }
 
     func latestReceipt(for key: String) -> WorkflowRunReceipt? {
-        workflowReceipts.first { $0.account == key }
+        workflowReceipts.first { $0.account == key && $0.supersededBy == nil }
     }
     func accountStageText(_ key: String) -> String? {
         guard let record = localAccounts[key], record.hasCredentials else { return nil }
@@ -750,7 +750,11 @@ final class AppModel: ObservableObject {
     }
 
     func retryExistingWorkflow(_ original: WorkflowRunReceipt) async {
-        guard let client else { return }
+        guard let client, original.supersededBy == nil else { return }
+        if original.workflow == statusWorkflowName, original.runID == nil {
+            await refreshStatuses(account: original.account, userInitiated: true)
+            return
+        }
         var suppliedID: Int?
         if original.runID == nil {
             let alert = NSAlert(); alert.messageText = "重查原任务"
@@ -1336,7 +1340,7 @@ struct RootView: View {
             .toolbar {
                 ToolbarItemGroup {
                     if model.isGitHubReady {
-                        Button { Task { await model.refreshAllStatuses() } } label: { Label("刷新", systemImage: "arrow.clockwise") }.disabled(model.busyMessage != nil)
+                        Button { Task { await model.refreshAllStatuses(userInitiated: true) } } label: { Label("刷新", systemImage: "arrow.clockwise") }.disabled(model.busyMessage != nil)
                     } else {
                         Button { model.startGitHubLogin() } label: { Label("连接 GitHub", systemImage: "person.crop.circle.badge.plus") }.disabled(model.busyMessage != nil)
                         Button { Task { await model.retryGitHubConnection() } } label: { Label("重新检测", systemImage: "arrow.clockwise") }.disabled(model.busyMessage != nil)
@@ -1470,7 +1474,7 @@ struct OverviewView: View {
                     }.padding(20).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack { Text("账号状态").font(.title2.bold()); Spacer(); Button("只读刷新") { Task { await model.refreshAllStatuses() } } }
+                    HStack { Text("账号状态").font(.title2.bold()); Spacer(); Button("只读刷新") { Task { await model.refreshAllStatuses(userInitiated: true) } }.disabled(model.busyMessage != nil) }
                     ForEach(Array(model.accountsSorted.prefix(6)), id: \.0) { key, account in AccountCompactRow(key: key, account: account, status: model.statuses[key]) }
                 }
             }.padding(28)
@@ -1583,7 +1587,7 @@ struct AccountCard: View {
                 Toggle("自动签到", isOn: Binding(get: { account.enabled }, set: { value in Task { await model.setEnabled(key, value) } })).toggleStyle(.switch).disabled(!model.isCloudAccount(key) || !model.isGitHubReady)
                 Toggle("自动兑换", isOn: Binding(get: { account.autoExchange }, set: { value in Task { await model.setAutoExchange(key, value) } })).toggleStyle(.switch).disabled(!model.isCloudAccount(key) || !model.isGitHubReady)
                 Spacer()
-                Button("刷新状态") { Task { await model.refreshStatus(key: key) } }.disabled(!model.isCloudAccount(key) || !model.isGitHubReady)
+                Button("刷新状态") { Task { await model.refreshStatus(key: key, userInitiated: true) } }.disabled(!model.isCloudAccount(key) || !model.isGitHubReady || model.busyMessage != nil)
                 Button("立即签到") { Task { await model.runCheckin(key) } }.disabled(!model.isCloudAccount(key) || !model.isGitHubReady)
                 Menu {
                     Button("打开 GLaDOS") { model.openGlados(accountKey: key) }
@@ -1599,7 +1603,7 @@ struct AccountCard: View {
             }
             if let stages = model.accountStageText(key) { Text(stages).font(.caption).foregroundStyle(.secondary) }
             if let receipt = model.latestReceipt(for: key) {
-                HStack { Text(receipt.stateText).font(.caption).foregroundStyle(.secondary); Spacer(); Button("重查已有任务") { Task { await model.retryExistingWorkflow(receipt) } }.disabled(!model.isGitHubReady) }
+                HStack { Text(receipt.stateText).font(.caption).foregroundStyle(.secondary); Spacer(); Button(receipt.retryTitle) { Task { await model.retryExistingWorkflow(receipt) } }.disabled(!model.isGitHubReady || model.busyMessage != nil || receipt.supersededBy != nil) }
             }
             if let error = status?.error, !error.isEmpty { Text(error).font(.caption).foregroundStyle(.orange) }
             if let warning = status?.statusWarning, !warning.isEmpty { Text(warning).font(.caption).foregroundStyle(.secondary) }
@@ -1699,7 +1703,7 @@ struct PunchesView: View {
                         Text("从 GLaDOS 积分历史只读推断签到记录；较早记录不足时显示为“数据不足”，不会误判成漏签。").foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("只读刷新全部") { Task { await model.refreshAllStatuses() } }.buttonStyle(.borderedProminent)
+                    Button("只读刷新全部") { Task { await model.refreshAllStatuses(userInitiated: true) } }.buttonStyle(.borderedProminent).disabled(model.busyMessage != nil)
                 }
                 ForEach(model.accountsSorted, id: \.0) { key, account in
                     let status = model.statuses[key]
@@ -1744,7 +1748,7 @@ struct RunsView: View {
                                 Text(receipt.dispatchedAt + (receipt.runID.map { " · Run #\($0)" } ?? " · 编号待核对")).font(.caption.monospaced()).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button("重查已有任务") { Task { await model.retryExistingWorkflow(receipt) } }.disabled(!model.isGitHubReady)
+                            Button(receipt.retryTitle) { Task { await model.retryExistingWorkflow(receipt) } }.disabled(!model.isGitHubReady || model.busyMessage != nil || receipt.supersededBy != nil)
                         }
                     }
                 }

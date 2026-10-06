@@ -1,24 +1,38 @@
 import Foundation
 
 extension GitHubClient {
-    func triggerWorkflow(_ workflow: String, account: String) throws -> WorkflowRunReceipt {
+    func triggerWorkflow(_ workflow: String, account: String, replaceUnidentifiedStatus: Bool = false) throws -> WorkflowRunReceipt {
         guard branch == "master", let receiptStore else { throw ManualAccountError.storage }
-        var (receipt, shouldDispatch) = try receiptStore.prepareWorkflow(workflow, account: account)
+        var (receipt, shouldDispatch) = try receiptStore.prepareWorkflow(workflow, account: account, replaceUnidentifiedStatus: replaceUnidentifiedStatus)
         if !shouldDispatch {
-            guard receipt.runID != nil else { throw WorkflowReceiptError.missingRunID }
+            guard receipt.runID != nil else {
+                throw workflow == "gladosStatus.yml" ? WorkflowReceiptError.statusDispatchUncertain : WorkflowReceiptError.missingRunID
+            }
             return receipt
         }
         do {
-            let result = try ProcessRunner.run(gh, ["workflow", "run", workflow, "--repo", repo, "--ref", "master", "-f", "account=\(account)"], timeout: 45)
-            receipt.runID = try WorkflowRunRules.dispatchedID(stdout: result.stdout, repository: repo)
+            let input = try JSONSerialization.data(withJSONObject: ["ref": "master", "inputs": ["account": account]])
+            let result = try ProcessRunner.run(gh, [
+                "api", "--hostname", "github.com", "--method", "POST",
+                "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2026-03-10",
+                "repos/\(repo)/actions/workflows/\(workflow)/dispatches", "--input", "-"
+            ], input: input, timeout: 45)
             receipt.dispatchAcknowledged = result.exitCode == 0
+            // Retain the acknowledgement even if the response cannot be decoded.
+            // No exception below can cause a second POST for this intent.
+            try receiptStore.saveWorkflow(receipt)
+            guard result.exitCode == 0 else { throw WorkflowReceiptError.dispatchUncertain }
+            receipt.runID = try WorkflowRunRules.dispatchedID(response: Data(result.stdout.utf8), repository: repo)
             try receiptStore.saveWorkflow(receipt)
             return receipt
         } catch {
             receipt.queryState = .interrupted
             try receiptStore.saveWorkflow(receipt)
-            if error is WorkflowReceiptError { throw error }
-            throw WorkflowReceiptError.dispatchUncertain
+            let receiptError = (error as? WorkflowReceiptError) ?? .dispatchUncertain
+            if workflow == "gladosStatus.yml", [.missingRunID, .dispatchUncertain].contains(receiptError) {
+                throw WorkflowReceiptError.statusDispatchUncertain
+            }
+            throw receiptError
         }
     }
 

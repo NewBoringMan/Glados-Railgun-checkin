@@ -182,6 +182,7 @@ struct ManualAccountsNativeTests {
         try expect(Data(contentsOf: legacyDB) == legacyBefore, "legacy sqlite remains byte-identical")
         try expect(target.session(for: "FFFFFFFFFFFFFFFF") == nil, "email migration does not manufacture credentials")
         try workflowReceiptFixtures(root: root)
+        try workflowRunClientFixtures(root: root)
         print("PASS: \(checks) isolated native account-store checks; no real Keychain, network, or user directories accessed.")
     }
 }
