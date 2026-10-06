@@ -21,10 +21,75 @@ struct AccountsFile: Decodable {
 struct StatusCacheEntry: Decodable {
     let accountKey: String
     let email: String?
+    let ok: Bool?
 
     enum CodingKeys: String, CodingKey {
         case accountKey = "account_key"
-        case email
+        case email, ok
+    }
+}
+
+private enum PolicyEmailDirectory {
+    private static let maximumBytes = 2 * 1024 * 1024
+    private static let manualAccountsURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/GLaDOS Account Center/ManualAccounts/accounts.json")
+
+    private struct ManualDirectory: Decodable {
+        let version: Int
+        let accounts: [String: ManualEntry]
+    }
+
+    private struct ManualEntry: Decodable {
+        let accountKey: String
+        let email: String
+    }
+
+    private static func boundedData(at url: URL) -> Data? {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size <= maximumBytes,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maximumBytes + 1), data.count <= maximumBytes else { return nil }
+        return data
+    }
+
+    private static func normalizedKey(_ value: String) -> String? {
+        let key = value.uppercased()
+        return key.range(of: "^[A-F0-9]{16}$", options: .regularExpression) == nil ? nil : key
+    }
+
+    static func normalizedEmail(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let email = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard email.utf8.count <= 254,
+              !email.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              email.range(of: "^[^\\s<>@,;]+@[^\\s<>@,;]+\\.[^\\s<>@,;]+$", options: .regularExpression) != nil else { return nil }
+        return email
+    }
+
+    static func load() -> [String: String] {
+        let decoder = JSONDecoder()
+        var emails: [String: String] = [:]
+        if let data = boundedData(at: statusCacheURL),
+           let entries = try? decoder.decode([StatusCacheEntry].self, from: data) {
+            for entry in entries where entry.ok == true {
+                guard let key = normalizedKey(entry.accountKey), let email = normalizedEmail(entry.email) else { continue }
+                emails[key] = email
+            }
+        }
+        // Names are private identity metadata, independent of live authentication.
+        // Reading this directory never opens the credential vault or changes it.
+        if let data = boundedData(at: manualAccountsURL),
+           let directory = try? decoder.decode(ManualDirectory.self, from: data),
+           directory.version == 1, directory.accounts.count <= 500 {
+            for (dictionaryKey, entry) in directory.accounts {
+                guard let key = normalizedKey(dictionaryKey), dictionaryKey == key, entry.accountKey == key,
+                      let email = normalizedEmail(entry.email) else { continue }
+                emails[key] = email
+            }
+        }
+        return emails
     }
 }
 
@@ -62,12 +127,10 @@ struct AccountRow: Identifiable, Hashable {
     var id: String { key }
 
     private var normalizedEmail: String? {
-        guard let email else { return nil }
-        let value = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
+        PolicyEmailDirectory.normalizedEmail(email)
     }
 
-    var displayName: String { normalizedEmail ?? label }
+    var displayName: String { normalizedEmail ?? "待补邮箱" }
     var subtitle: String { normalizedEmail == nil ? key : "\(label) · \(key)" }
 }
 
@@ -226,15 +289,7 @@ final class PolicyEditorModel: ObservableObject {
                         throw PolicyEditorError.commandFailed(policyMetadata.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
                     }
                 }
-                if let cacheData = try? Data(contentsOf: statusCacheURL),
-                   let cachedEntries = try? decoder.decode([StatusCacheEntry].self, from: cacheData) {
-                    for entry in cachedEntries {
-                        let email = (entry.email ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !email.isEmpty {
-                            emailsByKey[entry.accountKey.uppercased()] = email
-                        }
-                    }
-                }
+                emailsByKey = PolicyEmailDirectory.load()
                 return (accounts, catalog, policies, policySHA, emailsByKey)
             }.value
 

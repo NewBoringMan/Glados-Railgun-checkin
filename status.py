@@ -6,7 +6,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from checkin import AuthenticationError, ChallengeError, DEFAULT_DOMAINS, GladosAPI, NetworkError, ProtocolError, safe_payload_summary
+from checkin import (
+    AuthenticationError, ChallengeError, DEFAULT_DOMAINS, GladosAPI, NetworkError,
+    ProtocolError, IdentityMismatchError, error_kind, is_terminal_session_error, safe_payload_summary,
+)
+from session_context import SessionContextError, parse_session
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -133,7 +137,7 @@ def _read_status_payload(api: GladosAPI) -> Dict[str, Any]:
 def _read_points_payload(api: GladosAPI) -> Dict[str, Any]:
     payload = api._request_json("GET", "/api/user/points")
     if _optional_number(payload, ("points", "point", "pointsTotal", "points_total")) is None:
-        raise ProtocolError(f"{api.domain} 积分接口缺少 points · {safe_payload_summary(payload)}")
+        raise ProtocolError(f"{api.domain} 积分接口缺少 points · {safe_payload_summary(payload, cookie=api.cookie)}")
     return payload
 
 
@@ -270,27 +274,35 @@ def build_checkin_history(
 
 def read_status(cookie: str, account_key: str, domains: Iterable[str]):
     """Read account state with Points as the required source and Status as optional metadata."""
-    last_error = ""
-    for domain in domains:
+    try:
+        context = parse_session(cookie, account_key)
+    except SessionContextError as exc:
+        result = _error_result(account_key, "", str(exc))
+        result["error_kind"] = error_kind(exc)
+        return result
+    account_key = account_key or context.account_key
+    diagnostics = []
+    for domain in context.domains(domains):
         api = GladosAPI(domain, cookie)
         try:
-            # Points is the durable account-status source used for authentication,
-            # points, the native streak, and the calendar. Status is deliberately
-            # queried only afterwards so a schema change there cannot blank a card.
+            # Points establishes read access only. It never verifies that a
+            # subsequent check-in request will be accepted by the service.
             points_payload = _read_points_payload(api)
             points = _optional_number(points_payload, ("points", "point", "pointsTotal", "points_total"))
             if points is None:
-                raise ProtocolError(f"{domain} 积分接口缺少 points · {safe_payload_summary(points_payload)}")
+                raise ProtocolError(f"{domain} 积分接口缺少 points · {safe_payload_summary(points_payload, cookie=api.cookie)}")
 
             status_payload: Dict[str, Any] = {}
             status_warning = ""
             try:
                 status_payload = _read_status_payload(api)
+            except IdentityMismatchError:
+                raise
             except (NetworkError, ProtocolError, AuthenticationError, ChallengeError) as exc:
                 status_warning = str(exc)
 
             plan_name, vip_level = plan_from_status_data(status_payload)
-            email = _text_field(status_payload, ("email", "userEmail"))
+            email = _text_field(status_payload, ("email", "userEmail")) or context.email
             checkin_history, _, history_source = build_checkin_history(points_payload)
             streak = native_streak(points_payload, status_payload)
             days_left = _optional_number(status_payload, ("leftDays", "daysLeft", "left_days"))
@@ -307,14 +319,29 @@ def read_status(cookie: str, account_key: str, domains: Iterable[str]):
                 "checkin_history": checkin_history,
                 "history_source": history_source,
                 "status_warning": status_warning,
+                "session_warning": context.warning,
+                "authentication_state": "accepted_for_status",
+                "checkin_verified": False,
+                "error_kind": "",
+                "diagnostics": diagnostics,
                 "error": "",
             }
         except (NetworkError, ProtocolError, AuthenticationError, ChallengeError) as exc:
-            last_error = str(exc)
+            diagnostics.append({"domain": domain, "error_kind": error_kind(exc), "error": str(exc)})
+            if is_terminal_session_error(exc):
+                break
             continue
         finally:
             api.close()
-    return _error_result(account_key, "", last_error or "所有 GLaDOS 域名均不可用")
+    primary = diagnostics[-1] if diagnostics and diagnostics[-1]["error_kind"] in {"authentication_rejected", "device_mismatch", "identity_mismatch", "verification_required"} else (diagnostics[0] if diagnostics else {})
+    result = _error_result(account_key, primary.get("domain", ""), primary.get("error", "所有 GLaDOS 域名均不可用"))
+    result.update({
+        "email": context.email,
+        "error_kind": primary.get("error_kind", ""),
+        "session_warning": context.warning,
+        "diagnostics": diagnostics,
+    })
+    return result
 
 
 def _error_result(account_key: str, domain: str, error: str) -> Dict[str, Any]:
@@ -331,6 +358,11 @@ def _error_result(account_key: str, domain: str, error: str) -> Dict[str, Any]:
         "checkin_history": [],
         "history_source": "unavailable",
         "status_warning": "",
+        "session_warning": "",
+        "authentication_state": "unavailable",
+        "checkin_verified": False,
+        "error_kind": "",
+        "diagnostics": [],
         "error": error,
     }
 

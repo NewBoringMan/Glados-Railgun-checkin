@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -17,6 +17,10 @@ except ImportError:
     PushDeer = None
 
 from logging_config import init_logger
+from session_context import (
+    SessionContext, SessionContextError, account_key_from_user_id, parse_session,
+    split_sessions,
+)
 
 
 LOGGER = init_logger()
@@ -40,6 +44,18 @@ class CheckinError(RuntimeError):
 
 
 class AuthenticationError(CheckinError):
+    pass
+
+
+class AuthenticationRejected(AuthenticationError):
+    """An explicit server refusal; do not retry it against other domains."""
+
+
+class DeviceMismatchError(AuthenticationRejected):
+    pass
+
+
+class IdentityMismatchError(AuthenticationRejected):
     pass
 
 
@@ -91,6 +107,9 @@ class AccountResult:
     points_needed: Optional[int] = None
     points_after_exchange: Optional[int] = None
     status_warning: str = ""
+    session_warning: str = ""
+    error_kind: str = ""
+    diagnostics: List[Dict[str, str]] = field(default_factory=list)
     error: str = ""
 
     @property
@@ -104,7 +123,7 @@ class Config:
     def __init__(self, env: Optional[Dict[str, str]] = None):
         source = os.environ if env is None else env
         raw = source.get("GLADOS_COOKIES", "")
-        self.cookies: List[str] = [item.strip() for item in raw.split("&") if item.strip()]
+        self.cookies: List[str] = split_sessions(raw)
         self.push_key = source.get("PUSHDEER_SENDKEY", "").strip()
         self.verbose = _as_bool(source.get("GLADOS_VERBOSE"), False)
         self.auto_exchange = _as_bool(source.get("GLADOS_AUTO_EXCHANGE"), False)
@@ -121,18 +140,23 @@ class Config:
 
 
 class GladosAPI:
-    def __init__(self, domain: str, cookie: str, *, verbose: bool = False, session: Optional[requests.Session] = None):
+    def __init__(self, domain: str, cookie: str | SessionContext, *, verbose: bool = False, session: Optional[requests.Session] = None):
+        self.context = parse_session(cookie)
+        if self.context.structured and domain != self.context.host:
+            raise SessionContextError("登录信息仅限原登录域名，已停止跨域请求")
         self.domain = domain
-        self.cookie = cookie
+        self.cookie = self.context.cookie_header
         self.verbose = verbose
         self.session = session or requests.Session()
         self.base_url = f"https://{domain}"
         self.headers = {
             "accept": "application/json, text/plain, */*",
-            "cookie": cookie,
+            "cookie": self.cookie,
             "origin": self.base_url,
             "referer": f"{self.base_url}/console/checkin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+            # Manual captures always carry the actual browser UA. This legacy
+            # fallback preserves older Secrets but is never described as verified.
+            "user-agent": self.context.user_agent or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150 Safari/537.36",
         }
 
     def close(self) -> None:
@@ -150,6 +174,7 @@ class GladosAPI:
                     headers=self.headers,
                     json=data if method.upper() == "POST" else None,
                     timeout=(5, 15),
+                    allow_redirects=False,
                 )
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = exc
@@ -160,11 +185,28 @@ class GladosAPI:
             except requests.RequestException as exc:
                 raise NetworkError(f"{self.domain} 请求异常") from exc
 
+            # Inspect authentication reasons before generic HTTP errors. A 200
+            # JSON refusal is just as terminal as a 401, and a challenge is not
+            # evidence that the Cookie has expired.
+            text = response.text or ""
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                self._check_authentication(payload, path)
+            body = text.lower()
+            if "device-mismatch" in body or "device_mismatch" in body:
+                raise DeviceMismatchError(f"{self.domain} {path}：登录设备信息不匹配（device-mismatch），请手动检查原登录浏览器")
+            if "automated check-in detected" in body or "automated checkin detected" in body:
+                raise ChallengeError(f"{self.domain} {path}：服务端拒绝自动签到（automated-checkin-detected），已停止重试")
             if response.status_code in {401, 403}:
-                body = (response.text or "").lower()
                 if any(hint in body for hint in CHALLENGE_HINTS):
-                    raise ChallengeError(f"{self.domain} 返回了验证/挑战页面，已停止自动操作")
-                raise AuthenticationError(f"{self.domain} 登录信息已失效或无权限（HTTP {response.status_code}）")
+                    raise ChallengeError(f"{self.domain} {path}：需要网页验证，已停止重试")
+                raise AuthenticationRejected(f"{self.domain} {path}：服务端拒绝当前登录授权（HTTP {response.status_code}），请手动检查原登录浏览器")
+
+            if 300 <= response.status_code < 400:
+                raise AuthenticationRejected(f"{self.domain} {path}：接口要求跳转，已停止以免把登录信息发往其他地址")
 
             if response.status_code in RETRYABLE_STATUS_CODES:
                 if attempt + 1 >= attempts:
@@ -175,18 +217,55 @@ class GladosAPI:
             if response.status_code >= 400:
                 raise ProtocolError(f"{self.domain} 接口返回 HTTP {response.status_code}")
 
-            text = response.text or ""
             if any(hint in text.lower() for hint in CHALLENGE_HINTS) and "{" not in text[:10]:
-                raise ChallengeError(f"{self.domain} 返回了验证/挑战页面，已停止自动操作")
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise ProtocolError(f"{self.domain} 接口返回非 JSON 内容") from exc
+                raise ChallengeError(f"{self.domain} {path}：需要网页验证，已停止重试")
+            if payload is None:
+                raise ProtocolError(f"{self.domain} {path}：接口返回非 JSON 内容")
             if not isinstance(payload, dict):
                 raise ProtocolError(f"{self.domain} 接口 JSON 顶层不是对象")
+            self._check_response_identity(payload)
             return payload
 
         raise NetworkError(f"{self.domain} 请求失败: {last_error}")
+
+    def _check_authentication(self, payload: Dict[str, Any], path: str) -> None:
+        reason = _first_string(payload, ("reason", "errorReason")).strip().lower()
+        message = _first_string(payload, ("message", "error")).strip().lower()
+        if "device-mismatch" in reason or "device_mismatch" in reason or "device-mismatch" in message:
+            raise DeviceMismatchError(f"{self.domain} {path}：登录设备信息不匹配（device-mismatch），请手动检查原登录浏览器")
+        if "automated check-in detected" in message or "automated checkin detected" in message or reason in {"automated-checkin-detected", "automated_checkin_detected"}:
+            raise ChallengeError(f"{self.domain} {path}：服务端拒绝自动签到（automated-checkin-detected），已停止重试")
+        if any(word in reason for word in ("captcha", "challenge")):
+            raise ChallengeError(f"{self.domain} {path}：需要网页验证，已停止重试")
+        code = payload.get("code")
+        if str(code) == "-2":
+            raise AuthenticationRejected(f"{self.domain} {path}：服务端拒绝当前登录授权（code=-2），无法仅凭此错误确定过期时间；请手动检查原登录浏览器")
+
+    def _check_response_identity(self, payload: Dict[str, Any]) -> None:
+        if not self.context.structured:
+            return
+        for source in _candidate_dicts(payload):
+            for key in ("userId", "user_id", "uid"):
+                if source.get(key) is None:
+                    continue
+                try:
+                    actual_key = account_key_from_user_id(source[key])
+                except SessionContextError as exc:
+                    raise IdentityMismatchError("服务端返回无法核对的账号身份，已停止操作") from exc
+                if actual_key != self.context.account_key:
+                    raise IdentityMismatchError("服务端账号与已保存账号不一致，已停止操作")
+            for key in ("email", "userEmail", "accountEmail"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip() and value.strip().casefold() != self.context.email.casefold():
+                    raise IdentityMismatchError("服务端邮箱与已保存账号不一致，已停止操作")
+
+    def safe_message(self, value: Any, limit: int = 120) -> str:
+        message = str(value or "")
+        for part in self.cookie.split(";"):
+            _, separator, cookie_value = part.strip().partition("=")
+            if separator and cookie_value:
+                message = message.replace(cookie_value, "[redacted]")
+        return redact_diagnostic(message, limit)
 
     def status(self) -> Dict[str, Any]:
         """Read optional account metadata across legacy and newer response envelopes."""
@@ -205,7 +284,7 @@ class GladosAPI:
             allow_retry=False,
         )
         code = payload.get("code")
-        message = str(payload.get("message", ""))
+        message = self.safe_message(payload.get("message", ""))
         if code == 0:
             return {
                 "state": "success",
@@ -223,7 +302,7 @@ class GladosAPI:
         points = _first_int(payload, ("points", "point", "pointsTotal", "points_total"))
         if points is None:
             raise ProtocolError(
-                f"{self.domain} 积分接口缺少 points · {safe_payload_summary(payload)}"
+                f"{self.domain} 积分接口缺少 points · {safe_payload_summary(payload, cookie=self.cookie)}"
             )
         return points
 
@@ -236,9 +315,9 @@ class GladosAPI:
         )
         if payload.get("code") != 0:
             raise ProtocolError(
-                f"兑换接口业务拒绝，code={payload.get('code')!r}, message={str(payload.get('message', ''))[:120]}"
+                f"兑换接口业务拒绝，code={payload.get('code')!r}, message={self.safe_message(payload.get('message', ''))}"
             )
-        return str(payload.get("message") or "兑换成功")
+        return self.safe_message(payload.get("message") or "兑换成功")
 
 
 def load_exchange_catalog(path: Path) -> List[ExchangePlan]:
@@ -367,10 +446,35 @@ def _refresh_optional_status(api: GladosAPI, result: AccountResult) -> None:
     try:
         status = api.status()
         result.days_left = status.get("days_left")
-        result.email = status.get("email", "")
+        result.email = status.get("email") or result.email
         result.plan_name = status.get("plan_name", "")
+    except IdentityMismatchError as exc:
+        result.error = str(exc)
+        result.error_kind = error_kind(exc)
     except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
         result.status_warning = str(exc)
+
+
+def error_kind(error: BaseException) -> str:
+    if isinstance(error, DeviceMismatchError):
+        return "device_mismatch"
+    if isinstance(error, IdentityMismatchError):
+        return "identity_mismatch"
+    if isinstance(error, SessionContextError):
+        return "invalid_session_context"
+    if isinstance(error, AuthenticationError):
+        return "authentication_rejected"
+    if isinstance(error, ChallengeError):
+        return "verification_required"
+    if isinstance(error, NetworkError):
+        return "network"
+    return "protocol"
+
+
+def is_terminal_session_error(error: BaseException) -> bool:
+    # AuthenticationError is also used by legacy callers for a domain lookup
+    # failure. Real API refusals use the explicit terminal subclass above.
+    return isinstance(error, (AuthenticationRejected, ChallengeError, SessionContextError))
 
 
 def run_one_account(
@@ -389,6 +493,15 @@ def run_one_account(
         account_key=account_key or f"legacy-{account_index}",
         auto_exchange=auto_exchange,
     )
+    try:
+        context = parse_session(cookie, account_key)
+    except SessionContextError as exc:
+        result.error = str(exc)
+        result.error_kind = error_kind(exc)
+        return result
+    result.account_key = account_key or context.account_key or result.account_key
+    result.email = context.email
+    result.session_warning = context.warning
     selected_plan, configured_policy, policy_source, policy_warning = resolve_exchange_plan(
         catalog, result.account_key, account_policies
     )
@@ -403,8 +516,7 @@ def run_one_account(
     # The write path is intentionally first. Read-only status/points APIs must
     # never gate the check-in request itself.
     selected_api = None
-    last_error = ""
-    for domain in domains:
+    for domain in context.domains(domains):
         api = api_factory(domain, cookie)
         try:
             outcome = api.checkin()
@@ -415,21 +527,34 @@ def run_one_account(
             selected_api = api
             break
         except (NetworkError, ProtocolError, AuthenticationError, ChallengeError) as exc:
-            last_error = str(exc)
+            result.diagnostics.append({"domain": domain, "error_kind": error_kind(exc), "error": str(exc)})
+            if not result.error:
+                result.error = str(exc)
+                result.error_kind = error_kind(exc)
+                result.domain = domain
             api.close()
+            if is_terminal_session_error(exc):
+                result.error = str(exc)
+                result.error_kind = error_kind(exc)
+                result.domain = domain
+                break
             continue
 
     if selected_api is None:
-        result.error = last_error or "所有 GLaDOS 域名均不可用"
+        result.error = result.error or "所有 GLaDOS 域名均不可用"
         return result
+    result.error = ""
+    result.error_kind = ""
 
     try:
         try:
             result.points_total = selected_api.points()
         except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
             result.error = f"签到已完成，但积分/兑换检查失败：{exc}"
+            result.error_kind = error_kind(exc)
             result.exchange = "check_failed" if auto_exchange else "disabled"
-            _refresh_optional_status(selected_api, result)
+            if not is_terminal_session_error(exc):
+                _refresh_optional_status(selected_api, result)
             return result
 
         if not auto_exchange:
@@ -449,13 +574,18 @@ def run_one_account(
         except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
             result.exchange = "failed"
             result.error = f"签到已完成，但自动兑换失败：{exc}"
-            _refresh_optional_status(selected_api, result)
+            result.error_kind = error_kind(exc)
+            if not is_terminal_session_error(exc):
+                _refresh_optional_status(selected_api, result)
             return result
 
         try:
             result.points_after_exchange = selected_api.points()
         except (AuthenticationError, ChallengeError, NetworkError, ProtocolError) as exc:
             result.error = f"兑换已提交，但兑换后积分复核失败：{exc}"
+            result.error_kind = error_kind(exc)
+            if is_terminal_session_error(exc):
+                return result
 
         _refresh_optional_status(selected_api, result)
         return result
@@ -489,6 +619,8 @@ def format_human_summary(result: AccountResult) -> str:
         lines.append(f"兑换: {result.exchange}")
     if result.status_warning:
         lines.append(f"状态辅助信息: 暂不可用 · {result.status_warning}")
+    if result.session_warning:
+        lines.append(f"登录信息: {result.session_warning}")
     if result.error:
         lines.append(f"错误: {result.error}")
     return "\n".join(lines)
@@ -507,7 +639,13 @@ def send_push(push_key: str, title: str, content: str) -> None:
 
 
 def main() -> int:
-    config = Config()
+    try:
+        config = Config()
+    except SessionContextError as exc:
+        LOGGER.error("登录信息不可用: %s", exc)
+        result = AccountResult(account_index=1, account_key=os.environ.get("GLADOS_ACCOUNT_KEY", ""), error=str(exc), error_kind="invalid_session_context")
+        print("GLADOS_RESULT_JSON=" + json.dumps(asdict(result), ensure_ascii=False, separators=(",", ":")))
+        return 2
     if not config.cookies:
         LOGGER.error("未找到有效的 GLADOS_COOKIES。")
         return 2
@@ -582,7 +720,7 @@ def _candidate_dicts(data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     yield data
 
 
-def safe_payload_summary(data: Dict[str, Any]) -> str:
+def safe_payload_summary(data: Dict[str, Any], *, cookie: str = "") -> str:
     """Return non-secret API shape diagnostics without logging account data values."""
     top_keys = sorted(str(key) for key in data.keys())[:24]
     nested = data.get("data")
@@ -594,11 +732,24 @@ def safe_payload_summary(data: Dict[str, Any]) -> str:
         else []
     )
     code = data.get("code")
-    message = str(data.get("message", "") or "").replace("\n", " ").replace("\r", " ").strip()[:80]
+    message = str(data.get("message", "") or "")
+    for part in cookie.split(";"):
+        _, separator, cookie_value = part.strip().partition("=")
+        if separator and cookie_value:
+            message = message.replace(cookie_value, "[redacted]")
+    message = redact_diagnostic(message, 80)
     return (
         f"code={code!r}, message={message!r}, keys={top_keys!r}, "
         f"data_keys={data_keys!r}, data_user_keys={user_keys!r}"
     )
+
+
+def redact_diagnostic(value: Any, limit: int = 120) -> str:
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    text = re.sub(r"(?i)(?:gld:sess(?:\.sig)?|koa:sess(?:\.sig)?|cookie|authorization|token)\s*[:=]\s*[^;,\s]+", "[redacted]", text)
+    text = re.sub(r"[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+", "[email]", text)
+    text = re.sub(r"[A-Za-z0-9_+/=-]{32,}", "[redacted]", text)
+    return text[:limit]
 
 
 def _first_string(data: Dict[str, Any], keys: Iterable[str]) -> str:

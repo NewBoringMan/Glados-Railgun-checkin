@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+    <key>CFBundleDisplayName</key><string>GLaDOS Account Center</string>
+    <key>CFBundleExecutable</key><string>GLaDOSAccountCenter</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIdentifier</key><string>com.enoch.glados-account-center</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>GLaDOS Account Center</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>2.0.10</string>
+    <key>CFBundleVersion</key><string>20017</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSAppleEventsUsageDescription</key><string>用于在你主动新增或更新 GLaDOS 账号时选择和激活浏览器中的 GLaDOS 页面。</string>
+    <key>NSHumanReadableCopyright</key><string>GLaDOS Account Center</string>
+</dict>
+</plist>

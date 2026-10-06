@@ -10,6 +10,7 @@ on:
     paths:
       - 'checkin.py'
       - 'status.py'
+      - 'session_context.py'
       - 'logging_config.py'
       - 'requirements.txt'
       - 'tests/**'
@@ -19,6 +20,7 @@ on:
     paths:
       - 'checkin.py'
       - 'status.py'
+      - 'session_context.py'
       - 'logging_config.py'
       - 'requirements.txt'
       - 'tests/**'
@@ -39,7 +41,7 @@ jobs:
           python-version: '3.13'
       - run: pip install -r requirements.txt
       - name: Compile Python modules
-        run: python -m py_compile checkin.py status.py logging_config.py
+        run: python -m py_compile checkin.py status.py session_context.py logging_config.py
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
