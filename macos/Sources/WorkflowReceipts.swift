@@ -2,16 +2,27 @@ import Foundation
 
 enum WorkflowReceiptError: LocalizedError, Equatable {
     case identity, protocolError, interrupted, missingRunID, dispatchUncertain, statusDispatchUncertain
+    case queryInterrupted(WorkflowQueryStage)
     var errorDescription: String? {
         switch self {
         case .identity: return "任务归属未通过核对。已保存的登录资料和发布回执保留；未重新派发任务。"
         case .protocolError: return "GitHub 任务资料不完整。请稍后重查已有任务；未重新派发。"
         case .interrupted: return "GitHub 查询暂未完成。可重查已有任务；本机登录资料和发布状态未改变。"
+        case .queryInterrupted(let stage):
+            switch stage {
+            case .run: return "GitHub 任务状态暂未读完。任务编号已保留，可重查原任务。"
+            case .jobs: return "GitHub 账号任务明细暂未读完。任务编号已保留，可重查原任务。"
+            case .logs: return "GitHub 任务已结束，日志暂未读完。已保存任务结果，可重查原任务继续读取。"
+            }
         case .missingRunID: return "此次派发未返回可核对的任务编号。请在运行记录中指定原任务编号；应用不会自动再次派发。"
         case .dispatchUncertain: return "此次任务派发结果尚不确定。回执已保存在本机，请重查原任务；应用不会自动再次派发。"
         case .statusDispatchUncertain: return "此次刷新尚未取得可核对的任务编号。可以再次手动刷新；本机账号和登录资料已保留。"
         }
     }
+}
+
+enum WorkflowQueryStage: String, Codable, Sendable {
+    case run, jobs, logs
 }
 
 enum WorkflowQueryState: String, Codable, Sendable {
@@ -29,6 +40,8 @@ struct WorkflowRunReceipt: Codable, Equatable, Identifiable, Sendable {
     var dispatchAcknowledged = false
     var queryState: WorkflowQueryState = .pending
     var conclusion: String?
+    // A missing stage remains compatible with receipts written by older Apps.
+    var queryStage: WorkflowQueryStage?
     // Optional metadata keeps existing receipt files readable. The original
     // unknown query remains unknown; replacement does not claim it failed.
     var supersededBy: String?
@@ -37,6 +50,9 @@ struct WorkflowRunReceipt: Codable, Equatable, Identifiable, Sendable {
     var title: String { workflow == "gladosStatus.yml" ? "资料查询" : "手动签到" }
     var stateText: String {
         if supersededBy != nil { return "已由新的资料查询替代" }
+        if conclusion != nil, !queryState.finished, queryState != .rejected {
+            return "任务已结束，结果尚未读完，可重查原任务"
+        }
         switch queryState {
         case .succeeded: return workflow == "gladosStatus.yml" ? "资料查询任务成功（非签到认证）" : "签到任务成功"
         case .failed: return "任务已完成，结果需要处理"

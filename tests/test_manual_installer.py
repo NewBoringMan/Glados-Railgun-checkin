@@ -54,7 +54,7 @@ class InstallerFixture(unittest.TestCase):
         self.backups = self.root / "backups"
         self.make_app(self.app, "20042", b"original executable")
         self.expected = installer.fingerprint(self.app)
-        self.make_app(self.candidate, "20044", b"new executable")
+        self.make_app(self.candidate, "20045", b"new executable")
         self.origin_path = self.candidate / "Contents/Resources/manual-build-origin.json"
         self.origin_path.write_text(json.dumps({
             "schema": "glados.manual-build-origin", "version": 1,
@@ -93,7 +93,7 @@ class InstallerFixture(unittest.TestCase):
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
             "CFBundleIdentifier": installer.APP_ID,
             "CFBundleVersion": build,
-            "CFBundleShortVersionString": "2.0.12" if build == "20044" else "2.0.10",
+            "CFBundleShortVersionString": "2.0.13" if build == "20045" else "2.0.10",
             "CFBundleExecutable": "GLaDOSAccountCenter",
         }))
         (app / "Contents/MacOS/GLaDOSAccountCenter").write_bytes(executable)
@@ -260,7 +260,7 @@ class ReplacementTests(InstallerFixture):
         result = self.install()
         self.assertTrue(alias.is_symlink())
         self.assertEqual(alias.resolve(), self.app)
-        self.assertEqual(installer.plist(self.app / "Contents/Info.plist")["CFBundleVersion"], "20044")
+        self.assertEqual(installer.plist(self.app / "Contents/Info.plist")["CFBundleVersion"], "20045")
         self.assertEqual(installer.fingerprint(Path(result["rollback_app"])), self.expected)
         self.assertEqual(self.staging_dirs(), [])
 
