@@ -12,7 +12,18 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_APP="$1"
 SOURCE_APP="${2:-}"
 GLADOS_ARCH="${GLADOS_ARCH:-$(uname -m)}"
+GLADOS_PREBUILT_APP="${GLADOS_PREBUILT_APP:-}"
+GLADOS_PREBUILT_SHA256="${GLADOS_PREBUILT_SHA256:-}"
 case "$GLADOS_ARCH" in arm64|x86_64) ;; *) echo 'Unsupported architecture' >&2; exit 2;; esac
+if [[ -n "$GLADOS_PREBUILT_APP" || -n "$GLADOS_PREBUILT_SHA256" ]]; then
+  if [[ -z "$GLADOS_PREBUILT_APP" || -z "$GLADOS_PREBUILT_SHA256" || -z "$SOURCE_APP" ]]; then
+    echo 'Prebuilt mode requires GLADOS_PREBUILT_APP, GLADOS_PREBUILT_SHA256 and an inspected existing App.' >&2
+    exit 2
+  fi
+else
+  # Fail before copying the installed App when the Safari compiler is unavailable.
+  /usr/bin/xcodebuild -version >/dev/null
+fi
 if [[ -e "$OUTPUT_APP" || -L "$OUTPUT_APP" ]]; then
   echo 'Output already exists; choose a new staging path.' >&2
   exit 2
@@ -42,6 +53,70 @@ if sys.argv[2]:
 PY
 )"
 
+if [[ -n "$GLADOS_PREBUILT_APP" ]]; then
+  # Validate the complete CI artifact before any of its compiled code is copied.
+  # Local resources must match that artifact; a version number alone is not enough.
+  GLADOS_PREBUILT_APP="$(python3 - "$SCRIPT_DIR/install-manual.py" "$GLADOS_PREBUILT_APP" "$GLADOS_PREBUILT_SHA256" "$SOURCE_APP" "$OUTPUT_APP" "${TMPDIR:-/private/tmp}" "$PROJECT_DIR" "$GLADOS_ARCH" <<'PY'
+import importlib.util, plistlib, re, subprocess, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('glados_manual_installer', sys.argv[1])
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+prebuilt=module.app_path(sys.argv[2])
+expected=sys.argv[3]
+source=module.app_path(sys.argv[4])
+project=Path(sys.argv[7])
+if not re.fullmatch(r'[a-f0-9]{64}', expected):
+    raise SystemExit('The prebuilt fingerprint must be a lowercase SHA-256 package fingerprint.')
+if any(path.is_symlink() for path in prebuilt.rglob('*')):
+    raise SystemExit('The prebuilt App must not contain symlinks.')
+if '\n' in str(prebuilt) or '\r' in str(prebuilt):
+    raise SystemExit('The prebuilt App path contains an unsupported newline.')
+if prebuilt == source or prebuilt in source.parents or source in prebuilt.parents:
+    raise SystemExit('The prebuilt and inspected Apps must be separate.')
+output=Path(sys.argv[5]).expanduser().absolute()
+for path in (output, *output.parents):
+    if path.is_symlink():
+        raise SystemExit('The output write path must not contain symlinks.')
+for raw in (sys.argv[5], sys.argv[6]):
+    destination=Path(raw).expanduser().resolve()
+    if destination == prebuilt or prebuilt in destination.parents:
+        raise SystemExit('Build output and temporary files must be outside the prebuilt App.')
+if module.fingerprint(prebuilt) != expected:
+    raise SystemExit('The prebuilt App fingerprint does not match the verified artifact.')
+fresh=module.plist(project/'macos/Info.plist')
+info=module.plist(prebuilt/'Contents/Info.plist')
+for key in ('CFBundleIdentifier', 'CFBundleExecutable', 'CFBundleShortVersionString', 'CFBundleVersion'):
+    if info.get(key) != fresh.get(key):
+        raise SystemExit('The prebuilt App identity or version does not match this source.')
+subprocess.run([sys.executable, str(project/'macos/Tests/validate_package.py'), '--app', str(prebuilt), '--bundle-only'], check=True, capture_output=True)
+subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(prebuilt)], check=True, capture_output=True)
+extension=prebuilt/'Contents/PlugIns/GLaDOS Safari Bridge Extension.appex'
+signed=subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', '--xml', str(extension)], check=True, capture_output=True)
+entitlements=plistlib.loads(signed.stdout)
+if any(entitlements.get(key) is not True for key in ('com.apple.security.app-sandbox', 'com.apple.security.network.client')):
+    raise SystemExit('The prebuilt Safari extension is missing required entitlements.')
+extension_executable=module.plist(extension/'Contents/Info.plist').get('CFBundleExecutable')
+if not isinstance(extension_executable, str) or Path(extension_executable).name != extension_executable:
+    raise SystemExit('The prebuilt Safari executable is invalid.')
+executables=[prebuilt/name for name in (
+    'Contents/MacOS/GLaDOSAccountCenter', 'Contents/MacOS/GLaDOSAccountCenter.real',
+    'Contents/Frameworks/GLaDOSPolicyEditor.dylib', 'Contents/Frameworks/PolicyMenuPlugin.dylib',
+    'Contents/Frameworks/GLaDOSNotifications.dylib')]
+executables.append(extension/'Contents/MacOS'/extension_executable)
+for executable in executables:
+    subprocess.run(['/usr/bin/lipo', '-verify_arch', sys.argv[8], str(executable)], check=True, capture_output=True)
+resources=list((project/'macos/Resources').glob('*.js'))+[project/'macos/Resources/AppIcon.icns', project/'app_integration/checkin_watch.py']
+for resource in resources:
+    if resource.is_symlink() or not resource.is_file() or resource.read_bytes() != (prebuilt/'Contents/Resources'/resource.name).read_bytes():
+        raise SystemExit('A local resource differs from the verified prebuilt App: '+resource.name)
+if module.fingerprint(prebuilt) != expected:
+    raise SystemExit('The prebuilt App changed during validation.')
+print(prebuilt)
+PY
+)"
+fi
+
 BUILD_TMP="$(mktemp -d "${TMPDIR:-/private/tmp}/glados-manual-build.XXXXXX")"
 cleanup() {
   python3 - "$BUILD_TMP" <<'PY'
@@ -55,7 +130,7 @@ STAGE_APP="$BUILD_TMP/GLaDOS Account Center.app"
 # Compare the source before and after ditto, and compare the untouched copy with
 # that same baseline. A CI build without a source gets an explicit null baseline
 # and cannot be used by install-manual.py to replace an existing App.
-python3 - "$SCRIPT_DIR/install-manual.py" "$SOURCE_APP" "$STAGE_APP" "$BUILD_TMP/origin.json" "$PROJECT_DIR/macos/Info.plist" <<'PY'
+python3 - "$SCRIPT_DIR/install-manual.py" "$SOURCE_APP" "$STAGE_APP" "$BUILD_TMP/origin.json" "$PROJECT_DIR/macos/Info.plist" "$GLADOS_PREBUILT_SHA256" <<'PY'
 import importlib.util, json, shutil, subprocess, sys
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('glados_manual_installer', sys.argv[1])
@@ -72,10 +147,13 @@ if sys.argv[2]:
 else:
     (app/'Contents').mkdir(parents=True)
     shutil.copyfile(sys.argv[5], app/'Contents/Info.plist')
-Path(sys.argv[4]).write_text(json.dumps({
+origin={
     'schema':'glados.manual-build-origin', 'version':1,
     'sourceFingerprint':source_fingerprint,
-}, indent=2)+'\n', encoding='utf-8')
+}
+if sys.argv[6]:
+    origin['prebuiltFingerprint']=sys.argv[6]
+Path(sys.argv[4]).write_text(json.dumps(origin, indent=2)+'\n', encoding='utf-8')
 PY
 
 MACOS="$STAGE_APP/Contents/MacOS"
@@ -131,7 +209,7 @@ for name in ('Contents/MacOS/RefreshSecretStore', 'Contents/Frameworks/GLaDOSNot
     result=subprocess.run(['/usr/bin/codesign', '-d', '-r-', str(helper)],
                           check=True, capture_output=True, text=True)
     requirement=[line for line in (result.stdout+'\n'+result.stderr).splitlines()
-                 if line.startswith('designated =>')]
+                 if line.startswith(('designated =>', '# designated =>'))]
     if len(requirement) != 1:
         raise SystemExit('Could not record a retained helper signature.')
     retained[name]={'sha256':hashlib.sha256(helper.read_bytes()).hexdigest(),
@@ -170,6 +248,64 @@ cp "$PROJECT_DIR/macos/Resources/"*.js "$RESOURCES/"
 cp "$PROJECT_DIR/macos/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 cp "$SCRIPT_DIR/checkin_watch.py" "$RESOURCES/checkin_watch.py"
 
+EMBEDDED_SAFARI="$PLUGINS/GLaDOS Safari Bridge Extension.appex"
+if [[ -n "$GLADOS_PREBUILT_APP" ]]; then
+  python3 - "$SCRIPT_DIR/install-manual.py" "$GLADOS_PREBUILT_APP" "$GLADOS_PREBUILT_SHA256" "$STAGE_APP" "$PROJECT_DIR" <<'PY'
+import importlib.util, shutil, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('glados_manual_installer', sys.argv[1])
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+prebuilt=module.app_path(sys.argv[2])
+app=Path(sys.argv[4]).resolve(strict=True)
+if module.fingerprint(prebuilt) != sys.argv[3]:
+    raise SystemExit('The prebuilt App changed before copying.')
+names=[
+    'Contents/MacOS/GLaDOSAccountCenter', 'Contents/MacOS/GLaDOSAccountCenter.real',
+    'Contents/Frameworks/GLaDOSPolicyEditor.dylib', 'Contents/Frameworks/PolicyMenuPlugin.dylib',
+    'Contents/PlugIns/GLaDOS Safari Bridge Extension.appex',
+]
+# Never replace either retained helper. Only a genuinely absent notification
+# library receives the validated CI fallback, matching the source-build behavior.
+notifications='Contents/Frameworks/GLaDOSNotifications.dylib'
+if not module.present(app/notifications):
+    names.append(notifications)
+for name in names:
+    source=prebuilt/name
+    target=app/name
+    for path in (target, *target.parents):
+        if path == app:
+            break
+        if path.is_symlink():
+            raise SystemExit('Unsafe symlink in a prebuilt copy destination: '+name)
+    if app not in target.resolve().parents:
+        raise SystemExit('The prebuilt copy destination escapes the staging App.')
+    if source.is_dir():
+        if module.present(target):
+            raise SystemExit('The extension copy destination is already occupied.')
+        shutil.copytree(source, target)
+        if module.fingerprint(source) != module.fingerprint(target):
+            raise SystemExit('The copied Safari extension differs from the prebuilt App.')
+    else:
+        if source.is_symlink() or not source.is_file() or (target.exists() and not target.is_file()):
+            raise SystemExit('Invalid compiled component in the prebuilt copy.')
+        shutil.copy2(source, target)
+        if source.read_bytes() != target.read_bytes() or (source.stat().st_mode & 0o777) != (target.stat().st_mode & 0o777):
+            raise SystemExit('A copied compiled component differs from the prebuilt App.')
+for resource in (Path(sys.argv[5])/'macos/Resources').glob('*.js'):
+    # Check precisely the local build's resources, including any files added
+    # since preflight; unrelated resources inherited from the old App stay intact.
+    candidate=prebuilt/'Contents/Resources'/resource.name
+    staged=app/'Contents/Resources'/resource.name
+    if not candidate.is_file() or not staged.is_file() or staged.read_bytes() != candidate.read_bytes():
+        raise SystemExit('A staged JavaScript resource differs from the prebuilt App: '+resource.name)
+for name in ('AppIcon.icns', 'checkin_watch.py'):
+    if (app/'Contents/Resources'/name).read_bytes() != (prebuilt/'Contents/Resources'/name).read_bytes():
+        raise SystemExit('A staged resource differs from the prebuilt App: '+name)
+if module.fingerprint(prebuilt) != sys.argv[3]:
+    raise SystemExit('The prebuilt App changed during copying.')
+PY
+else
 # The installed notification library is retained byte-for-byte. A source-only
 # CI build compiles the recovered notification ABI for packaging validation.
 if [[ ! -e "$FRAMEWORKS/GLaDOSNotifications.dylib" ]]; then
@@ -211,8 +347,8 @@ xcodebuild -project "$SAFARI_PROJECT/GLaDOS Account Center.xcodeproj" \
   PRODUCT_BUNDLE_IDENTIFIER=com.enoch.glados-account-center.safari-bridge.extension \
   build
 SAFARI_PRODUCT="$SAFARI_TEMP/products/Release/GLaDOS Account Center Extension.appex"
-EMBEDDED_SAFARI="$PLUGINS/GLaDOS Safari Bridge Extension.appex"
 /usr/bin/ditto "$SAFARI_PRODUCT" "$EMBEDDED_SAFARI"
+fi
 
 # xcodebuild signing is disabled above, so apply the extension's capabilities
 # explicitly. The native handler makes an outbound loopback TCP connection.
@@ -249,7 +385,7 @@ for name, signature in expected.items():
     result=subprocess.run(['/usr/bin/codesign', '-d', '-r-', str(helper)],
                           check=True, capture_output=True, text=True)
     requirement=[line for line in (result.stdout+'\n'+result.stderr).splitlines()
-                 if line.startswith('designated =>')]
+                 if line.startswith(('designated =>', '# designated =>'))]
     actual={'sha256':hashlib.sha256(helper.read_bytes()).hexdigest(),
             'designatedRequirement':requirement[0] if len(requirement) == 1 else None}
     if actual != signature:
@@ -259,7 +395,7 @@ python3 "$PROJECT_DIR/macos/Tests/validate_package.py" --app "$STAGE_APP" --bund
 
 # Publish only a fully copied, verified bundle. A failed output copy never leaves
 # a partial App at the requested output path or removes an existing output.
-python3 - "$SCRIPT_DIR/install-manual.py" "$STAGE_APP" "$OUTPUT_APP" <<'PY'
+python3 - "$SCRIPT_DIR/install-manual.py" "$STAGE_APP" "$OUTPUT_APP" "$GLADOS_PREBUILT_APP" <<'PY'
 import importlib.util, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('glados_manual_installer', sys.argv[1])
@@ -269,6 +405,13 @@ source=Path(sys.argv[2])
 output=Path(sys.argv[3]).expanduser()
 if os.path.lexists(output):
     raise SystemExit('Output already exists; choose a new staging path.')
+if sys.argv[4]:
+    absolute=output.absolute()
+    if any(path.is_symlink() for path in (absolute, *absolute.parents)):
+        raise SystemExit('The output write path changed to a symlink.')
+    prebuilt=module.app_path(sys.argv[4])
+    if output.resolve() == prebuilt or prebuilt in output.resolve().parents:
+        raise SystemExit('Final output must remain outside the prebuilt App.')
 output.parent.mkdir(parents=True, exist_ok=True)
 output=output.parent.resolve(strict=True)/output.name
 temporary=Path(tempfile.mkdtemp(prefix='.glados-manual-output-', dir=output.parent))
