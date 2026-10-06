@@ -219,7 +219,8 @@ PY
 python3 - "$MACOS/RefreshSecretStore" "$BUILD_TMP/retained-helper.json" "$EMBEDDED_SAFARI" <<'PY'
 import hashlib, json, plistlib, subprocess, sys
 from pathlib import Path
-signed=subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', sys.argv[3]],
+# Apple TN3125: request XML instead of the default human-readable DER dump.
+signed=subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', '--xml', sys.argv[3]],
                       check=True, capture_output=True)
 entitlements=plistlib.loads(signed.stdout)
 if any(entitlements.get(key) is not True for key in (

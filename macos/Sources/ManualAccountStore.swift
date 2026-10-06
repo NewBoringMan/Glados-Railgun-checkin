@@ -11,6 +11,7 @@ enum ManualAccountError: LocalizedError {
     case keychain(OSStatus)
     case password
     case conflict
+    case remoteSessionFormat
     var errorDescription: String? {
         switch self {
         case .invalid(let reason): return reason
@@ -18,6 +19,35 @@ enum ManualAccountError: LocalizedError {
         case .keychain: return "无法访问本机钥匙串；请解锁这台 Mac 后重试。登录资料未发送到 GitHub。"
         case .password: return "密码错误、文件损坏或文件格式不受支持；未导入任何账号。"
         case .conflict: return "账号身份发生冲突，已停止保存；原有账号没有被覆盖。"
+        case .remoteSessionFormat: return "无法确认生产 master 支持当前登录资料格式，已停止同步。当前账号的本机登录资料已保留，此次凭据未写入 GitHub Secret。请确认云端部署和 GitHub 连接后，点击“同步本机资料”重试。"
+        }
+    }
+}
+
+/// The public capability marker must be deployed alongside the matching Python
+/// readers on production master before any structured Secret is published.
+enum ManualSessionFormatGate {
+    static let markerPath = ".github/glados/session-format.json"
+    private static let schema = "glados.manual-session"
+    private struct Header: Decodable { var schema: String; var version: Int }
+
+    static func requiresRemoteSupport(_ value: String) throws -> Bool {
+        let data = Data(value.utf8)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["schema"] as? String == schema else { return false }
+        guard let header = try? JSONDecoder().decode(Header.self, from: data), header.version == 1 else {
+            throw ManualAccountError.remoteSessionFormat
+        }
+        return true
+    }
+
+    static func validateMarker(_ data: Data) throws {
+        guard data.count <= 4096,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == Set(["schema", "version"]),
+              let header = try? JSONDecoder().decode(Header.self, from: data),
+              header.schema == schema, header.version == 1 else {
+            throw ManualAccountError.remoteSessionFormat
         }
     }
 }

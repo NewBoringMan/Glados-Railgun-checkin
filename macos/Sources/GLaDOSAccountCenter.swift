@@ -271,6 +271,14 @@ final class GitHubClient: @unchecked Sendable {
     func setSecret(name: String, value: String) throws {
         guard name.range(of: "^GLADOS_ACCOUNT_[A-F0-9]{16}$", options: .regularExpression) != nil else { throw AppError.message("Secret 名称未通过安全校验。") }
         guard value.utf8.count <= 48 * 1024 - 1 else { throw AppError.message("登录资料超过 GitHub Secret 的容量限制；完整资料已保存在本机，未发送截断内容。") }
+        if try ManualSessionFormatGate.requiresRemoteSupport(value) {
+            do {
+                // Secrets are shared by repository: a candidate App must verify
+                // production master on every write, regardless of its UI branch.
+                let marker = try readTextFile(ManualSessionFormatGate.markerPath, ref: defaultBranch).0
+                try ManualSessionFormatGate.validateMarker(Data(marker.utf8))
+            } catch { throw ManualAccountError.remoteSessionFormat }
+        }
         let result = try ProcessRunner.run(gh, ["secret", "set", name, "--repo", repo], input: Data((value + "\n").utf8), timeout: 60)
         guard result.exitCode == 0 else { throw AppError.message("更新 GitHub Secret 未完成；已保存的本机登录资料保留，可手动重试同步。") }
     }

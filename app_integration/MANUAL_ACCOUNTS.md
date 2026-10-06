@@ -49,6 +49,12 @@ bash app_integration/build-manual.sh /absolute/staging/GLaDOS-Account-Center.app
 
 前两项分别验证云端业务/会话逻辑和 JavaScript/资源包；后两项需要 macOS，使用隔离存储做原生账号与加密备份测试，并构建、签名验证主 App 和 Safari 扩展。GitHub Actions 的 `GLaDOS Account Center build` 生成 Apple Silicon 候选包，不使用任何生产凭据。
 
+### 生产部署顺序
+
+先把匹配的 `checkin.py`、`status.py`、`session_context.py` 和 `.github/glados/session-format.json` 在同一提交中部署到 App 使用的生产 `master`，再安装新 App、保存或导入新会话。新 App 在写入 Secret 前核对生产分支的格式声明；未部署、声明无效或版本不受支持时，保留本机资料并等待云端升级，不覆盖现有 Secret。
+
+新 JSON 会话一旦写入，后续状态和签到应运行支持该格式的代码版本，不要重新运行旧 SHA 的任务。需要回退 App 时，云端仍需保留兼容解析器；不能直接把云端回退到只支持原始 Cookie 的代码。
+
 无本机原包的 CI 构建只用于编译与包结构验证。正式替换需要先核对实际 App 的物理位置与摘要，确保 MacData 软链接或实际安装位置不会被猜错；在该原包上重新构建，保留未知的其他资源。
 
 ```sh

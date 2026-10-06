@@ -59,6 +59,21 @@ struct ManualAccountsNativeTests {
         let wire = try JSONSerialization.jsonObject(with: first.encoded()) as! [String: Any]
         try expect(Set(wire.keys) == Set(["schema", "version", "accountKey", "email", "cookieHeader", "host", "userAgent", "browser", "capturedAt"]), "exact cloud wire fields")
         try expect(wire["cookieHeader"] as? String == first.cookieHeader, "all cookie fields preserved")
+        try expect(ManualSessionFormatGate.requiresRemoteSupport(String(decoding: first.encoded(), as: UTF8.self)), "structured publication requires production capability check")
+        try expect(!ManualSessionFormatGate.requiresRemoteSupport(first.cookieHeader), "legacy raw cookies retain their existing publication path")
+        try ManualSessionFormatGate.validateMarker(Data(#"{"schema":"glados.manual-session","version":1}"#.utf8))
+        checks += 1
+        for (name, marker) in [
+            ("empty capability marker", ""),
+            ("missing capability version", #"{"schema":"glados.manual-session"}"#),
+            ("wrong capability schema", #"{"schema":"other","version":1}"#),
+            ("unsupported capability version", #"{"schema":"glados.manual-session","version":2}"#),
+            ("Boolean cannot act as capability version", #"{"schema":"glados.manual-session","version":true}"#),
+            ("string cannot act as capability version", #"{"schema":"glados.manual-session","version":"1"}"#),
+            ("unexpected capability fields", #"{"schema":"glados.manual-session","version":1,"extra":true}"#)
+        ] {
+            try rejects(name) { try ManualSessionFormatGate.validateMarker(Data(marker.utf8)) }
+        }
         var bad = first; bad.host = "sub.glados.cloud"
         try rejects("reject unapproved subdomain") { _ = try bad.validated() }
         bad = first; bad.userAgent = "Fixture\r\nCookie: leaked"
