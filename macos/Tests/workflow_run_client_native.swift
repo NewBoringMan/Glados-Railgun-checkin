@@ -164,7 +164,7 @@ extension ManualAccountsNativeTests {
 
         // Polling failures and recovery only GET the server-returned ID.
         ProcessRunner.handler = { call in
-            try expect(!call.isDispatch && call.arguments == ["api", "repos/\(repo)/actions/runs/\(id)"], "failed query reads only the exact bound run")
+            try expect(!call.isDispatch && call.arguments == ["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)"], "failed query reads only the exact bound run on github.com")
             return CommandResult(stdout: "", stderr: "HTTP 403 synthetic rejection", exitCode: 1)
         }
         try rejects("failed GET preserves task for retry") { _ = try client.waitForRun(replacement, timeout: 1) }
@@ -174,20 +174,125 @@ extension ManualAccountsNativeTests {
         let callsBeforeRecovery = ProcessRunner.invocations.count
         ProcessRunner.handler = { call in
             try expect(!call.isDispatch, "recovery cannot dispatch")
-            if call.arguments == ["api", "repos/\(repo)/actions/runs/\(id)"] {
+            if call.arguments == ["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)"] {
                 let value: [String: Any] = ["id": id, "path": ".github/workflows/gladosStatus.yml", "head_branch": "master",
                     "event": "workflow_dispatch", "created_at": replacement.dispatchedAt, "status": "completed", "conclusion": "success"]
                 return CommandResult(stdout: String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self))
             }
-            if call.arguments == ["api", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"] {
+            if call.arguments == ["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"] {
                 let value: [String: Any] = ["total_count": 1, "jobs": [["name": "GLaDOS status " + firstKey, "status": "completed", "conclusion": "success"]]]
                 return CommandResult(stdout: String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self))
             }
-            if call.arguments == ["run", "view", String(id), "--repo", repo, "--log"] { return CommandResult(stdout: "fixture status logs") }
+            if call.arguments == ["run", "view", String(id), "--repo", "github.com/" + repo, "--log"] { return CommandResult(stdout: "fixture status logs") }
             throw FixtureCommandError.unexpectedCommand
         }
         let (conclusion, _, logs) = try client.waitForRun(retry, timeout: 1)
         try expect(conclusion == "success" && logs == "fixture status logs" && ProcessRunner.invocations.count == callsBeforeRecovery + 3, "recovery checks metadata and account jobs before reading exact run logs")
         try expect(ProcessRunner.invocations.filter(\.isDispatch).count == 2, "successful recovery also performs no POST")
+        try workflowReadBudgetFixtures(root: root)
+    }
+
+    static func workflowReadBudgetFixtures(root: URL) throws {
+        let repo = "NewBoringMan/Glados-Railgun-checkin"
+        let id = 37_000_000_031
+        let runArguments = ["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)"]
+        let jobsArguments = ["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"]
+        let logArguments = ["run", "view", String(id), "--repo", "github.com/" + repo, "--log"]
+        func json(_ value: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
+        }
+        func metadata(_ receipt: WorkflowRunReceipt, conclusion: String) throws -> String {
+            try json(["id": id, "path": ".github/workflows/gladosStatus.yml", "head_branch": "master",
+                "event": "workflow_dispatch", "created_at": receipt.dispatchedAt, "status": "completed", "conclusion": conclusion])
+        }
+        func jobs(conclusion: String) throws -> String {
+            try json(["total_count": 1, "jobs": [["name": "GLaDOS status " + firstKey, "status": "completed", "conclusion": conclusion]]])
+        }
+        defer { ProcessRunner.reset() }
+
+        for conclusion in ["success", "failure"] {
+            ProcessRunner.reset()
+            let directory = root.appendingPathComponent("SlowQuery-" + conclusion)
+            let vault = FixtureVault()
+            let store = try LocalManualAccountStore(directory: directory, vault: vault)
+            var (receipt, _) = try store.prepareWorkflow("gladosStatus.yml", account: firstKey)
+            receipt.runID = id; receipt.dispatchAcknowledged = true
+            try store.saveWorkflow(receipt)
+            let original = receipt
+            let client = GitHubClient(repo: repo, receiptStore: store)
+            var beforeLog: [WorkflowRunReceipt] = []
+            ProcessRunner.handler = { call in
+                if call.arguments == runArguments {
+                    // Model the measured 14.42-second request without delaying
+                    // CI: the old six-second budget must fail this request.
+                    guard call.timeout >= 14.42 else { throw FixtureCommandError.timeout }
+                    return CommandResult(stdout: try metadata(original, conclusion: conclusion))
+                }
+                if call.arguments == jobsArguments { return CommandResult(stdout: try jobs(conclusion: conclusion)) }
+                if call.arguments == logArguments {
+                    let saved = try LocalManualAccountStore(directory: directory, vault: vault).workflowRecords()
+                    if let current = saved.first(where: { $0.id == original.id }) { beforeLog.append(current) }
+                    throw FixtureCommandError.timeout
+                }
+                throw FixtureCommandError.unexpectedCommand
+            }
+            do {
+                _ = try client.waitForRun(original, timeout: 360)
+                throw NativeTestFailure.failed("log timeout must remain visible")
+            } catch let error as WorkflowReceiptError {
+                try expect(error == .queryInterrupted(.logs), "log timeout identifies its stage")
+            }
+            let calls = ProcessRunner.invocations
+            try expect(calls.count == 5 && calls[0].arguments == runArguments && calls[1].arguments == jobsArguments, "slow metadata is accepted before three log-only retries")
+            try expect(calls[0].timeout >= 14.42 && calls[0].timeout <= 30 && calls[1].timeout > 6 && calls[1].timeout <= 30, "metadata and jobs use budgets above six seconds and at most thirty")
+            try expect(calls.filter { $0.arguments == logArguments }.allSatisfy { $0.timeout > 30 && $0.timeout <= 60 }, "logs use their independent sixty-second maximum")
+            try expect(beforeLog.count == 3 && beforeLog.allSatisfy { $0.conclusion == conclusion && $0.queryState == .pending && $0.queryStage == .logs && !$0.isResolved && $0.runID == id }, "verified terminal result is durable but unresolved before each log attempt")
+            let reopened = try LocalManualAccountStore(directory: directory, vault: vault)
+            guard let interrupted = try reopened.workflowRecords().first(where: { $0.id == original.id }) else {
+                throw NativeTestFailure.failed("interrupted query receipt missing")
+            }
+            try expect(interrupted.conclusion == conclusion && interrupted.queryState == .interrupted && interrupted.queryStage == .logs && !interrupted.isResolved, "log failure preserves success or failure conclusion across restart")
+            let restartedClient = GitHubClient(repo: repo, receiptStore: reopened)
+            let resumed = try restartedClient.triggerWorkflow("gladosStatus.yml", account: firstKey, replaceUnidentifiedStatus: true)
+            try expect(resumed.id == original.id && resumed.runID == id && ProcessRunner.invocations.count == calls.count, "explicit retry after restart reuses known ID without POST")
+            ProcessRunner.handler = { call in
+                if call.arguments == runArguments { return CommandResult(stdout: try metadata(original, conclusion: conclusion)) }
+                if call.arguments == jobsArguments { return CommandResult(stdout: try jobs(conclusion: conclusion)) }
+                if call.arguments == logArguments { return CommandResult(stdout: "fixture recovered status logs") }
+                throw FixtureCommandError.unexpectedCommand
+            }
+            let (recoveredConclusion, _, logs) = try restartedClient.waitForRun(resumed, timeout: 360)
+            let recovered = try reopened.workflowRecords().first { $0.id == original.id }
+            try expect(recoveredConclusion == conclusion && logs == "fixture recovered status logs", "retry retrieves original task logs")
+            try expect(recovered?.conclusion == conclusion && recovered?.isResolved == true && recovered?.queryStage == nil && recovered?.runID == id, "only retrieved logs resolve the receipt and clear its query stage")
+            try expect(recovered?.queryState == (conclusion == "success" ? .succeeded : .failed), "failure conclusion is not promoted to success")
+            try expect(ProcessRunner.invocations.filter(\.isDispatch).isEmpty, "slow query, log retries and restart recovery never dispatch")
+        }
+
+        let directory = root.appendingPathComponent("Query-Shared-Deadline")
+        let store = try LocalManualAccountStore(directory: directory, vault: FixtureVault())
+        var (receipt, _) = try store.prepareWorkflow("gladosStatus.yml", account: firstKey)
+        receipt.runID = id; receipt.dispatchAcknowledged = true
+        try store.saveWorkflow(receipt)
+        let original = receipt
+        let client = GitHubClient(repo: repo, receiptStore: store)
+        let exhaustedBudgets: [TimeInterval] = [0, -1]
+        for timeout in exhaustedBudgets {
+            ProcessRunner.reset()
+            try rejects("exhausted query deadline does not start a command") { _ = try client.waitForRun(original, timeout: timeout) }
+            try expect(ProcessRunner.invocations.isEmpty, "nonpositive total budget issues no GET or POST")
+        }
+        ProcessRunner.reset()
+        ProcessRunner.handler = { call in
+            guard call.arguments == runArguments else { throw FixtureCommandError.unexpectedCommand }
+            // Spend only this fixture's tiny remaining budget. Returning a
+            // valid metadata response must not create a fresh jobs budget.
+            Thread.sleep(forTimeInterval: max(0, call.timeout) + 0.02)
+            return CommandResult(stdout: try metadata(original, conclusion: "success"))
+        }
+        try rejects("later query stage cannot renew an exhausted total budget") { _ = try client.waitForRun(original, timeout: 0.2) }
+        try expect(ProcessRunner.invocations.count <= 1 && ProcessRunner.invocations.allSatisfy { $0.arguments == runArguments && $0.timeout > 0 && $0.timeout <= 0.2 }, "short deadline clamps the first timeout and prohibits a subsequent jobs call")
+        let pending = try store.workflowRecords().first { $0.id == original.id }
+        try expect(pending?.runID == id && pending?.conclusion == nil && pending?.isResolved == false, "metadata alone cannot persist an unverified terminal result")
     }
 }

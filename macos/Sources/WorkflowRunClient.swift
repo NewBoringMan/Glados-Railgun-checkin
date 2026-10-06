@@ -37,18 +37,27 @@ extension GitHubClient {
     }
 
     // Exactly one dispatch above. Retries here are bounded GETs of that ID only.
-    private func workflowGET(_ arguments: [String]) throws -> Data {
-        let deadline = Date().addingTimeInterval(24)
+    private func workflowGET(_ arguments: [String], stage: WorkflowQueryStage, deadline: Date) throws -> Data {
+        // A measured metadata GET on the user's Mac took 14.42 seconds. The
+        // old six-second limit aborted valid responses; logs may take longer
+        // still because gh can download an archive or fall back to job logs.
+        let attemptLimit: TimeInterval = stage == .logs ? 60 : 30
         for attempt in 0..<3 {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw WorkflowReceiptError.queryInterrupted(stage) }
             do {
-                let result = try ProcessRunner.run(gh, arguments, timeout: min(6, max(1, deadline.timeIntervalSinceNow)))
+                let result = try ProcessRunner.run(gh, arguments, timeout: min(attemptLimit, remaining))
                 if result.exitCode == 0 { return Data(result.stdout.utf8) }
                 guard WorkflowRunRules.retryable(result.stderr) else { throw WorkflowReceiptError.protocolError }
             } catch let error as WorkflowReceiptError { throw error }
             catch { /* Process timeout is also a failed GET, never a dispatch. */ }
-            if attempt < 2 && Date() < deadline { Thread.sleep(forTimeInterval: 1) }
+            if attempt < 2 {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { break }
+                Thread.sleep(forTimeInterval: min(1, remaining))
+            }
         }
-        throw WorkflowReceiptError.interrupted
+        throw WorkflowReceiptError.queryInterrupted(stage)
     }
 
     /// An ID supplied for an interrupted dispatch is checked before it becomes
@@ -56,8 +65,9 @@ extension GitHubClient {
     func bindExistingRun(_ id: Int, to original: WorkflowRunReceipt) throws -> WorkflowRunReceipt {
         guard original.runID == nil, let receiptStore else { throw WorkflowReceiptError.identity }
         var receipt = original; receipt.runID = id
-        let run = try WorkflowRunRules.verify(run: workflowGET(["api", "repos/\(repo)/actions/runs/\(id)"]), receipt: receipt)
-        let jobs = try workflowGET(["api", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"])
+        let deadline = Date().addingTimeInterval(180)
+        let run = try WorkflowRunRules.verify(run: workflowGET(["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)"], stage: .run, deadline: deadline), receipt: receipt)
+        let jobs = try workflowGET(["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"], stage: .jobs, deadline: deadline)
         _ = try WorkflowRunRules.verify(jobs: jobs, receipt: receipt, completed: run.status == "completed", requireAccountJobs: true)
         receipt.dispatchAcknowledged = true; receipt.queryState = .pending
         try receiptStore.saveWorkflow(receipt)
@@ -70,21 +80,32 @@ extension GitHubClient {
         let deadline = Date().addingTimeInterval(timeout)
         do {
             while Date() < deadline {
-                let run = try WorkflowRunRules.verify(run: workflowGET(["api", "repos/\(repo)/actions/runs/\(id)"]), receipt: receipt)
-                let passed = try WorkflowRunRules.verify(jobs: workflowGET(["api", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"]), receipt: receipt, completed: run.status == "completed")
+                receipt.queryStage = .run
+                let run = try WorkflowRunRules.verify(run: workflowGET(["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)"], stage: .run, deadline: deadline), receipt: receipt)
+                receipt.queryStage = .jobs
+                let passed = try WorkflowRunRules.verify(jobs: workflowGET(["api", "--hostname", "github.com", "repos/\(repo)/actions/runs/\(id)/jobs?per_page=100"], stage: .jobs, deadline: deadline), receipt: receipt, completed: run.status == "completed")
                 if run.status == "completed" {
                     guard let conclusion = run.conclusion else { throw WorkflowReceiptError.protocolError }
                     guard conclusion != "success" || passed else { throw WorkflowReceiptError.identity }
                     let logs: String
                     if receipt.workflow == "gladosStatus.yml" {
-                        logs = String(decoding: try workflowGET(["run", "view", String(id), "--repo", repo, "--log"]), as: UTF8.self)
+                        // Keep the verified remote outcome even when logs are
+                        // slow. This receipt stays unresolved until logs arrive,
+                        // so restarting or refreshing resumes this exact ID.
+                        receipt.conclusion = conclusion
+                        receipt.queryState = .pending
+                        receipt.queryStage = .logs
+                        try receiptStore.saveWorkflow(receipt)
+                        logs = String(decoding: try workflowGET(["run", "view", String(id), "--repo", "github.com/\(repo)", "--log"], stage: .logs, deadline: deadline), as: UTF8.self)
                     } else { logs = "" }
                     receipt.conclusion = conclusion
                     receipt.queryState = conclusion == "success" && passed ? .succeeded : .failed
+                    receipt.queryStage = nil
                     try receiptStore.saveWorkflow(receipt)
                     return (conclusion, "https://github.com/\(repo)/actions/runs/\(id)", logs)
                 }
-                Thread.sleep(forTimeInterval: 3)
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining > 0 { Thread.sleep(forTimeInterval: min(3, remaining)) }
             }
             throw WorkflowReceiptError.interrupted
         } catch {

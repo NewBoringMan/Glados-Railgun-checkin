@@ -118,6 +118,8 @@ extension ManualAccountsNativeTests {
         let legacyJSON = try JSONEncoder().encode(original)
         try expect(!String(decoding: legacyJSON, as: UTF8.self).contains("supersededBy"), "legacy receipt representation omits optional replacement field")
         try expect(JSONDecoder().decode(WorkflowRunReceipt.self, from: legacyJSON).supersededBy == nil, "old receipts decode without replacement field")
+        try expect(!String(decoding: legacyJSON, as: UTF8.self).contains("queryStage"), "old receipt representation has no query-stage field")
+        try expect(JSONDecoder().decode(WorkflowRunReceipt.self, from: legacyJSON).queryStage == nil, "old receipts decode without a query stage")
         let reopened = try LocalManualAccountStore(directory: directory, vault: vault)
         let (automatic, autoDispatch) = try reopened.prepareWorkflow("gladosStatus.yml", account: firstKey)
         try expect(!autoDispatch && automatic == original, "automatic refresh preserves unidentified status intent")

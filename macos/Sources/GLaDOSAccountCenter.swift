@@ -717,7 +717,11 @@ final class AppModel: ObservableObject {
         guard !parsed.isEmpty, parsed.allSatisfy({ status in
             (try? ManualValidation.key(status.accountKey)) != nil && (receipt.account == "all" || status.accountKey == receipt.account)
         }) else {
-            var pending = receipt; pending.queryState = .interrupted
+            // waitForRun has already persisted a verified remote conclusion.
+            // The caller's pre-query copy must not erase it if parsing fails.
+            var pending = try localStore?.workflowRecords().first(where: { $0.id == receipt.id }) ?? receipt
+            pending.queryState = .interrupted
+            pending.queryStage = .logs
             try localStore?.saveWorkflow(pending)
             throw WorkflowReceiptError.protocolError
         }

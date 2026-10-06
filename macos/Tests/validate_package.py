@@ -33,8 +33,8 @@ def validate_source() -> None:
     run("node", "--test", *map(str, sorted((ROOT / "Tests").glob("*.test.js"))))
     info = read_plist(ROOT / "Info.plist")
     assert info["CFBundleIdentifier"] == APP_ID
-    assert info["CFBundleShortVersionString"] == "2.0.12"
-    assert info["CFBundleVersion"] == "20044"
+    assert info["CFBundleShortVersionString"] == "2.0.13"
+    assert info["CFBundleVersion"] == "20045"
     safari = PROJECT / "app_integration/SafariExtensionSource"
     manifest = json.loads((safari / "Resources/manifest.json").read_text())
     assert {"nativeMessaging", "cookies"}.issubset(manifest["permissions"])
@@ -60,8 +60,8 @@ def validate_bundle(app: Path) -> None:
     info = read_plist(contents / "Info.plist")
     assert info["CFBundleIdentifier"] == APP_ID
     assert info["CFBundleExecutable"] == "GLaDOSAccountCenter"
-    assert info["CFBundleVersion"] == "20044"
-    assert info["CFBundleShortVersionString"] == "2.0.12"
+    assert info["CFBundleVersion"] == "20045"
+    assert info["CFBundleShortVersionString"] == "2.0.13"
     assert "GLaDOSRefreshPython" not in info
     origin = json.loads((contents / "Resources/manual-build-origin.json").read_text())
     assert origin.get("schema") == "glados.manual-build-origin" and type(origin.get("version")) is int and origin["version"] == 1

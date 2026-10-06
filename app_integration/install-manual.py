@@ -431,7 +431,7 @@ def install(app: Path, candidate: Path, expected: str, backup_root: Path) -> dic
     if app_processes(app, include_workers=False):
         raise ValueError("Account Center is open; close it through the approved Mac GUI before installation")
     candidate_info = plist(candidate / "Contents/Info.plist")
-    if candidate_info.get("CFBundleVersion") != "20044" or candidate_info.get("CFBundleShortVersionString") != "2.0.12":
+    if candidate_info.get("CFBundleVersion") != "20045" or candidate_info.get("CFBundleShortVersionString") != "2.0.13":
         raise ValueError("Candidate is not the verified manual-login build")
     origin_path = candidate / "Contents/Resources/manual-build-origin.json"
     if origin_path.is_symlink() or not origin_path.is_file() or origin_path.stat().st_size > 4096:
