@@ -55,6 +55,7 @@ jobs:
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       PUPPETEER_SKIP_DOWNLOAD: 'true'
+      GQD_VALIDATE_NATIVE_STORAGE: '1'
     defaults:
       run:
         working-directory: desktop-deployer

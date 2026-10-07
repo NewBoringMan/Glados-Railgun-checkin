@@ -30,12 +30,14 @@
     loader: '<path d="M21 12a9 9 0 1 1-9-9"/>',
     browser: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01m3 0h.01"/>',
     compass: '<circle cx="12" cy="12" r="9"/><path d="m16 8-2 6-6 2 2-6 6-2Z"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
   };
 
   const defaults = {
     version: '', platform: '', dataDirectory: '', busy: false, stage: 'idle', message: '', error: '',
     github: null, browsers: [], selectedBrowser: '', settings: { repoName: 'glados-quick-deploy', exchangePlan: 'plan500', time: '09:30' },
     authCode: null, accounts: [], events: [], currentRun: null,
+    resumeTasks: [], activeTaskId: null, errorInfo: null, storageWarning: '', progress: { completed: [], current: null },
   };
 
   let state = { ...defaults, settings: { ...defaults.settings } };
@@ -45,7 +47,11 @@
   let saveTimer = null;
   let toastTimer = null;
   let awaitingAction = false;
-  let lastActiveStep = 0;
+  let deploymentMode = 'new';
+  let selectedTaskId = null;
+  let initializedMode = false;
+  let refreshingAll = false;
+  let resumeSignature = '';
   let eventsSignature = '';
   let accountsSignature = '';
   let browserSignature = '';
@@ -99,31 +105,69 @@
 
   function isBusy() { return Boolean(state.busy || awaitingAction); }
 
+  function findTask(taskId) { return state.resumeTasks.find((task) => task.id === taskId) || null; }
+  function selectedTask() { return findTask(selectedTaskId); }
+  function recoveryTask() { return deploymentMode === 'resume' ? selectedTask() : null; }
+  function accountTask(account) { return findTask(account.pendingTaskId) || state.resumeTasks.find((task) => task.accountKey === account.accountKey) || null; }
+
+  function taskActionLabel(task) {
+    return task.actionLabel || (task.needsLogin ? '重新登录并继续' : '继续未完成任务');
+  }
+
+  function planLabel(plan) {
+    return { plan500: '500 积分换 100 天', plan200: '200 积分换 30 天', plan100: '100 积分换 10 天', off: '关闭自动兑换' }[plan] || '按已保存的兑换计划';
+  }
+
+  function phaseLabel(phase) {
+    return { github_auth: 'GitHub 授权', browser_login: 'GLaDOS 登录', deploying: '部署配置', verifying: '运行验证' }[phase] || '已保存的步骤';
+  }
+
+  function displayedSettings() {
+    const task = recoveryTask();
+    return task ? { ...defaults.settings, ...(task.settings || {}), selectedBrowser: task.browserId || '' } : draft;
+  }
+
+  function normalizeSelection() {
+    if (!initializedMode && (state.resumeTasks.length || (!state.busy && state.stage !== 'initializing'))) {
+      const preferred = findTask(state.activeTaskId) || state.resumeTasks[0];
+      if (preferred) { selectedTaskId = preferred.id; deploymentMode = 'resume'; }
+      initializedMode = true;
+    }
+    if (!selectedTask()) {
+      if (selectedTaskId && deploymentMode === 'resume') deploymentMode = 'new';
+      selectedTaskId = (findTask(state.activeTaskId) || state.resumeTasks[0])?.id || null;
+    }
+    if (state.busy && findTask(state.activeTaskId) && !['complete', 'error', 'cancelled'].includes(state.stage)) selectedTaskId = state.activeTaskId;
+    if (deploymentMode === 'resume' && !selectedTask()) deploymentMode = 'new';
+  }
+
   function stageInfo() {
     const stage = String(state.stage || 'idle').toLowerCase();
     const configurations = {
-      idle: { step: state.github ? 1 : 0, done: state.github ? 1 : 0, title: '准备好开始了', badge: '准备就绪', icon: 'sparkles', kind: 'idle', message: '确认部署设置后点击「一键部署」。只需在提示时完成登录。' },
-      initializing: { step: 0, done: 0, title: '正在准备运行环境', badge: '准备中', icon: 'loader', kind: 'working', message: '初始化完成后即可开始部署。' },
-      github_auth: { step: 0, done: 0, title: '请完成 GitHub 授权', badge: '等待授权', icon: 'github', kind: 'working', message: '在打开的 GitHub 页面完成授权，程序会自动继续。' },
-      browser_login: { step: 1, done: 1, title: '请登录 GLaDOS', badge: '等待登录', icon: 'browser', kind: 'working', message: '在所选浏览器中完成登录，成功后自动接续部署。' },
-      deploying: { step: 2, done: 2, title: '正在自动部署', badge: '部署中', icon: 'cloud', kind: 'working', message: '同步项目、配置运行参数并启动首次验证。' },
-      verifying: { step: 3, done: 3, title: '正在验证首次运行', badge: '验证中', icon: 'activity', kind: 'working', message: '等待 GitHub Actions 返回实际运行结果。' },
-      complete: { step: 4, done: 4, title: '部署流程已完成', badge: '部署完成', icon: 'check', kind: 'complete', message: '实际签到结果请查看下方账号状态。' },
-      error: { step: lastActiveStep, done: lastActiveStep, title: '需要处理一个问题', badge: '需要处理', icon: 'alert', kind: 'error', message: '请查看具体提示，处理后重新部署或刷新运行结果。' },
-      cancelling: { step: lastActiveStep, done: lastActiveStep, title: '正在取消任务', badge: '取消中', icon: 'loader', kind: 'working', message: '正在安全结束当前步骤。' },
-      cancelled: { step: lastActiveStep, done: lastActiveStep, title: '本次任务已取消', badge: '已取消', icon: 'pause', kind: 'idle', message: '已完成的配置会保留，可随时重新开始。' },
+      idle: { title: '准备好开始了', badge: '准备就绪', icon: 'sparkles', kind: 'idle', message: '确认设置后点击“添加并部署账号”，在提示时完成登录。' },
+      initializing: { title: '正在准备运行环境', badge: '准备中', icon: 'loader', kind: 'working', message: '初始化完成后即可开始部署。' },
+      resume_available: { title: '有未完成任务可以继续', badge: '待继续', icon: 'refresh', kind: 'idle', message: '选择上方待办，按已保存的任务设置继续。' },
+      github_auth: { title: '请完成 GitHub 授权', badge: '等待授权', icon: 'github', kind: 'working', message: '在 GitHub 官方页面完成授权，程序会自动接续当前任务。' },
+      browser_login: { title: '请登录 GLaDOS', badge: '等待登录', icon: 'browser', kind: 'working', message: '在所选浏览器中完成登录，成功后自动接续部署。' },
+      deploying: { title: '正在自动部署', badge: '部署中', icon: 'cloud', kind: 'working', message: '配置当前账号，并接续尚未完成的任务。' },
+      verifying: { title: '正在验证运行结果', badge: '验证中', icon: 'activity', kind: 'working', message: '等待 GitHub Actions 返回实际运行结果。' },
+      complete: { title: '当前操作已完成', badge: '已完成', icon: 'check', kind: 'complete', message: '每个账号的实际结果请查看下方卡片。' },
+      error: { title: '当前任务需要处理', badge: '需要处理', icon: 'alert', kind: 'error', message: '使用上方错误提示中的操作接续当前任务。' },
+      cancelling: { title: '正在取消任务', badge: '取消中', icon: 'loader', kind: 'working', message: '正在安全结束当前步骤。' },
+      cancelled: { title: '本次操作已停止', badge: '已取消', icon: 'pause', kind: 'idle', message: '可恢复的任务会保留在待办列表中。' },
     };
-    const result = configurations[stage] || (isBusy()
-      ? { step: lastActiveStep, done: lastActiveStep, title: '任务正在进行', badge: '进行中', icon: 'loader', kind: 'working', message: '程序正在处理当前步骤。' }
+    let result = configurations[stage] || (isBusy()
+      ? { title: '任务正在进行', badge: '进行中', icon: 'loader', kind: 'working', message: '程序正在处理当前步骤。' }
       : configurations.idle);
-    if (['github_auth', 'browser_login', 'deploying', 'verifying'].includes(stage)) lastActiveStep = result.step;
     if (stage === 'complete' && state.currentRun) {
       const runResult = resultInfo(state.currentRun);
-      if (runResult.kind === 'pending') return { step: 3, done: 3, title: '部署完成，等待验证', badge: '等待验证', icon: 'clock', kind: 'working', message: '任务已配置，首次运行仍在排队或执行。可在账号卡片刷新结果。' };
-      if (runResult.kind === 'error') return { step: 3, done: 3, title: '部署完成，验证未通过', badge: '需要处理', icon: 'alert', kind: 'error', message: '请查看本次运行记录，处理具体问题后重新验证。' };
+      if (runResult.kind === 'pending') result = { title: '部署完成，等待验证', badge: '等待验证', icon: 'clock', kind: 'working', message: '任务已配置，本次运行仍在排队或执行。可在账号卡片刷新结果。' };
+      if (runResult.kind === 'error') result = { title: '当前运行未通过', badge: '需要处理', icon: 'alert', kind: 'error', message: '请查看对应账号的结果，处理具体问题后继续。' };
     }
-    if (stage === 'idle' && isBusy()) return configurations.initializing;
-    return result;
+    if (stage === 'idle' && isBusy()) result = configurations.initializing;
+    const completed = new Set(state.progress.completed.filter((step) => Number.isInteger(step) && step >= 0 && step <= 3));
+    const current = Number.isInteger(state.progress.current) && state.progress.current >= 0 && state.progress.current <= 3 ? state.progress.current : null;
+    return { ...result, step: current, completed, done: completed.size };
   }
 
   function renderConnection() {
@@ -141,7 +185,9 @@
 
   function renderBrowsers() {
     const browsers = Array.isArray(state.browsers) ? state.browsers : [];
-    const signature = JSON.stringify(browsers);
+    const task = recoveryTask();
+    const savedBrowserId = task ? String(task.browserId || '') : '';
+    const signature = JSON.stringify([browsers, task ? savedBrowserId : null]);
     if (signature !== browserSignature) {
       browserSignature = signature;
       const select = $('browser-select');
@@ -160,16 +206,23 @@
           select.append(option);
         }
       }
+      if (task && !browsers.some((browser) => browser.id === savedBrowserId)) {
+        const option = makeText('option', '', savedBrowserId ? '已保存的浏览器：' + savedBrowserId : '按任务已保存的登录方式');
+        option.value = savedBrowserId;
+        option.disabled = true;
+        select.append(option);
+      }
     }
     const available = browsers.filter((browser) => browser.available !== false);
-    if (!available.some((browser) => browser.id === draft.selectedBrowser) && available.length) {
+    if (!task && !available.some((browser) => browser.id === draft.selectedBrowser) && available.length) {
       const preferred = available.find((browser) => browser.id === state.selectedBrowser)
         || available.find((browser) => /brave/i.test(browser.id)) || available[0];
       draft.selectedBrowser = preferred.id;
     }
-    $('browser-select').value = draft.selectedBrowser;
-    $('browser-select').disabled = isBusy() || !available.length;
-    const selected = browsers.find((browser) => browser.id === draft.selectedBrowser);
+    const selectedId = task ? savedBrowserId : draft.selectedBrowser;
+    $('browser-select').value = selectedId;
+    $('browser-select').disabled = isBusy() || Boolean(task) || !available.length;
+    const selected = browsers.find((browser) => browser.id === selectedId);
     const family = selected ? String(selected.family || '').toLowerCase() : '';
     const browserId = selected ? String(selected.id || '').toLowerCase() : '';
     let description = selected && selected.details ? safeText(selected.details) : '程序会打开专用登录窗口，完成 GLaDOS 登录后自动继续。';
@@ -192,20 +245,22 @@
     $('browser-symbol').className = 'browser-symbol' + (symbolClass ? ' ' + symbolClass : '');
     setIcon($('browser-symbol').querySelector('.icon'), symbolName);
     text($('browser-family'), familyLabel);
-    text($('browser-description'), description);
-    text($('browser-discovery'), available.length ? '已识别 ' + available.length + ' 种可用方式' : '正在识别可用浏览器');
+    text($('browser-description'), task ? task.needsLogin ? '任务需要补充登录；点击继续后由软件接续处理。' : '继续使用此任务已保存的登录进度。' : description);
+    text($('browser-discovery'), task ? '任务已保存的登录方式' : available.length ? '已识别 ' + available.length + ' 种可用方式' : '正在识别可用浏览器');
   }
 
   function renderSettings() {
+    const task = recoveryTask();
+    const settings = displayedSettings();
     for (const [id, key] of [['repository-input', 'repoName'], ['exchange-select', 'exchangePlan'], ['schedule-input', 'time']]) {
       const element = $(id);
-      if (document.activeElement !== element && element.value !== draft[key]) element.value = draft[key];
-      element.disabled = isBusy();
+      if ((task || document.activeElement !== element) && element.value !== settings[key]) element.value = settings[key];
+      element.disabled = isBusy() || Boolean(task);
     }
     const hasBrowser = state.browsers.some((browser) => browser.id === draft.selectedBrowser && browser.available !== false);
-    $('deploy-button').disabled = isBusy() || !hasBrowser || !window.quickDeploy;
-    text($('deploy-button-label'), isBusy() ? '任务正在进行…' : state.accounts.length ? '部署另一个账号' : '一键部署');
-    setIcon($('deploy-button-icon'), isBusy() ? 'loader' : 'rocket');
+    $('deploy-button').disabled = isBusy() || !window.quickDeploy || (task ? task.canResume === false : !hasBrowser);
+    text($('deploy-button-label'), isBusy() ? '任务正在进行…' : task ? taskActionLabel(task) : '添加并部署账号');
+    setIcon($('deploy-button-icon'), isBusy() ? 'loader' : task ? 'refresh' : 'rocket');
     $('deploy-button-icon').classList.toggle('is-spinning', isBusy());
     $('cancel-button').hidden = !isBusy();
     $('cancel-button').disabled = state.stage === 'cancelling';
@@ -217,33 +272,124 @@
       verifying: 'GitHub 任务正在排队或运行，结果会自动更新。',
       cancelling: '正在结束当前步骤，请稍候。',
     };
-    text($('deploy-hint'), hints[state.stage] || '需要时会打开登录页，登录完成后自动接续。');
+    text($('deploy-hint'), isBusy() ? hints[state.stage] || '正在处理当前操作，请稍候。' : task ? task.needsLogin ? '其他步骤已保留；本次需要重新登录后继续。' : '按此任务保存的配置继续，不读取新账号表单。' : '需要时会打开登录页，登录完成后自动接续。');
+    text($('deploy-heading'), task ? '继续未完成任务' : '添加账号');
+    text($('setup-description'), task ? '以下为该任务保存的设置，继续时沿用。' : '为新账号选择登录方式与每日任务。');
+    text($('setup-mode'), task ? '已保存任务' : '新账号');
+    $('task-context').hidden = !task;
+    text($('task-context'), task ? (task.email || task.accountKey || '待确认账号') + ' · ' + (task.repository || task.settings?.repoName || '待确认仓库') : '');
+    $('add-account').disabled = isBusy();
+    $('refresh-all').disabled = isBusy() || !state.accounts.length;
+    text($('refresh-all-label'), refreshingAll ? '正在刷新…' : '刷新全部');
+    $('refresh-all-icon').classList.toggle('is-spinning', refreshingAll);
+  }
+
+  function renderResumeTasks() {
+    const tasks = state.resumeTasks;
+    $('resume-panel').hidden = !tasks.length;
+    text($('resume-count'), tasks.length);
+    if (!tasks.length) return;
+    const signature = JSON.stringify(tasks.map((task) => [task.id, task.email, task.accountKey, task.repository]));
+    if (signature !== resumeSignature) {
+      resumeSignature = signature;
+      $('resume-select').replaceChildren();
+      for (const task of tasks) {
+        const option = makeText('option', '', (task.email || task.accountKey || '待确认账号') + ' · ' + (task.repository || task.settings?.repoName || '待确认仓库'));
+        option.value = task.id;
+        $('resume-select').append(option);
+      }
+    }
+    const task = selectedTask();
+    if (!task) return;
+    $('resume-select').value = task.id;
+    $('resume-select').disabled = isBusy();
+    $('resume-task-button').disabled = isBusy() || task.canResume === false;
+    text($('resume-task-button'), taskActionLabel(task));
+    $('discard-resume').disabled = isBusy();
+    text($('resume-mode-label'), deploymentMode === 'resume' ? '当前选择' : '待办已保留');
+    text($('resume-task-identity'), '任务位置：' + phaseLabel(task.phase) + (task.githubLogin ? ' · GitHub：' + task.githubLogin : ''));
+    text($('resume-settings'), '已保存设置：' + (task.repository || task.settings?.repoName || '待确认仓库') + ' · 每日 ' + (task.settings?.time || '09:30') + ' UTC+8 · ' + planLabel(task.settings?.exchangePlan || 'plan500'));
+    text($('resume-availability'), task.canResume === false ? '这条任务目前不能直接继续，请按对应错误提示处理。' : task.needsLogin ? '进度已保留；继续时需要完成 GLaDOS 官方登录。' : '可以接续此任务；是否需要 GitHub 授权会由程序提示。');
+    const ownError = task.lastError && state.errorInfo?.taskId !== task.id;
+    $('resume-task-error').hidden = !ownError;
+    text($('resume-task-error'), ownError ? task.lastError : '');
+    const retention = task.savedAcrossRestart ? '任务进度已保存，可在下次打开后继续。' : '当前登录可能仅在本次打开期间保留；关闭后可能需要重新登录。';
+    text($('resume-retention'), retention + (task.updatedAt ? ' 更新于 ' + formatDate(task.updatedAt, true) : ''));
+  }
+
+  function errorAction() {
+    if (localError || !state.errorInfo || typeof state.errorInfo !== 'object') return null;
+    const info = state.errorInfo;
+    const task = findTask(info.taskId);
+    const name = info.action || (task ? 'resumeDeploy' : '');
+    const allowed = ['resumeDeploy', 'connectGithub', 'reloginAccount', 'refreshAll', 'refreshRun'];
+    if (!allowed.includes(name)) return null;
+    if (name === 'resumeDeploy') return task ? { name, taskId: task.id, disabled: task.canResume === false, label: info.actionLabel || taskActionLabel(task) } : null;
+    if (name === 'reloginAccount' || name === 'refreshRun') {
+      const accountKey = info.accountKey || task?.accountKey;
+      if (!state.accounts.some((account) => account.accountKey === accountKey)) return null;
+      return { name, accountKey, label: info.actionLabel || (name === 'reloginAccount' ? '更新此账号登录' : '刷新此账号结果') };
+    }
+    return { name, label: info.actionLabel || (name === 'connectGithub' ? '重新授权 GitHub' : '刷新全部账号') };
+  }
+
+  function renderError() {
+    const error = localError || state.error;
+    const info = !localError && state.errorInfo && typeof state.errorInfo === 'object' ? state.errorInfo : null;
+    const task = info ? findTask(info.taskId) : null;
+    const titles = {
+      WORKFLOW_AUTH_REQUIRED: 'GitHub 需要补充工作流授权',
+      AUTH_REQUIRED: 'GitHub 需要重新授权',
+      SESSION_REJECTED: 'GLaDOS 登录需要更新',
+      AUTHENTICATION_REQUIRED: 'GLaDOS 登录需要更新',
+      LOGIN_REQUIRED: 'GLaDOS 登录需要更新',
+      IDENTITY_MISMATCH: '登录账号与目标账号不一致',
+      ACCOUNT_MISMATCH: '登录账号与目标账号不一致',
+      WRONG_ACCOUNT: '请使用此任务原来的 GitHub 账号',
+    };
+    $('error-banner').hidden = !error && !info?.message;
+    text($('error-title'), titles[info?.code] || '当前任务需要处理');
+    text($('error-message'), info?.message || (error && typeof error === 'object' ? error.message || '当前步骤未完成，请查看运行记录。' : error));
+    const context = task ? (task.email || task.accountKey || '当前账号') + ' · ' + (task.repository || task.settings?.repoName || '待确认仓库') : '';
+    const hint = [context, info?.hint].filter(Boolean).join('。');
+    $('error-hint').hidden = !hint;
+    text($('error-hint'), hint);
+    const action = errorAction();
+    $('error-action').hidden = !action;
+    $('error-action').disabled = isBusy() || Boolean(action?.disabled);
+    text($('error-action'), action?.label || '继续处理');
+    $('storage-warning').hidden = !state.storageWarning;
+    text($('storage-warning-message'), state.storageWarning);
   }
 
   function renderProgress() {
     const info = stageInfo();
+    const task = recoveryTask();
+    const appliesToSelection = !task || state.activeTaskId === task.id;
     $('overview-badge').className = 'overview-badge is-' + info.kind;
     text($('overview-text'), info.badge);
-    text($('progress-count'), info.done + ' / 4');
-    $('progress-visual').className = 'progress-visual is-' + info.kind;
-    setIcon($('progress-center-icon'), info.icon);
-    $('progress-center-icon').classList.toggle('is-spinning', info.icon === 'loader');
-    text($('progress-title'), info.title);
-    text($('progress-message'), state.message || info.message);
+    text($('progress-count'), appliesToSelection ? info.done + ' / 4' : '待继续');
+    $('progress-visual').className = 'progress-visual is-' + (appliesToSelection ? info.kind : 'idle');
+    setIcon($('progress-center-icon'), appliesToSelection ? info.icon : 'refresh');
+    $('progress-center-icon').classList.toggle('is-spinning', appliesToSelection && info.icon === 'loader');
+    text($('progress-title'), appliesToSelection ? info.title : '已选择待继续任务');
+    text($('progress-message'), appliesToSelection ? state.message || info.message : '此任务停在“' + phaseLabel(task.phase) + '”。点击继续后显示该任务的实际进度。');
     const stage = String(state.stage || 'idle');
-    const active = (!['idle', 'cancelled', 'complete'].includes(stage) && (isBusy() || stage === 'error')) || (stage === 'complete' && info.done < 4);
+    const waiting = !isBusy() && (stage === 'resume_available' || Boolean(task));
+    const active = info.step !== null && (isBusy() || stage === 'error' || waiting || (stage === 'complete' && info.done < 4));
+    $('progress-steps').hidden = !appliesToSelection;
     for (const item of $('progress-steps').children) {
       const index = Number(item.dataset.step);
-      const done = index < info.done;
       const current = index === info.step && active;
       const failed = current && info.kind === 'error';
+      const done = info.completed.has(index) && !failed;
       item.classList.toggle('is-done', done);
       item.classList.toggle('is-current', current && !failed);
       item.classList.toggle('is-failed', failed);
       const indicator = item.querySelector('.step-indicator');
       if (done) { indicator.replaceChildren(makeIcon('check')); }
       else { text(indicator, index + 1); }
-      const status = failed ? '需处理' : done ? '已完成' : current ? stage === 'cancelling' ? '取消中' : '进行中' : '';
+      const status = failed ? '需处理' : done ? '已完成' : current ? stage === 'cancelling' ? '取消中' : waiting ? '待继续' : '进行中' : '';
       text(item.querySelector('.step-state'), status);
       item.setAttribute('aria-label', item.querySelector('strong').textContent + '：' + (status || '未开始'));
       if (current) item.setAttribute('aria-current', 'step');
@@ -253,15 +399,13 @@
     $('github-auth').hidden = !auth;
     text($('auth-code'), auth ? state.authCode.code : '');
     const run = state.currentRun;
-    $('current-run').hidden = !run;
+    $('current-run').hidden = !run || !appliesToSelection;
     if (run) {
       const status = resultInfo(run);
       text($('current-run-title'), status.label);
       text($('current-run-detail'), (run.repository || '') + (run.runId ? ' · #' + run.runId : ''));
     }
-    const error = localError || state.error;
-    $('error-banner').hidden = !error;
-    text($('error-message'), error && typeof error === 'object' ? error.message || '当前步骤未完成，请查看运行记录后重试。' : error);
+    renderError();
   }
 
   function resultInfo(account) {
@@ -270,7 +414,6 @@
     const points = Number(account.pointsAdded);
     const added = Number.isFinite(points) && points > 0;
     const creditSuffix = added ? ' · 已加分 +' + points : '';
-    if (account.paused) return { kind: 'neutral', label: '仓库已暂停', detail: '此仓库全部账号已暂停按计划运行' };
     if (['authentication_rejected', 'authentication_required'].includes(conclusion)) return { kind: 'error', label: '需要重新登录' + creditSuffix, detail: '登录授权被拒绝，请重新登录后更新' };
     if (['failure', 'failed', 'error', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(conclusion)) return { kind: 'error', label: (conclusion === 'timed_out' ? '运行超时' : '运行异常') + creditSuffix, detail: added ? '已取得积分，但本次任务仍有异常；请查看运行记录' : '查看记录，处理后重新验证' };
     if (conclusion === 'cancelled' || conclusion === 'canceled') return { kind: 'neutral', label: '运行已取消' + creditSuffix, detail: added ? '取消前已取得积分，后续步骤未全部完成' : '可刷新查看最新记录' };
@@ -297,22 +440,39 @@
 
   function accountButton(account, action, icon, label, visibleLabel = false, payload = {}) {
     const button = document.createElement('button');
-    button.className = 'account-action' + (action === 'pause' && !account.paused ? ' is-danger' : '');
+    const primary = action === 'resumeDeploy' || action === 'reloginAccount';
+    const background = action === 'openRun' || action === 'openRepository';
+    button.className = 'account-action' + (primary ? ' is-primary' : '') + (action === 'pause' && !account.paused ? ' is-danger' : '');
     button.type = 'button';
-    button.title = label;
+    button.dataset.action = action;
+    button.dataset.accountKey = String(account.accountKey || '');
+    button.title = action === 'reloginAccount' ? '更新此账号登录，沿用该账号的仓库设置' : label;
     button.setAttribute('aria-label', label + '：' + safeText(account.email || account.accountKey));
     button.append(makeIcon(icon));
-    if (visibleLabel) button.append(makeText('span', 'action-label', label));
-    button.disabled = pendingAccounts.has(account.accountKey) || ((action === 'pause' || action === 'refreshRun') && isBusy());
+    if (visibleLabel) button.append(makeText('span', primary ? 'account-primary-label' : 'action-label', label));
+    button.disabled = pendingAccounts.has(account.accountKey) || (!background && isBusy());
     if (action === 'openRun' && !account.runId && !account.runUrl) button.disabled = true;
+    if (action === 'openRepository' && !account.repository) button.disabled = true;
+    if ((action === 'pause' || action === 'refreshRun') && (!account.repository || account.deploymentStatus === 'pending')) button.disabled = true;
+    if (action === 'resumeDeploy' && findTask(payload.taskId)?.canResume === false) button.disabled = true;
     button.addEventListener('click', () => accountAction(account.accountKey, action, payload));
     return button;
+  }
+
+  function accountStatus(account, task) {
+    if (!task && account.deploymentStatus !== 'pending') return resultInfo(account);
+    if (!task) return { kind: 'pending', label: '部署待完成', detail: '登录已确认，可更新此账号登录后继续部署' };
+    const running = state.busy && state.activeTaskId === task.id && !['error', 'cancelled', 'complete'].includes(state.stage);
+    if (running && state.stage === 'cancelling') return { kind: 'pending', label: '正在取消', detail: '正在安全结束此账号的当前步骤，已保存的进度会保留' };
+    if (running) return { kind: 'pending', label: phaseLabel(state.stage === 'github_auth' ? 'github_auth' : task.phase) + '进行中', detail: '正在处理此账号，完成后会自动更新结果' };
+    if (task.lastError) return { kind: 'error', label: task.needsLogin ? '登录待继续' : '任务待继续', detail: task.lastError };
+    return { kind: 'pending', label: task.needsLogin ? '登录待继续' : task.phase === 'verifying' ? '验证待继续' : '部署待继续', detail: task.needsLogin ? '此前进度已保存，需要完成此账号登录' : '已停在“' + phaseLabel(task.phase) + '”，可接续已保存的进度' };
   }
 
   function renderAccounts(force = false) {
     text($('accounts-count'), state.accounts.length);
     text($('nav-account-count'), state.accounts.length);
-    const signature = JSON.stringify([state.accounts, Array.from(pendingAccounts), isBusy()]);
+    const signature = JSON.stringify([state.accounts, state.resumeTasks, state.activeTaskId, state.stage, Array.from(pendingAccounts), isBusy()]);
     if (!force && signature === accountsSignature) return;
     accountsSignature = signature;
     const list = $('accounts-list');
@@ -323,8 +483,10 @@
     }
     list.replaceChildren();
     for (const account of state.accounts) {
+      const task = accountTask(account);
       const card = document.createElement('article');
       card.className = 'account-card';
+      card.dataset.accountKey = String(account.accountKey || '');
       const identity = document.createElement('div');
       identity.className = 'account-identity';
       const email = account.email || account.accountKey || 'GLaDOS 账号';
@@ -336,10 +498,11 @@
       const repository = makeText('p', 'account-repository', account.repository || '正在配置仓库');
       repository.title = safeText(account.repository || '');
       identityCopy.append(repository);
+      identityCopy.append(makeText('p', 'account-schedule' + (account.paused ? ' is-paused' : ''), account.paused ? '此仓库定时任务已暂停' : account.deploymentStatus === 'pending' ? '等待完成云端部署' : '此仓库定时任务已启用'));
       identity.append(identityCopy);
       card.append(identity);
 
-      const status = resultInfo(account);
+      const status = accountStatus(account, task);
       const statusBlock = document.createElement('div');
       statusBlock.className = 'account-state';
       const badge = document.createElement('span');
@@ -347,16 +510,25 @@
       const dot = document.createElement('span');
       dot.className = 'status-dot';
       dot.setAttribute('aria-hidden', 'true');
-      badge.append(dot, makeText('span', '', status.label));
+      const previousResult = account.lastRefreshError && !task && account.deploymentStatus !== 'pending';
+      badge.append(dot, makeText('span', '', (previousResult ? '上次结果：' : '') + status.label));
       statusBlock.append(badge);
-      const detail = safeText(account.paused ? status.detail : account.message || status.detail);
+      const detail = safeText(task || account.deploymentStatus === 'pending' ? status.detail : account.message || status.detail);
       const detailElement = makeText('span', 'account-detail', detail);
-      if (account.updatedAt) detailElement.title = '更新于 ' + formatDate(account.updatedAt, true);
       statusBlock.append(detailElement);
+      if (account.lastRefreshError) {
+        const refreshError = makeText('span', 'account-refresh-error', '刷新暂未完成：' + account.lastRefreshError);
+        refreshError.setAttribute('role', 'status');
+        statusBlock.append(refreshError);
+      }
+      if (task && (account.runId || account.runUrl || (account.conclusion && account.conclusion !== 'not_started'))) statusBlock.append(makeText('span', 'account-previous', '上次结果：' + resultInfo(account).label));
+      if (account.updatedAt) statusBlock.append(makeText('span', 'account-updated', '记录更新于 ' + formatDate(account.updatedAt, true)));
       card.append(statusBlock);
 
       const actions = document.createElement('div');
       actions.className = 'account-actions';
+      if (task) actions.append(accountButton(account, 'resumeDeploy', 'refresh', taskActionLabel(task), true, { taskId: task.id }));
+      actions.append(accountButton(account, 'reloginAccount', 'browser', '更新登录', true));
       actions.append(accountButton(account, 'refreshRun', 'refresh', '刷新结果'));
       actions.append(accountButton(account, 'openRun', 'external', '运行记录', true));
       actions.append(accountButton(account, 'openRepository', 'repository', '打开仓库'));
@@ -392,6 +564,7 @@
 
   function render() {
     renderConnection();
+    renderResumeTasks();
     renderBrowsers();
     renderSettings();
     renderProgress();
@@ -407,11 +580,15 @@
       browsers: Array.isArray(next.browsers) ? next.browsers : [],
       accounts: Array.isArray(next.accounts) ? next.accounts : [],
       events: Array.isArray(next.events) ? next.events : [],
+      resumeTasks: Array.isArray(next.resumeTasks) ? next.resumeTasks.filter((task) => task && typeof task.id === 'string' && task.id) : [],
+      progress: { completed: Array.isArray(next.progress?.completed) ? next.progress.completed : [], current: next.progress?.current ?? null },
+      errorInfo: next.errorInfo && typeof next.errorInfo === 'object' ? next.errorInfo : null,
     };
     if (!initializedDraft || !draftDirty) {
       draft = { ...state.settings, selectedBrowser: state.selectedBrowser || draft.selectedBrowser };
       initializedDraft = true;
     }
+    normalizeSelection();
     render();
   }
 
@@ -432,13 +609,14 @@
   }
 
   function captureDraft() {
+    if (deploymentMode !== 'new') return;
     draft = gatherSettings();
     draftDirty = true;
     localError = '';
   }
 
   async function saveSettings() {
-    if (!draftDirty || isBusy() || !window.quickDeploy) return;
+    if (deploymentMode !== 'new' || !draftDirty || isBusy() || !window.quickDeploy) return;
     if (!$('repository-input').checkValidity() || !$('schedule-input').checkValidity()) return;
     const snapshot = { ...draft };
     try {
@@ -454,6 +632,8 @@
   async function startDeploy(event) {
     if (event) event.preventDefault();
     if (isBusy()) return;
+    const task = recoveryTask();
+    if (task) { await performResume(task.id); return; }
     if (!$('deploy-form').reportValidity()) return;
     captureDraft();
     if (!draft.selectedBrowser) { toast('请选择一种可用的登录方式。'); return; }
@@ -461,17 +641,91 @@
     window.clearTimeout(saveTimer);
     localError = '';
     awaitingAction = true;
-    lastActiveStep = state.github ? 1 : 0;
     render();
     try {
-      await callAction('startDeploy', { browserId: draft.selectedBrowser, repoName: draft.repoName, exchangePlan: draft.exchangePlan, time: draft.time });
+      await callAction('startDeploy', { browserId: draft.selectedBrowser, repoName: draft.repoName, exchangePlan: draft.exchangePlan, time: draft.time, newTask: true });
       draftDirty = false;
     } catch (error) {
       localError = safeText(error.message || '任务未能启动。请查看提示后重试。');
     } finally {
       awaitingAction = false;
+      selectErrorTask();
       render();
     }
+  }
+
+  function scrollTo(element) {
+    if (!element) return;
+    element.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  }
+
+  function chooseTask(taskId) {
+    if (isBusy() || !findTask(taskId)) return false;
+    window.clearTimeout(saveTimer);
+    selectedTaskId = taskId;
+    deploymentMode = 'resume';
+    localError = '';
+    render();
+    return true;
+  }
+
+  function selectErrorTask() {
+    const task = findTask(state.errorInfo?.taskId) || (state.stage === 'cancelled' ? findTask(state.activeTaskId) : null);
+    if (task) { selectedTaskId = task.id; deploymentMode = 'resume'; }
+    normalizeSelection();
+  }
+
+  function addAccount() {
+    if (isBusy()) return;
+    window.clearTimeout(saveTimer);
+    deploymentMode = 'new';
+    localError = '';
+    render();
+    scrollTo($('deploy-heading'));
+    $('deploy-heading').focus({ preventScroll: true });
+  }
+
+  async function performResume(taskId) {
+    const task = findTask(taskId);
+    if (!task || task.canResume === false || !chooseTask(taskId)) return;
+    awaitingAction = true;
+    render();
+    try { await callAction('resumeDeploy', { taskId }); }
+    catch (error) { localError = safeText(error.message || '任务未能接续，请查看提示后重试。'); }
+    finally { awaitingAction = false; selectErrorTask(); render(); }
+  }
+
+  async function discardTask() {
+    const task = selectedTask();
+    if (isBusy() || !task) return;
+    localError = '';
+    awaitingAction = true;
+    render();
+    try {
+      await callAction('discardResume', { taskId: task.id });
+      if (!findTask(task.id)) toast('本地待办已移除，云端已部署任务保留。');
+    } catch (error) { localError = safeText(error.message || '移除本地待办未完成，请重试。'); }
+    finally { awaitingAction = false; normalizeSelection(); render(); }
+  }
+
+  async function refreshAll() {
+    if (isBusy() || !state.accounts.length) return;
+    localError = '';
+    refreshingAll = true;
+    awaitingAction = true;
+    render();
+    try { await callAction('refreshAll', {}); }
+    catch (error) { localError = safeText(error.message || '刷新未完成，各账号已取得的结果会保留。'); }
+    finally { refreshingAll = false; awaitingAction = false; render(); }
+  }
+
+  async function repairError() {
+    const action = errorAction();
+    if (isBusy() || !action || action.disabled) return;
+    if (action.name === 'resumeDeploy') { await performResume(action.taskId); return; }
+    if (action.name === 'connectGithub') { await connectGithub(); return; }
+    if (action.name === 'refreshAll') { await refreshAll(); return; }
+    await accountAction(action.accountKey, action.name, {});
   }
 
   async function connectGithub() {
@@ -493,26 +747,70 @@
   }
 
   async function accountAction(accountKey, name, payload) {
-    if (pendingAccounts.has(accountKey)) return;
+    const account = state.accounts.find((item) => item.accountKey === accountKey);
+    if (!account || pendingAccounts.has(accountKey)) return;
+    if (name === 'resumeDeploy') {
+      if (chooseTask(payload?.taskId)) { scrollTo($('workspace')); await performResume(payload.taskId); }
+      return;
+    }
+    const blocking = name !== 'openRun' && name !== 'openRepository';
+    if (blocking && isBusy()) return;
+    if (blocking) localError = '';
     pendingAccounts.add(accountKey);
-    renderAccounts(true);
-    try { await callAction(name, { accountKey, ...payload }); }
-    catch (error) { toast(error.message || '操作未完成，请稍后重试。'); }
-    finally { pendingAccounts.delete(accountKey); renderAccounts(true); }
+    if (blocking) awaitingAction = true;
+    render();
+    try {
+      const request = name === 'reloginAccount' ? { accountKey } : { accountKey, ...payload };
+      if (name === 'reloginAccount') {
+        const savedBrowser = state.browsers.find((browser) => browser.id === account.browser && browser.available !== false);
+        if (savedBrowser) request.browserId = savedBrowser.id;
+        scrollTo($('workspace'));
+      }
+      await callAction(name, request);
+    } catch (error) {
+      if (blocking) localError = safeText(error.message || '此账号的操作未完成，请稍后重试。');
+      else toast(error.message || '页面未能打开，请稍后重试。');
+    }
+    finally {
+      pendingAccounts.delete(accountKey);
+      if (blocking) awaitingAction = false;
+      if (name === 'reloginAccount') selectErrorTask();
+      render();
+    }
   }
 
   function bindEvents() {
     $('deploy-form').addEventListener('submit', startDeploy);
     $('github-connect').addEventListener('click', connectGithub);
     $('cancel-button').addEventListener('click', cancelTask);
+    $('add-account').addEventListener('click', addAccount);
+    $('refresh-all').addEventListener('click', refreshAll);
+    $('resume-select').addEventListener('change', () => { chooseTask($('resume-select').value); });
+    $('resume-task-button').addEventListener('click', () => { performResume(selectedTaskId); });
+    $('discard-resume').addEventListener('click', discardTask);
+    $('error-action').addEventListener('click', repairError);
+    $('error-details').addEventListener('click', () => {
+      $('activity-list').hidden = false;
+      $('toggle-activity').setAttribute('aria-expanded', 'true');
+      $('toggle-activity').replaceChildren(document.createTextNode('收起'), makeIcon('chevronUp'));
+      scrollTo($('activity-section'));
+      $('activity-heading').setAttribute('tabindex', '-1');
+      $('activity-heading').focus({ preventScroll: true });
+    });
     $('copy-auth-code').addEventListener('click', async () => {
       try { await callAction('copyAuthCode'); toast('授权码已复制。'); }
       catch (error) { toast(error.message || '复制未完成，请手动选择授权码。'); }
     });
     for (const id of ['browser-select', 'repository-input', 'exchange-select', 'schedule-input']) {
-      $(id).addEventListener('change', () => { captureDraft(); window.clearTimeout(saveTimer); renderBrowsers(); renderSettings(); saveTimer = window.setTimeout(saveSettings, 200); });
+      $(id).addEventListener('change', () => {
+        if (deploymentMode !== 'new' || isBusy()) return;
+        captureDraft(); window.clearTimeout(saveTimer); renderBrowsers(); renderSettings(); saveTimer = window.setTimeout(saveSettings, 200);
+      });
     }
-    $('repository-input').addEventListener('input', () => { captureDraft(); window.clearTimeout(saveTimer); saveTimer = window.setTimeout(saveSettings, 500); });
+    $('repository-input').addEventListener('input', () => {
+      if (deploymentMode !== 'new' || isBusy()) return;
+      captureDraft(); window.clearTimeout(saveTimer); saveTimer = window.setTimeout(saveSettings, 500);
+    });
     $('toggle-activity').addEventListener('click', () => {
       const collapsed = !$('activity-list').hidden;
       $('activity-list').hidden = collapsed;
@@ -522,7 +820,7 @@
     document.querySelectorAll('[data-scroll]').forEach((button) => {
       button.addEventListener('click', () => {
         const target = $(button.dataset.scroll);
-        if (target) target.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+        scrollTo(target);
         document.querySelectorAll('.nav-item').forEach((item) => {
           item.classList.toggle('is-active', item === button);
           if (item === button) item.setAttribute('aria-current', 'page');

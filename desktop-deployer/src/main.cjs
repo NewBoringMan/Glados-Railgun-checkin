@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, clipboard, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, clipboard, Menu, safeStorage } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -18,6 +18,7 @@ let browserModule = null;
 let captureClosePromise = Promise.resolve();
 let quitting = false;
 let allowQuit = false;
+const smokeActions = [];
 const uiFile = path.join(__dirname, '..', 'renderer', 'index.html');
 const uiURL = pathToFileURL(uiFile).href;
 
@@ -93,7 +94,11 @@ async function smokeCheck() {
   if (typeof puppeteer.launch !== 'function') throw new Error('Packaged browser automation component is unavailable');
   const ghVersion = execFileSync(ghPath(), ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 10000 }).split(/\r?\n/)[0];
   if (!ghVersion.startsWith('gh version 2.102.0')) throw new Error('Bundled GitHub CLI did not start at the verified version');
-  const report = { ok: true, platform: process.platform, arch: process.arch, packaged: app.isPackaged, version: app.getVersion(), electron: process.versions.electron, node: process.versions.node, ghExists: fs.existsSync(ghPath()), ghVersion, puppeteerLoaded: true, inspection };
+  const { runRendererRegression } = require('./smoke-fixtures.cjs');
+  const { runStorageRegression } = require('./smoke-storage.cjs');
+  const storage = await runStorageRegression({ directory: dataRoot, safeStorage });
+  const recovery = await runRendererRegression({ window, controller, uiFile, actions: smokeActions, outputDirectory: smokeDirectory });
+  const report = { ok: true, platform: process.platform, arch: process.arch, packaged: app.isPackaged, version: app.getVersion(), electron: process.versions.electron, node: process.versions.node, ghExists: fs.existsSync(ghPath()), ghVersion, puppeteerLoaded: true, inspection, storage, recovery };
   if (!report.ghExists) throw new Error('Bundled GitHub CLI is missing');
   if (smokeDirectory) {
     fs.mkdirSync(smokeDirectory, { recursive: true });
@@ -105,6 +110,7 @@ async function smokeCheck() {
 
 async function startup() {
   const { GitHubClient } = require('./github.cjs');
+  const { ResumeStore } = require('./resume-store.cjs');
   const browser = require('./browser.cjs');
   browserModule = browser;
   const github = new GitHubClient({ ghPath: ghPath(), onEvent: event => controller?.onGitHubEvent(event), openExternal });
@@ -116,9 +122,18 @@ async function startup() {
     }, discoverBrowsers: browser.discoverBrowsers,
     parentWindow: () => window, profileRoot, dataDirectory: dataRoot, version: app.getVersion(),
     platform: process.platform, restored: smoke ? {} : loadState(dataRoot),
+    resumeStore: smoke ? undefined : new ResumeStore({ directory: dataRoot, safeStorage }),
     save: state => { if (!smoke) saveState(dataRoot, state); }, openExternal,
     copyAuthCode: value => clipboard.writeText(value),
   });
+  if (smoke) {
+    // Native renderer checks exercise the real preload/IPC path with fixture data.
+    // Intercept before loading the page so no fixture action can reach an account.
+    controller.action = async (name, payload = {}) => {
+      smokeActions.push({ name, payload: JSON.parse(JSON.stringify(payload)) });
+      return controller.snapshot();
+    };
+  }
   controller.on('state', state => { if (window && !window.isDestroyed()) window.webContents.send('qd:state', state); });
   ipcMain.handle('qd:state', event => { verifyIPC(event); return controller.snapshot(); });
   ipcMain.handle('qd:action', async (event, name, payload) => {
@@ -147,7 +162,7 @@ async function startup() {
       await browser.cleanupOwnedProfiles(profileRoot);
       if (quitting) return;
       await controller.initialize();
-      if (!quitting) controller.note('准备就绪。点击一键部署，只需完成登录。');
+      if (!quitting && !controller.state.resumeTasks.length) controller.note('准备就绪。点击一键部署，只需完成登录。');
     }
     catch (error) { controller.state.error = safeMessage(error.message); }
     finally { controller.state.busy = false; controller.changed(); }

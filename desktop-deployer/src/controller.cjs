@@ -1,10 +1,36 @@
 'use strict';
 
 const { EventEmitter } = require('node:events');
-const { DEFAULT_SETTINGS, cleanSettings, cleanAccount } = require('./state.cjs');
+const { randomBytes } = require('node:crypto');
+const { DEFAULT_SETTINGS, cleanSettings, cleanAccount, cleanCheckpoint, cleanPendingTask } = require('./state.cjs');
 
 const PENDING = new Set(['queued', 'pending', 'requested', 'waiting', 'in_progress']);
 const FAILED = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
+const LOGIN_ERRORS = new Set(['INVALID_CREDENTIAL', 'SESSION_INCOMPLETE', 'SESSION_REJECTED', 'AUTOMATION_REJECTED', 'IDENTITY_MISMATCH', 'ACCOUNT_MISMATCH', 'LOGIN_REQUIRED', 'STORED_CREDENTIAL_MISSING']);
+
+function operationError(code, message, stage = 'deploying') { return Object.assign(new Error(message), { code, stage }); }
+
+function recoveryHint(code) {
+  if (code === 'WORKFLOW_AUTH_REQUIRED') return '完成 GitHub 官方补充授权后，会接续当前步骤，已确认的 GLaDOS 登录无需重做。';
+  if (code === 'AUTH_REQUIRED') return '重新连接 GitHub 后继续当前任务。';
+  if (code === 'WRONG_ACCOUNT') return '此任务绑定原 GitHub 账号，请在官方授权页选择该账号后继续。';
+  if (LOGIN_ERRORS.has(code)) return '在官方登录窗口登录卡片上的目标账号，成功后接续任务。';
+  if (code === 'DISPATCH_UNCERTAIN') return '正在核对已经发出的验证请求。继续操作只查询原请求，不会重复发起签到。';
+  if (code === 'PRIOR_DISPATCH_PENDING') return '同一仓库还有另一账号的验证请求待确认。先继续查询该原任务，再回到本次待办；各账号进度均已保留。';
+  if (code === 'RATE_LIMITED') return '等待 GitHub 请求限制解除后继续，已完成步骤会保留。';
+  if (['NETWORK_ERROR', 'TIMEOUT', 'GITHUB_UNAVAILABLE'].includes(code)) return '检查网络连接，恢复后点击继续；不必从头登录。';
+  if (['REPOSITORY_CHANGED', 'CONFLICT'].includes(code)) return '仓库刚发生更新，继续时会重新读取远端配置，不覆盖其他更新。';
+  if (code === 'CONFIGURATION_CHANGED') return '远端配置已改变，普通继续不会覆盖。请核对本任务保存的设置；选择“更新登录并重新部署”后会重新应用这些设置。同一仓库的签到时间和兑换计划由全部账号共享。';
+  if (code === 'ACCOUNT_ALREADY_PENDING') return '该账号已有未完成任务。可继续原任务；如需改用其他仓库，请先移除原本地待办后再添加。';
+  if (code === 'PERMISSION_DENIED') return '检查 GitHub 账号对目标仓库的管理权限和 Actions 设置，然后继续。';
+  if (code === 'CHECKPOINT_SAVE_FAILED') return '检查应用数据目录是否可写，恢复后继续当前任务。';
+  return '已完成的步骤会保留，处理提示的问题后可从当前步骤继续。';
+}
+
+function sameBinding(a, b) {
+  return a.id === b.id && a.credentialVersion === b.credentialVersion && a.account?.accountKey === b.account?.accountKey
+    && a.githubLogin?.toLowerCase() === b.githubLogin?.toLowerCase() && a.githubId === b.githubId && a.settings.repoName === b.settings.repoName;
+}
 
 function safeMessage(value, secrets = []) {
   let text = String(value || '').slice(0, 4000);
@@ -50,19 +76,113 @@ class Controller extends EventEmitter {
     this.initializeAbort = null;
     this.initializeTask = null;
     const restored = options.restored || {};
+    this.metadataAuthoritative = Array.isArray(restored.pendingDeployments);
+    this.tasks = new Map((restored.pendingDeployments || []).map(task => cleanPendingTask(task)).filter(Boolean).map(task => [task.id, task]));
+    this.activeTask = null;
     this.state = {
-      version: options.version || '1.0.0', platform: options.platform || process.platform,
+      version: options.version || '1.1.0', platform: options.platform || process.platform,
       dataDirectory: options.dataDirectory || '', busy: false, stage: 'idle',
       message: '完成登录后，软件会自动部署到你的 GitHub。', error: '', github: null,
       browsers: [], selectedBrowser: restored.selectedBrowser || '',
       settings: cleanSettings(restored.settings || DEFAULT_SETTINGS), authCode: null,
-      accounts: (restored.accounts || []).map(cleanAccount).filter(Boolean), events: [], currentRun: null,
+      accounts: (restored.accounts || []).map(cleanAccount).filter(Boolean), events: (restored.events || []).slice(-100), currentRun: null,
+      resumeTasks: [], activeTaskId: restored.activeTaskId || '', errorInfo: null, storageWarning: '', progress: { completed: [], current: 0 },
     };
+    this.syncTaskSummaries();
   }
 
   snapshot() { return JSON.parse(JSON.stringify(this.state)); }
   changed() { this.emit('state', this.snapshot()); }
-  persist() { this.options.save?.(this.state); }
+  persist() { this.options.save?.({ ...this.state, pendingDeployments: [...this.tasks.values()].map(task => cleanPendingTask(task)).filter(Boolean) }); }
+  needsLogin(task) { return !task.credential && !task.checkpoint?.secretStored && !task.checkpoint?.dispatch && !task.checkpoint?.run; }
+  progressFor(task) {
+    const completed = [];
+    if (task?.githubLogin) completed.push(0);
+    if (task && (task.credential || task.checkpoint?.secretStored || task.checkpoint?.run || task.checkpoint?.dispatch)) completed.push(1);
+    if (task?.checkpoint?.configured || task?.checkpoint?.run || task?.checkpoint?.dispatch) completed.push(2);
+    if (task?.checkpoint?.run?.status === 'completed') completed.push(3);
+    const current = Math.min(3, ['github_auth', 'browser_login', 'deploying', 'verifying'].indexOf(task?.phase || 'github_auth'));
+    return { completed, current };
+  }
+  syncTaskSummaries() {
+    this.state.resumeTasks = [...this.tasks.values()].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))).map(task => {
+      const needsLogin = this.needsLogin(task);
+      const code = task.lastError?.code || '';
+      let actionLabel = task.checkpoint?.run || task.checkpoint?.dispatch ? '继续查询原任务' : needsLogin ? '登录并继续' : '继续未完成任务';
+      if (code === 'WORKFLOW_AUTH_REQUIRED') actionLabel = '补充 GitHub 授权并继续';
+      else if (code === 'WRONG_ACCOUNT') actionLabel = '登录原 GitHub 账号并继续';
+      else if (code === 'CONFIGURATION_CHANGED') actionLabel = '重新核对远端配置';
+      return { id: task.id, accountKey: task.account?.accountKey || task.expectedAccountKey || '', email: task.account?.email || '',
+        repository: task.checkpoint?.repository || (task.githubLogin ? `${task.githubLogin}/${task.settings.repoName}` : ''),
+        githubLogin: task.githubLogin || '', browserId: task.browserId, phase: task.phase, settings: { ...task.settings },
+        updatedAt: task.updatedAt, errorCode: code, lastError: task.lastError?.message || '', needsLogin,
+        canResume: true, savedAcrossRestart: !task.credential || Boolean(task.savedAcrossRestart), actionLabel };
+    });
+    if (!this.state.activeTaskId) this.state.activeTaskId = this.state.resumeTasks[0]?.id || '';
+    const active = this.activeTask || this.tasks.get(this.state.activeTaskId);
+    if (active) this.state.progress = this.progressFor(active);
+  }
+  async saveTasks() {
+    this.syncTaskSummaries();
+    // Non-secret progress, including dispatch intent, must be durable before another cloud mutation.
+    this.persist();
+    if (this.options.resumeStore) {
+      const result = await this.options.resumeStore.save([...this.tasks.values()].map(task => cleanPendingTask(task, { includeCredential: true })).filter(Boolean));
+      this.state.storageWarning = result.warning || '';
+      for (const task of this.tasks.values()) task.savedAcrossRestart = Boolean(result.durable);
+    }
+    this.syncTaskSummaries(); this.persist(); this.changed();
+  }
+  async saveTask(task) {
+    task.revision = (task.revision || 0) + 1; task.updatedAt = new Date().toISOString();
+    this.tasks.set(task.id, task); await this.saveTasks();
+  }
+  async restoreTasks() {
+    if (this.options.resumeStore) {
+      const loaded = await this.options.resumeStore.load();
+      this.state.storageWarning = loaded.warning || '';
+      for (const raw of loaded.tasks || []) {
+        const encrypted = cleanPendingTask(raw, { includeCredential: true });
+        if (!encrypted) continue;
+        const metadata = this.tasks.get(encrypted.id);
+        // Metadata is saved before the encrypted envelope. A missing task in a valid
+        // metadata file is a completed/discarded task, not an invitation to resurrect it.
+        if (this.metadataAuthoritative && !metadata) continue;
+        // A public checkpoint may be written immediately before its revision is
+        // incremented. For equal revisions, metadata is therefore authoritative.
+        let task = !metadata || encrypted.revision > metadata.revision ? encrypted : { ...metadata };
+        if (!task.credential && encrypted.credential && sameBinding(task, encrypted) && !task.checkpoint?.secretStored && !task.credentialExpired) task.credential = encrypted.credential;
+        if (encrypted.credentialExpired && sameBinding(task, encrypted)) { delete task.credential; task.credentialExpired = true; }
+        task.savedAcrossRestart = Boolean(loaded.durable);
+        this.tasks.set(task.id, task);
+      }
+    }
+    if (!this.tasks.has(this.state.activeTaskId)) this.state.activeTaskId = '';
+    this.syncTaskSummaries();
+    for (const task of this.tasks.values()) if (task.account) this.upsertPending(task);
+    if (this.tasks.size) {
+      this.state.stage = 'resume_available';
+      this.state.message = `已恢复 ${this.tasks.size} 个未完成任务，选择继续即可接续已保存的步骤。`;
+      const active = this.tasks.get(this.state.activeTaskId);
+      if (active?.lastError) this.setError(active.lastError, active);
+    }
+  }
+  setError(error, task = this.activeTask, action) {
+    const code = /^[A-Z_]{1,60}$/.test(error?.code || '') ? error.code : 'OPERATION_FAILED';
+    const message = safeMessage(error?.message || '当前操作未完成。', this.secrets);
+    this.state.error = message;
+    const summary = task && this.state.resumeTasks.find(item => item.id === task.id);
+    const nextAction = task && code === 'CONFIGURATION_CHANGED' && task.account
+      ? { taskId: task.id, accountKey: task.account.accountKey, action: 'reloginAccount', actionLabel: '更新登录并重新部署' }
+      : task ? { taskId: task.id, action: 'resumeDeploy', actionLabel: summary?.actionLabel || '继续未完成任务' } : action || {};
+    this.state.errorInfo = { code, stage: String(error?.stage || task?.phase || this.state.stage).slice(0, 80), message, hint: recoveryHint(code), ...nextAction };
+  }
+  upsertPending(task) {
+    if (!task.account) return;
+    const old = this.state.accounts.find(item => item.accountKey === task.account.accountKey);
+    this.upsert({ ...old, ...task.account, ...(task.checkpoint?.repository ? { repository: task.checkpoint.repository } : {}),
+      githubLogin: task.githubLogin, settings: task.settings, pendingTaskId: task.id, deploymentStatus: old?.deploymentStatus === 'deployed' || old?.runId ? 'deployed' : 'pending' });
+  }
   note(message, level = 'info') {
     const safe = safeMessage(message, this.secrets);
     if (!safe) return;
@@ -100,6 +220,7 @@ class Controller extends EventEmitter {
       if (!this.state.browsers.some(b => b.id === this.state.selectedBrowser && b.available)) {
         this.state.selectedBrowser = this.state.browsers.find(b => b.available && b.id !== 'embedded')?.id || 'embedded';
       }
+      await this.restoreTasks();
       if (signal.aborted) return;
       try { this.state.github = await this.github.whoami({ signal }); } catch { this.state.github = null; }
       if (!this.closing) this.changed();
@@ -127,7 +248,7 @@ class Controller extends EventEmitter {
     this.operationDone = new Promise(resolve => { finishOperation = resolve; });
     this.abort = new AbortController();
     const signal = this.abort.signal;
-    this.state.busy = true; this.state.error = ''; this.state.authCode = null;
+    this.state.busy = true; this.state.error = ''; this.state.errorInfo = null; this.state.authCode = null;
     this.changed();
     try {
       if (priorBackground) await priorBackground.catch(() => {});
@@ -137,84 +258,249 @@ class Controller extends EventEmitter {
     catch (error) {
       if (aborted(error, signal)) {
         this.state.stage = 'cancelled';
-        this.note(this.state.currentRun ? '已停止本机等待；已提交的 GitHub 任务仍可在账号卡片中查看。' : '已取消。登录窗口和本次临时会话会自动关闭。', 'warning');
+        this.note(this.activeTask ? '已停止当前操作，完成的步骤已保留，可稍后继续。' : this.state.currentRun ? '已停止本机等待；已提交的 GitHub 任务仍可在账号卡片中查看。' : '已取消当前操作。', 'warning');
       } else {
         this.state.stage = 'error';
-        this.state.error = safeMessage(error?.message || '操作未完成，请检查网络后重试。', this.secrets);
+        if (this.activeTask) {
+          if (LOGIN_ERRORS.has(error?.code)) { delete this.activeTask.credential; this.activeTask.needsLogin = true; }
+          if (error?.code === 'STORED_CREDENTIAL_MISSING' && this.activeTask.checkpoint && !this.activeTask.checkpoint.dispatch && !this.activeTask.checkpoint.run) {
+            this.activeTask.checkpoint.secretStored = false; this.activeTask.checkpoint.configured = false; delete this.activeTask.checkpoint.configSha;
+          }
+          this.activeTask.lastError = { code: error?.code || 'OPERATION_FAILED', message: safeMessage(error?.message, this.secrets), stage: error?.stage || this.activeTask.phase };
+          this.syncTaskSummaries();
+        }
+        this.setError(error);
         this.note(this.state.error, 'error');
       }
+      if (this.activeTask) {
+        try { await this.saveTask(this.activeTask); }
+        catch { this.state.storageWarning = '进度暂时无法保存到磁盘；请保持应用打开，检查数据目录权限后继续。'; }
+      }
     } finally {
-      this.secrets.length = 0; this.abort = null; this.pendingAccount = null;
+      this.secrets.length = 0; this.abort = null; this.pendingAccount = null; this.activeTask = null;
       this.state.busy = false; this.state.authCode = null;
+      this.syncTaskSummaries();
+      try { this.persist(); } catch { this.state.storageWarning = '进度暂时无法保存到磁盘，请保持应用打开并检查数据目录。'; }
       this.changed();
       finishOperation();
     }
     return this.snapshot();
   }
 
-  async ensureGitHub(signal, forceLogin = false) {
+  async ensureGitHub(signal, forceLogin = false, { refresh = false, requireWorkflow = true } = {}) {
     let identity;
-    try { if (!forceLogin) identity = await this.github.whoami({ signal }); }
+    try { identity = await this.github.whoami({ signal }); }
     catch (error) {
       if (error.code !== 'AUTH_REQUIRED' && error.status !== 401) throw error;
     }
-    if (!identity) {
+    if (!identity || forceLogin) {
       this.state.stage = 'github_auth';
       this.note('请在浏览器中完成 GitHub 登录和官方授权。');
-      identity = await this.github.login({ signal });
+      identity = await this.github.login({ signal, refresh: Boolean(refresh && identity) });
     }
     if (!identity?.login || !/^[A-Za-z0-9-]+$/.test(identity.login)) throw new Error('没有取得有效的 GitHub 账号身份。');
+    if (requireWorkflow && identity.workflowScope === false) {
+      const previous = identity;
+      this.state.stage = 'github_auth';
+      this.note('GitHub 已连接，需要补充工作流权限。请完成官方授权，随后自动继续。');
+      identity = await this.github.login({ signal, refresh: true });
+      if (identity?.login?.toLowerCase() !== previous.login.toLowerCase() || (previous.id && identity.id && previous.id !== identity.id)) throw operationError('WRONG_ACCOUNT', '补充授权的 GitHub 账号与当前账号不同，请选择原账号。', 'github_auth');
+      if (identity.workflowScope === false) throw operationError('WORKFLOW_AUTH_REQUIRED', 'GitHub 尚未授予工作流管理权限，请完成官方补充授权。', 'github_auth');
+    }
     this.state.github = identity; this.state.authCode = null; this.changed();
     return identity;
   }
 
+  createTask(settings, browserId, account) {
+    if (this.tasks.size >= 100) throw operationError('TASK_LIMIT', '未完成任务已达 100 个，请先完成或移除已有任务。');
+    const now = new Date().toISOString();
+    return { id: randomBytes(16).toString('hex'), revision: 0, createdAt: now, updatedAt: now, settings: { ...settings }, browserId,
+      phase: 'github_auth', ...(account ? { account: { accountKey: account.accountKey, email: account.email || '', browser: account.browser || browserId }, expectedAccountKey: account.accountKey } : {}) };
+  }
+
+  selectTask(task) {
+    this.activeTask = task; this.state.activeTaskId = task.id; this.state.currentRun = task.checkpoint?.run || null;
+    this.pendingAccount = task.account || null; this.state.stage = task.phase; this.syncTaskSummaries(); this.changed();
+  }
+
+  rememberCredential(credential) {
+    this.secrets.push(credential.cookie);
+    for (const segment of String(credential.cookie).split(';')) {
+      const i = segment.indexOf('='); if (i >= 0) this.secrets.push(segment.slice(i + 1).trim());
+    }
+  }
+
+  bindGitHub(task, identity) {
+    if ((task.githubLogin && task.githubLogin.toLowerCase() !== identity.login.toLowerCase()) || (task.githubId && identity.id && task.githubId !== identity.id)) {
+      throw operationError('WRONG_ACCOUNT', '此任务属于 GitHub 账号 ' + task.githubLogin + '，请登录该账号后继续。', 'github_auth');
+    }
+    task.githubLogin = identity.login;
+    if (Number.isSafeInteger(identity.id)) task.githubId = identity.id;
+  }
+
   async startDeploy(payload = {}) {
+    // Existing callers also get a real resume instead of accidentally starting another login.
+    if (!payload.newTask && this.tasks.size) return this.resumeDeploy({ taskId: this.tasks.has(this.state.activeTaskId) ? this.state.activeTaskId : this.tasks.keys().next().value });
     return this.exclusive(async signal => {
       const requested = { ...this.state.settings, ...payload };
       const settings = cleanSettings(requested);
-      if (requested.repoName !== settings.repoName || requested.time !== settings.time || requested.exchangePlan !== settings.exchangePlan) throw new Error('仓库名称、签到时间或兑换计划格式不正确。');
-      const browserId = payload.browserId || this.state.selectedBrowser;
-      if (!this.state.browsers.some(b => b.id === browserId && b.available)) throw new Error('所选浏览器不可用，请使用内置登录窗口。');
-      this.state.settings = settings; this.state.selectedBrowser = browserId; this.state.currentRun = null;
-      this.persist();
-      await this.ensureGitHub(signal);
-      this.state.stage = 'browser_login';
-      this.note('请在专用窗口登录 GLaDOS。登录成功后会自动继续，无需复制 Cookie。');
-      const credential = await this.captureLogin({ browserId, signal, profileRoot: this.options.profileRoot, parentWindow: this.options.parentWindow?.(), onProgress: event => this.note(event.message || event) });
+      if (requested.repoName !== settings.repoName || requested.time !== settings.time || requested.exchangePlan !== settings.exchangePlan) throw operationError('INVALID_SETTINGS', '仓库名称、签到时间或兑换计划格式不正确。');
+      const browserId = payload.browserId || payload.selectedBrowser || this.state.selectedBrowser;
+      if (!this.state.browsers.some(b => b.id === browserId && b.available)) throw operationError('BROWSER_UNAVAILABLE', '所选浏览器不可用，请使用内置登录窗口。');
+      this.state.settings = settings; this.state.selectedBrowser = browserId;
+      const task = this.createTask(settings, browserId);
+      this.selectTask(task); await this.saveTask(task);
+      await this.continueDeploy(task, signal);
+    });
+  }
+
+  async resumeDeploy(payload = {}) {
+    return this.exclusive(async signal => {
+      const task = this.tasks.get(payload.taskId);
+      if (!task) throw operationError('TASK_NOT_FOUND', '该任务已完成或已移除，请查看账号列表。');
+      this.selectTask(task);
+      await this.continueDeploy(task, signal);
+    });
+  }
+
+  async continueDeploy(task, signal) {
+    const previousError = task.lastError?.code;
+    const readOnly = Boolean(task.checkpoint?.run || task.checkpoint?.dispatch);
+    const identity = await this.ensureGitHub(signal, previousError === 'WRONG_ACCOUNT', { requireWorkflow: !readOnly && !task.checkpoint?.configured });
+    this.bindGitHub(task, identity);
+    if (!readOnly) {
+      const repository = (task.checkpoint?.repository || `${task.githubLogin}/${task.settings.repoName}`).toLowerCase();
+      const unresolved = [...this.tasks.values()].find(other => other.id !== task.id && other.checkpoint?.dispatch && !other.checkpoint?.run
+        && other.checkpoint.repository?.toLowerCase() === repository);
+      if (unresolved) {
+        await this.saveTask(task);
+        this.selectTask(unresolved);
+        throw operationError('PRIOR_DISPATCH_PENDING', '同一仓库中 ' + (unresolved.account?.email || unresolved.account?.accountKey || '另一账号') + ' 的验证请求仍待确认，请先继续查询原任务。本次待办已保留。', 'verifying');
+      }
+    }
+    delete task.lastError;
+    await this.saveTask(task);
+    if (this.needsLogin(task)) {
+      task.phase = 'browser_login'; this.state.stage = task.phase;
+      if (!this.state.browsers.some(b => b.id === task.browserId && b.available)) task.browserId = this.state.selectedBrowser;
+      if (!this.state.browsers.some(b => b.id === task.browserId && b.available)) task.browserId = 'embedded';
+      await this.saveTask(task);
+      this.note(task.account?.email ? '请在专用窗口登录 ' + task.account.email + '，完成后继续此账号的任务。' : '请在专用窗口登录 GLaDOS，登录成功后自动继续。');
+      const credential = await this.captureLogin({ browserId: task.browserId, signal, profileRoot: this.options.profileRoot,
+        parentWindow: this.options.parentWindow?.(), onProgress: event => this.note(event.message || event) });
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-      this.secrets.push(credential.cookie);
-      for (const segment of String(credential.cookie).split(';')) {
-        const i = segment.indexOf('='); if (i >= 0) this.secrets.push(segment.slice(i + 1).trim());
-      }
-      this.pendingAccount = { accountKey: credential.accountKey, email: credential.email || '', browser: credential.browser || browserId };
-      this.state.stage = 'deploying';
-      this.note('登录身份已核验，正在配置专用仓库和该账号的加密登录信息。');
-      let renewedAuthorization = false;
-      const deploy = async () => {
-        try { return await this.github.deploy({ credential, ...settings, signal }); }
-        catch (error) {
-          if (renewedAuthorization || !['WORKFLOW_AUTH_REQUIRED', 'AUTH_REQUIRED'].includes(error.code)) throw error;
-          renewedAuthorization = true;
-          this.note('GitHub 需要补充授权。请完成官方登录，随后会自动接续本次部署。');
-          await this.ensureGitHub(signal, true);
-          this.state.stage = 'deploying';
-          return this.github.deploy({ credential, ...settings, signal });
-        }
+      if (!credential || !/^[A-F0-9]{16}$/.test(credential.accountKey || '')) throw operationError('INVALID_CREDENTIAL', '未取得有效的 GLaDOS 账号身份，请重新登录。', 'browser_login');
+      if (task.expectedAccountKey && task.expectedAccountKey !== credential.accountKey) throw operationError('ACCOUNT_MISMATCH', '登录的 GLaDOS 账号与目标账号不同。请登录卡片上的账号，原账号未被修改。', 'browser_login');
+      const sameTarget = other => {
+        if (other.githubLogin?.toLowerCase() !== task.githubLogin?.toLowerCase() || (other.githubId && task.githubId && other.githubId !== task.githubId)) return false;
+        if (other.checkpoint?.repository && task.checkpoint?.repository) return other.checkpoint.repository.toLowerCase() === task.checkpoint.repository.toLowerCase();
+        return other.settings.repoName.toLowerCase() === task.settings.repoName.toLowerCase();
       };
-      let result = await deploy();
-      const waitingSince = Date.now();
-      while (result.deploymentPending) {
-        if (Date.now() - waitingSince > 15 * 60 * 1000) throw new Error('先前的 GitHub 任务等待超过 15 分钟，本次登录信息尚未提交。请待任务结束后重新登录部署。');
-        this.state.stage = 'verifying';
-        this.note('同一仓库的先前任务仍在运行。当前登录信息仅保留在本机内存，结束后会自动接续部署。');
-        await pauseFor(15000, signal);
-        result = await deploy();
+      const otherTasks = [...this.tasks.values()].filter(other => other.id !== task.id && (other.account?.accountKey || other.expectedAccountKey) === credential.accountKey);
+      const conflicting = otherTasks.find(other => !sameTarget(other));
+      const existing = conflicting || otherTasks.find(other => other.checkpoint?.dispatch || other.checkpoint?.run) || otherTasks[0];
+      if (existing) {
+        this.tasks.delete(task.id);
+        if (!conflicting && !existing.checkpoint?.secretStored && !existing.checkpoint?.dispatch && !existing.checkpoint?.run) {
+          existing.credential = { ...credential }; existing.credentialVersion = randomBytes(16).toString('hex');
+          existing.needsLogin = false; existing.credentialExpired = false;
+          existing.account = { accountKey: credential.accountKey, email: existing.account?.email || credential.email || '', browser: credential.browser || task.browserId };
+          existing.expectedAccountKey = credential.accountKey;
+        }
+        this.selectTask(existing); this.upsertPending(existing); await this.saveTasks();
+        if (conflicting) throw operationError('ACCOUNT_ALREADY_PENDING', '此 GLaDOS 账号已有绑定其他 GitHub 账号或仓库的未完成任务。已保留原目标；请继续原任务，或先移除其本地待办后再创建新目标。', 'browser_login');
+        this.note('此账号已有未完成任务，已合并到原任务并沿用原设置。');
+        return this.continueDeploy(existing, signal);
       }
-      this.recordResult({ ...this.pendingAccount, ...result });
-      const failed = FAILED.has(result.conclusion);
-      this.state.stage = failed ? 'error' : 'complete';
-      if (failed) this.state.error = this.resultMessage({ ...this.pendingAccount, ...result });
-      this.note(this.resultMessage({ ...this.pendingAccount, ...result }), failed ? 'error' : 'info');
+      this.rememberCredential(credential);
+      task.credential = { ...credential }; task.credentialVersion = randomBytes(16).toString('hex');
+      task.needsLogin = false; task.credentialExpired = false;
+      task.account = { accountKey: credential.accountKey, email: credential.email || '', browser: credential.browser || task.browserId };
+      task.expectedAccountKey = credential.accountKey;
+      this.pendingAccount = task.account;
+      task.phase = 'deploying';
+      this.upsertPending(task); await this.saveTask(task);
+    } else if (task.credential) this.rememberCredential(task.credential);
+    this.pendingAccount = task.account;
+    task.phase = readOnly ? 'verifying' : 'deploying'; this.state.stage = task.phase;
+    this.note(readOnly ? '正在接续查询原验证任务，不会重复提交签到。' : '继续已保存的部署步骤，正在配置该账号的云端任务。');
+    await this.saveTask(task);
+    let renewedAuthorization = false;
+    const deploy = async () => {
+      try {
+        return await this.github.deploy({ credential: task.credential, ...task.settings, signal, checkpoint: task.checkpoint,
+          onCheckpoint: async checkpoint => {
+            const saved = cleanCheckpoint(checkpoint);
+            if (!saved) throw operationError('CHECKPOINT_SAVE_FAILED', '部署进度格式不正确，已停止后续操作。');
+            if (saved.githubLogin && saved.githubLogin.toLowerCase() !== task.githubLogin.toLowerCase()) throw operationError('WRONG_ACCOUNT', 'GitHub 账号在部署期间发生变化，请登录原账号继续。');
+            if (saved.accountKey && saved.accountKey !== task.account?.accountKey) throw operationError('ACCOUNT_MISMATCH', '部署检查点与目标账号不一致，已停止操作。');
+            task.checkpoint = saved;
+            if (saved.secretStored) delete task.credential;
+            task.phase = saved.run || saved.dispatch ? 'verifying' : 'deploying';
+            this.state.stage = task.phase;
+            if (saved.run) this.state.currentRun = saved.run;
+            this.upsertPending(task);
+            await this.saveTask(task);
+          },
+        });
+      } catch (error) {
+        if (renewedAuthorization || !['WORKFLOW_AUTH_REQUIRED', 'AUTH_REQUIRED'].includes(error.code)) throw error;
+        renewedAuthorization = true;
+        this.note('GitHub 需要完成官方授权；当前 GLaDOS 登录和部署进度已保留。');
+        const renewed = await this.ensureGitHub(signal, true, { refresh: error.code === 'WORKFLOW_AUTH_REQUIRED', requireWorkflow: true });
+        this.bindGitHub(task, renewed); this.state.stage = task.phase;
+        return deploy();
+      }
+    };
+    let result = await deploy();
+    const waitingSince = Date.now();
+    while (result.deploymentPending) {
+      if (Date.now() - waitingSince > 15 * 60 * 1000) throw operationError('PRIOR_RUN_PENDING', '先前的 GitHub 任务仍未结束，当前进度已保存，可稍后继续。');
+      this.state.stage = 'deploying';
+      this.note('同一仓库的先前任务仍在运行，结束后会自动继续当前账号。');
+      await pauseFor(15000, signal); result = await deploy();
+    }
+    if (result.checkpoint) task.checkpoint = cleanCheckpoint(result.checkpoint);
+    this.recordResult({ ...task.account, ...result, settings: task.settings, githubLogin: task.githubLogin, deploymentStatus: 'deployed', pendingTaskId: '' });
+    this.tasks.delete(task.id); this.activeTask = null; await this.saveTasks();
+    const failed = FAILED.has(result.conclusion);
+    this.state.stage = failed ? 'error' : 'complete';
+    this.state.progress = { completed: result.status && PENDING.has(result.status) ? [0, 1, 2] : [0, 1, 2, 3], current: 3 };
+    if (failed) {
+      const evidence = evidenceFor({ ...task.account, ...result });
+      this.setError(operationError(evidence.outcome === 'authentication_required' ? 'LOGIN_REQUIRED' : 'RUN_FAILED', this.resultMessage({ ...task.account, ...result }), 'verifying'), null,
+        { action: evidence.outcome === 'authentication_required' ? 'reloginAccount' : 'refreshRun', actionLabel: evidence.outcome === 'authentication_required' ? '更新此账号登录' : '刷新此账号结果', accountKey: task.account.accountKey });
+    }
+    this.note(this.resultMessage({ ...task.account, ...result }), failed ? 'error' : 'info');
+  }
+
+  async reloginAccount(payload = {}) {
+    return this.exclusive(async signal => {
+      const account = this.findAccount(payload.accountKey);
+      const previousTasks = [...this.tasks.values()].filter(task => (task.account?.accountKey || task.expectedAccountKey) === account.accountKey);
+      const submitted = previousTasks.find(task => task.checkpoint?.dispatch || task.checkpoint?.run);
+      if (submitted) {
+        this.selectTask(submitted);
+        throw operationError('DISPATCH_UNCERTAIN', '此账号还有待确认的验证请求，请先继续查询原任务。', 'verifying');
+      }
+      const selected = this.tasks.get(this.state.activeTaskId);
+      const previous = previousTasks.find(task => task.id === account.pendingTaskId) || previousTasks.find(task => task.id === selected?.id) || previousTasks[0];
+      const settings = cleanSettings(previous?.settings || account.settings || this.state.settings);
+      if (!previous && account.repository) settings.repoName = account.repository.split('/')[1];
+      const task = this.createTask(settings, payload.browserId || this.state.selectedBrowser, account);
+      if (account.repository) task.githubLogin = account.repository.split('/')[0];
+      else if (account.githubLogin) task.githubLogin = account.githubLogin;
+      if (previous) {
+        task.githubLogin = previous.githubLogin || previous.checkpoint?.githubLogin || task.githubLogin;
+        if (previous.githubId || previous.checkpoint?.githubId) task.githubId = previous.githubId || previous.checkpoint.githubId;
+      }
+      if (previous?.checkpoint) {
+        task.checkpoint = { ...previous.checkpoint, secretStored: false, configured: false };
+        delete task.checkpoint.configSha;
+      }
+      for (const old of previousTasks) this.tasks.delete(old.id);
+      this.selectTask(task); this.upsertPending(task); await this.saveTask(task);
+      await this.continueDeploy(task, signal);
     });
   }
 
@@ -233,8 +519,8 @@ class Controller extends EventEmitter {
   recordResult(result) {
     const evidence = evidenceFor(result);
     const repeated = ['already', 'already_checked'].includes(evidence.outcome);
-    const conclusion = FAILED.has(result.conclusion) ? result.conclusion : result.result?.status === 'unverified' ? 'unverified' : repeated && result.conclusion === 'success' ? 'already_checked_in' : evidence.outcome === 'checked' && result.conclusion === 'success' ? 'checkin_success' : result.conclusion || result.status || 'queued';
-    this.upsert({ ...result, pointsAdded: Number.isFinite(evidence.pointsAdded) ? evidence.pointsAdded : null, message: safeMessage(evidence.message || result.message || '', this.secrets), conclusion });
+    const conclusion = evidence.outcome === 'authentication_required' ? 'authentication_required' : FAILED.has(result.conclusion) ? result.conclusion : result.result?.status === 'unverified' ? 'unverified' : repeated && result.conclusion === 'success' ? 'already_checked_in' : evidence.outcome === 'checked' && result.conclusion === 'success' ? 'checkin_success' : result.conclusion || result.status || 'queued';
+    this.upsert({ ...result, status: result.status || 'completed', lastRefreshError: '', pointsAdded: Number.isFinite(evidence.pointsAdded) ? evidence.pointsAdded : null, message: safeMessage(evidence.message || result.message || '', this.secrets), conclusion });
     this.state.currentRun = { repository: result.repository, runId: result.runId, runUrl: result.runUrl, status: result.status || 'completed', conclusion: result.conclusion || null };
   }
 
@@ -245,7 +531,7 @@ class Controller extends EventEmitter {
   }
 
   async refreshAccount(account, signal, latest = false) {
-    if (!account.repository) return;
+    if (!account.repository) throw operationError('DEPLOYMENT_PENDING', '该账号尚未完成部署，请先继续未完成任务。');
     const result = await this.github.refresh({ repository: account.repository, accountKey: account.accountKey, ...(latest ? {} : { runId: account.runId }), signal });
     if (signal?.aborted || this.closing) return;
     this.recordResult({ ...account, ...result });
@@ -287,13 +573,47 @@ class Controller extends EventEmitter {
   async action(name, payload = {}) {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('操作参数不正确。');
     if (name === 'cancel') { this.abort?.abort(); if (this.state.busy) { this.state.stage = 'cancelling'; this.note('正在关闭本次操作，请稍候。'); } return this.snapshot(); }
-    if (name === 'connectGithub') return this.exclusive(async signal => { await this.ensureGitHub(signal, true); this.state.stage = 'idle'; this.note(`已连接 GitHub：${this.state.github.login}。`); });
+    if (name === 'connectGithub') return this.exclusive(async signal => { await this.ensureGitHub(signal, true); this.state.stage = this.tasks.size ? 'resume_available' : 'idle'; this.note(`已连接 GitHub：${this.state.github.login}。${this.tasks.size ? '可以继续已保存的任务。' : ''}`); });
     if (name === 'startDeploy') return this.startDeploy(payload);
+    if (name === 'resumeDeploy') return this.resumeDeploy(payload);
+    if (name === 'reloginAccount') return this.reloginAccount(payload);
+    if (name === 'discardResume') return this.exclusive(async () => {
+      const task = this.tasks.get(payload.taskId);
+      if (!task) return;
+      this.tasks.delete(task.id);
+      if (this.state.activeTaskId === task.id) { this.state.activeTaskId = ''; this.state.currentRun = null; this.state.progress = { completed: [], current: 0 }; }
+      this.state.accounts = this.state.accounts.filter(account => account.pendingTaskId !== task.id || account.runId || account.deploymentStatus === 'deployed');
+      for (const account of this.state.accounts) if (account.pendingTaskId === task.id) account.pendingTaskId = '';
+      await this.saveTasks(); this.state.stage = this.tasks.size ? 'resume_available' : 'idle';
+      this.note('已移除这项本地待办。已经建立的 GitHub 仓库和云端任务仍保留。');
+    });
+    if (name === 'refreshAll') return this.exclusive(async signal => {
+      const accounts = this.state.accounts.filter(account => account.repository && (account.runId || account.deploymentStatus === 'deployed'));
+      let successful = 0; let failed = 0;
+      for (const account of accounts) {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        try { await this.refreshAccount({ ...account }, signal, true); successful++; }
+        catch (error) {
+          if (aborted(error, signal)) throw error;
+          failed++; const message = safeMessage(error?.message, this.secrets);
+          this.upsert({ ...account, lastRefreshError: message });
+          this.note((account.email || account.accountKey) + '：' + message, 'warning');
+        }
+      }
+      this.state.stage = failed && !successful ? 'error' : 'complete';
+      if (!accounts.length) this.note('还没有已部署账号。请先继续待办或添加账号。');
+      else this.note('已刷新 ' + successful + ' 个账号' + (failed ? '；' + failed + ' 个账号暂未刷新，可在各自卡片查看原因。' : '，各账号的结果已分别更新。'), failed ? 'warning' : 'info');
+      if (failed && !successful) this.setError(operationError('REFRESH_FAILED', '暂时未能刷新账号，请检查各账号提示后重试。'), null, { action: 'refreshAll', actionLabel: '重新刷新全部' });
+    });
     if (name === 'refreshRun') return this.exclusive(async signal => {
       const result = await this.refreshAccount(this.findAccount(payload.accountKey), signal, true);
       const failed = FAILED.has(result?.conclusion);
       this.state.stage = failed ? 'error' : 'complete';
-      if (failed) this.state.error = this.resultMessage({ ...this.findAccount(payload.accountKey), ...result });
+      if (failed) {
+        const authentication = evidenceFor({ ...this.findAccount(payload.accountKey), ...result }).outcome === 'authentication_required';
+        this.setError(operationError(authentication ? 'LOGIN_REQUIRED' : 'RUN_FAILED', this.resultMessage({ ...this.findAccount(payload.accountKey), ...result }), 'verifying'), null,
+          { action: authentication ? 'reloginAccount' : 'refreshRun', actionLabel: authentication ? '更新此账号登录' : '刷新此账号结果', accountKey: payload.accountKey });
+      }
       this.note(failed ? this.state.error : '已读取 GitHub 上最近一次适用的运行结果。', failed ? 'error' : 'info');
     });
     if (name === 'pause') return this.exclusive(async signal => {
@@ -305,7 +625,7 @@ class Controller extends EventEmitter {
     });
     if (name === 'openRun' || name === 'openRepository') {
       const account = this.findAccount(payload.accountKey);
-      const url = name === 'openRun' ? account.runUrl : `https://github.com/${account.repository}`;
+      const url = name === 'openRun' ? account.runUrl : account.repository ? `https://github.com/${account.repository}` : null;
       if (url) await this.options.openExternal(url);
     } else if (name === 'copyAuthCode') {
       if (this.state.authCode?.code) this.options.copyAuthCode?.(this.state.authCode.code);

@@ -8,7 +8,7 @@ if (!/^[A-Za-z0-9-]+$/.test(prefix || '')) throw new Error('Invalid platform art
 const root = path.join(process.env.GITHUB_WORKSPACE, 'desktop-deployer');
 const delivery = path.join(root, 'delivery');
 const meta = ['manifest.json', 'SHA256SUMS.txt'].map(name => path.join(delivery, name));
-for (const name of ['package-lock.json', 'smoke-output/desktop-smoke.json', 'smoke-output/desktop-smoke.png']) {
+for (const name of ['package-lock.json', 'smoke-output/desktop-smoke.json', 'smoke-output/desktop-smoke.png', 'smoke-output/recovery-smoke.png', 'smoke-output/multi-account-smoke.png']) {
   const file = path.join(root, name); if (fs.existsSync(file)) meta.push(file);
 }
 await client.uploadArtifact(`${prefix}-metadata`, meta, root, { retentionDays: 30, compressionLevel: 6 });

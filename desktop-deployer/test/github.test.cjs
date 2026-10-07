@@ -9,7 +9,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const {
   GitHubClient, GitHubError, accountKeyFor, validateCredential, parseResults,
-  parseHTTPOutput, renderWorkflow, renderRunner, scheduleToCron, WORKFLOW_FILE,
+  parseHTTPOutput, classifyCommandFailure, renderWorkflow, renderRunner, scheduleToCron, WORKFLOW_FILE,
   WORKFLOW_PATH, KEEPALIVE_PATH, MANIFEST_PATH, MARKER_PATH, UPSTREAM_SHA,
 } = require('../src/github.cjs');
 
@@ -49,11 +49,13 @@ class MemoryGitHub extends GitHubClient {
     this.dispatchResponse = 'modern';
     this.runStatus = 'completed';
     this.currentLogin = 'tester';
+    this.currentId = 42;
+    this.workflowScope = true;
   }
   sha() { return (++this.version).toString(16).padStart(40, '0'); }
   addRepo(name, managed = false) {
     const full = `tester/${name}`;
-    const record = { id: this.repositories.size + 1, full_name: full, owner: { login: 'tester' }, permissions: { admin: true }, default_branch: 'main', private: false, files: new Map(), head: this.sha(), tree: this.sha(), trees: new Map(), commits: new Map() };
+    const record = { id: this.repositories.size + 1, full_name: full, owner: { login: 'tester', id: 42 }, permissions: { admin: true }, default_branch: 'main', private: false, files: new Map(), head: this.sha(), tree: this.sha(), trees: new Map(), commits: new Map() };
     record.commits.set(record.head, { tree: { sha: record.tree }, parents: [] });
     if (managed) record.files.set(MARKER_PATH, JSON.stringify({ appId: 'glados-quick-deploy', schemaVersion: 1, repositoryId: record.id }));
     this.repositories.set(full, record);
@@ -70,7 +72,10 @@ class MemoryGitHub extends GitHubClient {
   }
   async _api(endpoint, options = {}) {
     this.calls.push({ endpoint, method: options.method || 'GET', body: options.body, raw: options.raw });
-    if (endpoint === 'user') return { login: this.currentLogin, name: 'Tester', avatar_url: 'https://avatars.githubusercontent.com/u/1' };
+    if (endpoint === 'user') {
+      const data = { login: this.currentLogin, id: this.currentId, name: 'Tester', avatar_url: 'https://avatars.githubusercontent.com/u/1' };
+      return options.metadata ? { data, workflowScope: this.workflowScope } : data;
+    }
     if (endpoint === 'user/repos') {
       const repo = this.addRepo(options.body.name);
       // Deliberately omit permissions, as creation is verified with a subsequent GET.
@@ -113,6 +118,11 @@ class MemoryGitHub extends GitHubClient {
       return { object: { sha: repo.head } };
     }
     if (route === 'actions/permissions') return { enabled: true, allowed_actions: 'selected' };
+    if (route.startsWith('actions/secrets/')) {
+      const name = route.slice('actions/secrets/'.length);
+      if (!this.secrets.has(`${full}/${name}`)) throw new GitHubError('NOT_FOUND', 'not found', 'secrets');
+      return { name, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' };
+    }
     if (/actions\/workflows\/[^/]+\/(enable|disable)$/.test(route)) return null;
     if (route === `actions/workflows/${WORKFLOW_FILE}/dispatches`) {
       this.dispatchCount++;
@@ -142,6 +152,14 @@ class MemoryGitHub extends GitHubClient {
     throw new Error(`Unexpected mock endpoint: ${endpoint}`);
   }
 }
+
+function restartClient(previous) {
+  const next = new MemoryGitHub();
+  for (const key of ['repositories', 'secrets', 'runs', 'dispatchCount', 'version', 'currentId', 'currentLogin', 'workflowScope']) next[key] = previous[key];
+  return next;
+}
+
+const snapshotCopy = value => JSON.parse(JSON.stringify(value));
 
 test('verified identity is stable across cookie and browser changes and rejects missing identity', () => {
   const one = credential();
@@ -177,7 +195,7 @@ test('official gh non-TTY login opens exactly the verified device URL without st
       child.stderr.emit('data', Buffer.from('! First copy your one-time co'));
       child.stderr.emit('data', Buffer.from('de: ABCD-1234\nOpen this URL to continue in your web browser: https://github.com/login/device\n'));
       child.stderr.emit('data', Buffer.from('Authentication complete.\n'));
-    } else child.stdout.emit('data', Buffer.from(http({ login: 'tester', name: 'Test', avatar_url: 'https://avatars.githubusercontent.com/u/1' })));
+    } else child.stdout.emit('data', Buffer.from(http({ login: 'tester', id: 42, name: 'Test', avatar_url: 'https://avatars.githubusercontent.com/u/1' })));
     child.emit('close', 0);
   });
   const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl, onEvent: e => emitted.push(e), openExternal: async url => opened.push(url) });
@@ -225,6 +243,59 @@ test('abort kills the child and raw GitHub failures never cross the error bounda
 test('modern and legacy HTTP output parse without relying on a 204-only dispatch', () => {
   assert.deepEqual(parseHTTPOutput(http(null, 204)), { status: 204, body: '' });
   assert.equal(JSON.parse(parseHTTPOutput(http({ workflow_run_id: 123 })).body).workflow_run_id, 123);
+});
+
+test('granted and accepted scope headers never turn normal HTTP failures into missing workflow authorization', () => {
+  for (const [status, expected] of [[404, 'NOT_FOUND'], [409, 'CONFLICT'], [422, 'VALIDATION_FAILED'], [403, 'PERMISSION_DENIED']]) {
+    const output = `HTTP/2 ${status}\r\nX-OAuth-Scopes: gist, read:org, repo, workflow\r\nX-Accepted-OAuth-Scopes: repo, workflow\r\n\r\n${JSON.stringify({ message: 'Ordinary request failure' })}`;
+    assert.equal(classifyCommandFailure(output, `gh: Ordinary request failure (HTTP ${status})`, 'configuration', 1).code, expected);
+  }
+  const denied = 'refusing to allow an OAuth App to create or update workflow `.github/workflows/checkin.yml` without `workflow` scope';
+  assert.equal(classifyCommandFailure(http({ message: denied }, 403), '', 'configuration', 1).code, 'WORKFLOW_AUTH_REQUIRED');
+  assert.equal(classifyCommandFailure('', 'missing required workflow scope', 'identity', 1).code, 'WORKFLOW_AUTH_REQUIRED');
+  assert.equal(classifyCommandFailure(http({ message: 'Missing required "workflow" scope' }, 403), '', 'configuration', 1).code, 'WORKFLOW_AUTH_REQUIRED');
+});
+
+test('whoami exposes only safe identity and an explicit nullable workflow scope', async () => {
+  for (const [header, expected] of [['X-OAuth-Scopes: repo, workflow\r\n', true], ['X-OAuth-Scopes: repo\r\n', false], ['X-OAuth-Scopes:\r\n', false], ['', null]]) {
+    const fake = fakeSpawn(child => {
+      child.stdout.emit('data', Buffer.from(`HTTP/2 200\r\n${header}X-Private: NEVER_FORWARD\r\n\r\n${JSON.stringify({ login: 'tester', id: 42, name: 'Test', private: 'NEVER_FORWARD' })}`));
+      child.emit('close', 0);
+    });
+    const user = await new GitHubClient({ ghPath: '/fake/gh', spawnImpl: fake.spawnImpl }).whoami();
+    assert.deepEqual(user, { login: 'tester', id: 42, workflowScope: expected, name: 'Test', avatarUrl: '' });
+    assert.equal(JSON.stringify(user).includes('NEVER_FORWARD'), false);
+  }
+});
+
+test('scope repair uses official refresh, verifies the same immutable GitHub identity and does not prompt on stdin', async () => {
+  for (const changed of [false, true]) {
+    let userReads = 0;
+    const fake = fakeSpawn((child, call) => {
+      if (call.args[0] === 'auth') {
+        assert.deepEqual(call.args, ['auth', 'refresh', '--hostname', 'github.com', '--scopes', 'workflow', '--clipboard=false']);
+        child.stderr.emit('data', Buffer.from('First copy your one-time code: ABCD-1234\nOpen this URL to continue in your web browser: https://github.com/login/device\n'));
+      } else {
+        userReads++;
+        child.stdout.emit('data', Buffer.from(`HTTP/2 200\r\nX-OAuth-Scopes: repo${userReads > 1 ? ', workflow' : ''}\r\n\r\n${JSON.stringify({ login: 'tester', id: changed && userReads > 1 ? 99 : 42 })}`));
+      }
+      child.emit('close', 0);
+    });
+    const client = new GitHubClient({ ghPath: '/fake/gh', spawnImpl: fake.spawnImpl });
+    if (changed) await assert.rejects(client.login({ refresh: true }), { code: 'WRONG_ACCOUNT' });
+    else assert.equal((await client.login({ refresh: true })).workflowScope, true);
+    assert.equal(fake.calls.filter(call => call.args[0] === 'auth').length, 1);
+    assert.ok(fake.calls.every(call => call.input === undefined));
+  }
+});
+
+test('a confirmed missing workflow scope stops deployment before creating or writing anything', async () => {
+  const client = new MemoryGitHub();
+  client.workflowScope = false;
+  await assert.rejects(client.deploy({ credential: credential() }), { code: 'WORKFLOW_AUTH_REQUIRED' });
+  assert.equal(client.calls.length, 1);
+  assert.equal(client.repositories.size, 0);
+  assert.equal(client.secrets.size, 0);
 });
 
 test('deployment creates an isolated repository, uses atomic non-force commit and verifies only selected account', async () => {
@@ -481,4 +552,163 @@ test('verification deadline returns the known queued run and cancels an outstand
   assert.equal(outcome.runId, 999);
   assert.equal(outcome.status, 'queued');
   assert.equal(requestAborted, true);
+});
+
+test('a persisted uploaded secret resumes after restart without a cookie or a second secret write', async () => {
+  const original = new MemoryGitHub();
+  const captured = credential();
+  let saved;
+  await assert.rejects(original.deploy({ credential: captured, onCheckpoint: async next => {
+    saved = snapshotCopy(next);
+    assert.equal(JSON.stringify(next).includes(captured.cookie), false);
+    assert.equal(JSON.stringify(next).includes(captured.email), false);
+    if (next.secretStored) throw new Error('Simulated application interruption');
+  } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+  assert.equal(saved.secretStored, true);
+  assert.equal(saved.configured, false);
+  assert.equal(original.dispatchCount, 0);
+  const restarted = restartClient(original);
+  const result = await restarted.deploy({ checkpoint: saved, onCheckpoint: async next => { saved = snapshotCopy(next); } });
+  assert.equal(result.result.status, 'points_increased');
+  assert.equal(restarted.calls.some(call => call.kind === 'secret'), false);
+  assert.equal(restarted.repositories.size, 1);
+  assert.equal(saved.run.runId, result.runId);
+});
+
+test('checkpoint persistence failure stops before the next side effect including dispatch', async () => {
+  const untouched = new MemoryGitHub();
+  await assert.rejects(untouched.deploy({ credential: credential(), onCheckpoint: async () => { throw new Error('DISK_SECRET_DO_NOT_LEAK'); } }), error => error.code === 'CHECKPOINT_SAVE_FAILED' && !error.message.includes('DISK_SECRET'));
+  assert.equal(untouched.repositories.size, 0);
+  assert.equal(untouched.secrets.size, 0);
+  const client = new MemoryGitHub();
+  let saved;
+  await assert.rejects(client.deploy({ credential: credential(), onCheckpoint: async next => {
+    if (next.dispatch) throw new Error('Disk full');
+    saved = snapshotCopy(next);
+  } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+  assert.equal(saved.configured, true);
+  assert.equal(saved.dispatch, undefined);
+  assert.equal(client.dispatchCount, 0);
+});
+
+test('creation checkpoint adopts only the exact newly created repository and never overwrites a foreign marker', async () => {
+  for (const foreignMarker of [undefined, null, { appId: 'foreign', schemaVersion: 1, repositoryId: 1 }]) {
+    const original = new MemoryGitHub();
+    let saved;
+    await assert.rejects(original.deploy({ credential: credential(), onCheckpoint: async next => {
+      saved = snapshotCopy(next);
+      if (next.createdRepository) throw new Error('Crash before marker');
+    } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+    assert.equal(original.repositories.size, 1);
+    const repo = original.repositories.get(saved.repository);
+    assert.equal(repo.files.has(MARKER_PATH), false);
+    repo.files.set('unrelated.txt', 'Preserve this file');
+    if (foreignMarker !== undefined) repo.files.set(MARKER_PATH, JSON.stringify(foreignMarker));
+    const restarted = restartClient(original);
+    const parameters = { checkpoint: saved, credential: credential(), onCheckpoint: async next => { saved = snapshotCopy(next); } };
+    if (foreignMarker !== undefined) {
+      await assert.rejects(restarted.deploy(parameters), { code: 'UNMANAGED_REPOSITORY' });
+      assert.equal(restarted.calls.some(call => call.method === 'POST' || call.kind === 'secret'), false);
+    } else {
+      await restarted.deploy(parameters);
+      assert.equal(saved.createdRepository, undefined);
+      assert.equal(restarted.repositories.size, 1);
+      assert.equal(repo.files.get('unrelated.txt'), 'Preserve this file');
+    }
+  }
+});
+
+test('configured checkpoints verify remote files and do not commit again; modified configurations stop safely', async () => {
+  for (const changed of [false, true]) {
+    const original = new MemoryGitHub();
+    let saved;
+    await assert.rejects(original.deploy({ credential: credential(), onCheckpoint: async next => {
+      saved = snapshotCopy(next);
+      if (next.configured) throw new Error('Crash after configuration');
+    } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+    const repo = original.repositories.get(saved.repository);
+    if (changed) repo.files.set(WORKFLOW_PATH, 'External modification');
+    const restarted = restartClient(original);
+    if (changed) await assert.rejects(restarted.deploy({ checkpoint: saved }), { code: 'CONFIGURATION_CHANGED' });
+    else assert.equal((await restarted.deploy({ checkpoint: saved })).result.status, 'points_increased');
+    assert.equal(restarted.calls.some(call => call.endpoint?.endsWith('/git/trees') || call.kind === 'secret'), false);
+    assert.equal(restarted.dispatchCount, changed ? 0 : 1);
+  }
+});
+
+test('a dropped dispatch response survives restart and recovers the exact nonce without another POST', async () => {
+  const original = new MemoryGitHub();
+  original.dispatchResponse = 'lost';
+  original._findRun = async () => { throw new GitHubError('NETWORK_ERROR', 'disconnected', 'verification', { retryable: true }); };
+  let saved;
+  await assert.rejects(original.deploy({ credential: credential(), onCheckpoint: async next => { saved = snapshotCopy(next); } }), { code: 'NETWORK_ERROR' });
+  assert.equal(original.dispatchCount, 1);
+  assert.ok(saved.dispatch?.nonce);
+  assert.equal(saved.run, undefined);
+  const restarted = restartClient(original);
+  restarted.workflowScope = false;
+  const result = await restarted.deploy({ checkpoint: saved, onCheckpoint: async next => { saved = snapshotCopy(next); } });
+  assert.equal(result.runId, 1001);
+  assert.equal(result.result.status, 'points_increased');
+  assert.equal(restarted.dispatchCount, 1);
+  assert.ok(restarted.calls.every(call => call.method === 'GET'));
+  assert.equal(restarted.events.find(event => event.type === 'run').credentialUpdated, true);
+  const onceMore = restartClient(restarted);
+  const again = await onceMore.deploy({ checkpoint: saved });
+  assert.equal(again.runId, 1001);
+  assert.ok(onceMore.calls.every(call => call.method === 'GET'));
+  assert.equal(onceMore.dispatchCount, 1);
+});
+
+test('an unresolved durable dispatch intent remains available and is never reposted', async () => {
+  const original = new MemoryGitHub();
+  let saved;
+  await assert.rejects(original.deploy({ credential: credential(), onCheckpoint: async next => {
+    saved = snapshotCopy(next);
+    if (next.dispatch) throw new Error('Crash after durable intent but before HTTP');
+  } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+  const restarted = restartClient(original);
+  await assert.rejects(restarted.deploy({ checkpoint: saved }), { code: 'DISPATCH_UNCERTAIN' });
+  assert.equal(restarted.dispatchCount, 0);
+  assert.ok(saved.dispatch.nonce);
+  assert.equal(restarted._pendingDispatches.get(saved.repository).nonce, saved.dispatch.nonce);
+  assert.ok(restarted.calls.every(call => call.method === 'GET'));
+});
+
+test('resume rejects changed immutable GitHub or repository identity before any writes', async () => {
+  for (const change of ['user-id', 'login', 'repository-id', 'owner-id']) {
+    const original = new MemoryGitHub();
+    let saved;
+    await assert.rejects(original.deploy({ credential: credential(), onCheckpoint: async next => {
+      saved = snapshotCopy(next);
+      if (next.secretStored) throw new Error('Stop after upload');
+    } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+    const restarted = restartClient(original);
+    if (change === 'user-id') restarted.currentId = 99;
+    if (change === 'login') restarted.currentLogin = 'different-user';
+    if (change === 'repository-id') restarted.repositories.get(saved.repository).id = 99;
+    if (change === 'owner-id') restarted.repositories.get(saved.repository).owner.id = 99;
+    await assert.rejects(restarted.deploy({ checkpoint: saved }), { code: ['repository-id', 'owner-id'].includes(change) ? 'REPOSITORY_IDENTITY_CHANGED' : 'WRONG_ACCOUNT' });
+    assert.ok(restarted.calls.every(call => call.method === 'GET'));
+    assert.equal(restarted.dispatchCount, 0);
+  }
+});
+
+test('resuming configuration merges the fresh remote accounts instead of overwriting a later addition', async () => {
+  const original = new MemoryGitHub();
+  let saved;
+  const first = credential();
+  const second = credential('second@example.test');
+  await assert.rejects(original.deploy({ credential: first, onCheckpoint: async next => {
+    saved = snapshotCopy(next);
+    if (next.secretStored) throw new Error('Interrupt first account configuration');
+  } }), { code: 'CHECKPOINT_SAVE_FAILED' });
+  const otherDeployment = restartClient(original);
+  await otherDeployment.deploy({ credential: second });
+  const restarted = restartClient(otherDeployment);
+  const result = await restarted.deploy({ checkpoint: saved });
+  const manifest = JSON.parse(restarted.repositories.get(saved.repository).files.get(MANIFEST_PATH));
+  assert.deepEqual(new Set(manifest.accounts.map(account => account.accountKey)), new Set([first.accountKey, second.accountKey]));
+  assert.equal(result.result.accounts[0].accountKey, first.accountKey);
+  assert.equal(restarted.calls.some(call => call.kind === 'secret'), false);
 });

@@ -88,8 +88,14 @@ function classifyCommandFailure(stdout, stderr, stage, exitCode) {
   const raw = `${stdout || ''}\n${stderr || ''}`;
   const matches = [...raw.matchAll(/(?:HTTP(?:\/[\d.]+)?\s+|HTTP\s*[:=]\s*)([1-5]\d\d)/gi)];
   const httpStatus = matches.length ? Number(matches[matches.length - 1][1]) : undefined;
-  const lower = raw.toLowerCase();
-  if (/workflow.*scope|scope.*workflow|refusing to allow.*workflow/.test(lower)) return new GitHubError('WORKFLOW_AUTH_REQUIRED', 'GitHub 授权缺少管理工作流的权限，请重新完成 GitHub 授权。', stage, { httpStatus });
+  // --include emits granted/accepted scope headers even for normal 404/409 responses.
+  // Only an explicit rejection in the body/CLI diagnostic identifies missing scope.
+  let bodyDiagnostic = parseHTTPOutput(stdout || '').body;
+  try { const body = JSON.parse(bodyDiagnostic); if (typeof body?.message === 'string') bodyDiagnostic = body.message; } catch { /* CLI/network failures are not necessarily JSON. */ }
+  const diagnostic = `${bodyDiagnostic}\n${stderr || ''}`
+    .split(/\r?\n/).filter(line => !/^\s*x-(?:oauth|accepted-oauth)-scopes\s*:/i.test(line)).join('\n');
+  const lower = diagnostic.toLowerCase();
+  if (/refusing to allow[^\r\n]*workflow[^\r\n]*(?:without|missing)[^\r\n]*scope|(?:missing|required|insufficient)[^\r\n]{0,50}["'`]?workflow["'`]?\s+scope|["'`]?workflow["'`]?\s+scope[^\r\n]{0,35}(?:is required|is missing)/.test(lower)) return new GitHubError('WORKFLOW_AUTH_REQUIRED', 'GitHub 授权缺少管理工作流的权限，请补充当前账号的官方授权。', stage, { httpStatus });
   if (lower.includes('rate limit') || httpStatus === 429) return new GitHubError('RATE_LIMITED', 'GitHub 暂时限制请求频率，请稍后继续。', stage, { httpStatus, retryable: true });
   if (httpStatus === 401 || /not logged into|not logged in|please run:.*auth login|to get started with github cli/.test(lower)) return new GitHubError('AUTH_REQUIRED', '需要重新登录 GitHub。', stage, { httpStatus });
   if (httpStatus === 403) return new GitHubError('PERMISSION_DENIED', 'GitHub 未允许此操作，请检查授权或仓库 Actions 限制。', stage, { httpStatus });
@@ -99,24 +105,60 @@ function classifyCommandFailure(stdout, stderr, stage, exitCode) {
   if (httpStatus >= 500) return new GitHubError('GITHUB_UNAVAILABLE', 'GitHub 服务暂时不可用，请稍后继续。', stage, { httpStatus, retryable: true });
   if (/access_denied|authorization.*denied|authentication.*denied/.test(lower)) return new GitHubError('AUTH_DENIED', 'GitHub 授权已取消或未获批准。', stage);
   if (/expired_token|device.*expired|code.*expired/.test(lower)) return new GitHubError('AUTH_EXPIRED', 'GitHub 授权码已过期，请重新登录。', stage);
+  if (/error refreshing credentials for.+received credentials for/.test(lower)) return new GitHubError('WRONG_ACCOUNT', '请使用原 GitHub 账号完成权限补充。', 'identity');
   if (/timeout|timed out|dial tcp|no such host|enotfound|econn|network|tls|connection|unexpected eof|proxyconnect/.test(lower)) return new GitHubError('NETWORK_ERROR', '无法连接 GitHub，请检查网络后继续。', stage, { retryable: true });
   if (exitCode === 4) return new GitHubError('AUTH_REQUIRED', '需要重新登录 GitHub。', stage);
   return new GitHubError('GITHUB_COMMAND_FAILED', 'GitHub 操作未完成，请重试或重新授权。', stage, { httpStatus });
 }
 
-function parseHTTPOutput(output) {
+function parseHTTPOutput(output, { metadata = false } = {}) {
   let rest = String(output || '');
   let status = 200;
+  let workflowScope = null;
   for (let count = 0; count < 8 && /^HTTP\/\S+\s+\d{3}/.test(rest); count++) {
     const match = rest.match(/^HTTP\/\S+\s+(\d{3})[^\r\n]*\r?\n/);
     if (!match) break;
     status = Number(match[1]);
     const separator = rest.search(/\r?\n\r?\n/);
-    if (separator === -1) return { status, body: '' };
+    if (separator === -1) return { status, body: '', ...(metadata ? { workflowScope } : {}) };
+    if (metadata) {
+      const scopes = rest.slice(0, separator).match(/^x-oauth-scopes:[ \t]*([^\r\n]*)/im);
+      workflowScope = scopes ? scopes[1].split(',').map(value => value.trim().toLowerCase()).includes('workflow') : null;
+    }
     const separatorLength = rest.slice(separator).startsWith('\r\n\r\n') ? 4 : 2;
     rest = rest.slice(separator + separatorLength);
   }
-  return { status, body: rest };
+  return { status, body: rest, ...(metadata ? { workflowScope } : {}) };
+}
+
+function copyCheckpoint(value) {
+  if (!value || typeof value !== 'object' || value.schemaVersion !== 1 || !LOGIN_RE.test(value.githubLogin || '') || !ACCOUNT_KEY_RE.test(value.accountKey || '')) throw new GitHubError('INVALID_CHECKPOINT', '部署断点格式无效，请重新开始该账号的部署。', 'recovery');
+  const next = { schemaVersion: 1, githubLogin: value.githubLogin, accountKey: value.accountKey, secretStored: value.secretStored === true, configured: value.configured === true };
+  if (value.githubId != null) {
+    if (!Number.isSafeInteger(value.githubId) || value.githubId <= 0) throw new GitHubError('INVALID_CHECKPOINT', '部署断点中的 GitHub 身份无效。', 'recovery');
+    next.githubId = value.githubId;
+  }
+  if (value.repository != null) {
+    if (!validRepository(value.repository) || value.repository.split('/')[0].toLowerCase() !== value.githubLogin.toLowerCase() || !Number.isSafeInteger(value.repositoryId) || value.repositoryId <= 0 || typeof value.branch !== 'string' || !value.branch || value.branch.length > 200 || /[\x00-\x20\x7f]/.test(value.branch)) throw new GitHubError('INVALID_CHECKPOINT', '部署断点中的仓库无效。', 'recovery');
+    Object.assign(next, { repository: value.repository, repositoryId: value.repositoryId, branch: value.branch });
+  }
+  if (value.createdRepository === true) next.createdRepository = true;
+  if (value.configSha != null) {
+    if (!SHA_RE.test(value.configSha)) throw new GitHubError('INVALID_CHECKPOINT', '部署断点中的配置版本无效。', 'recovery');
+    next.configSha = value.configSha;
+  }
+  if (((next.secretStored || next.configured || next.createdRepository) && !next.repository) || (next.configured && !next.secretStored)) throw new GitHubError('INVALID_CHECKPOINT', '部署断点的步骤状态不一致。', 'recovery');
+  if (value.dispatch != null) {
+    const d = value.dispatch;
+    if (!next.configured || !/^[a-f0-9]{32}$/.test(d.nonce || '') || d.accountKey !== next.accountKey || d.branch !== next.branch || !Number.isFinite(d.submittedAt) || d.submittedAt < 0) throw new GitHubError('INVALID_CHECKPOINT', '部署断点中的验证请求无效。', 'recovery');
+    next.dispatch = { nonce: d.nonce, accountKey: d.accountKey, branch: d.branch, submittedAt: d.submittedAt };
+  }
+  if (value.run != null) {
+    const run = value.run;
+    if (!next.configured || run.repository !== next.repository || !Number.isSafeInteger(run.runId) || run.runId <= 0) throw new GitHubError('INVALID_CHECKPOINT', '部署断点中的运行记录无效。', 'recovery');
+    next.run = { repository: next.repository, runId: run.runId, runUrl: `https://github.com/${next.repository}/actions/runs/${run.runId}`, status: ACTIVE_STATUSES.has(run.status) || run.status === 'completed' ? run.status : 'queued', conclusion: ['success', 'failure', 'cancelled', 'skipped', 'timed_out', 'action_required', 'stale', 'startup_failure', 'neutral'].includes(run.conclusion) ? run.conclusion : null };
+  }
+  return next;
 }
 
 function safeResult(payload) {
@@ -237,35 +279,40 @@ class GitHubClient {
     });
   }
 
-  async _api(endpoint, { method = 'GET', body, signal, stage = 'github', raw = false } = {}) {
+  async _api(endpoint, { method = 'GET', body, signal, stage = 'github', raw = false, metadata = false } = {}) {
     if (typeof endpoint !== 'string' || !/^(?:user(?:\/repos)?|repos\/[A-Za-z0-9_.%\/-]+(?:\?.*)?)$/.test(endpoint)) throw new GitHubError('INVALID_ENDPOINT', 'GitHub 请求地址无效。', stage);
     const args = ['api', '--hostname', 'github.com', '--include', '-H', 'Accept: application/vnd.github+json', '-H', `X-GitHub-Api-Version: ${API_VERSION}`, '--method', method, endpoint];
     let input;
     if (body !== undefined) { args.push('--input', '-'); input = Buffer.from(JSON.stringify(body), 'utf8'); }
     const output = await this._runGh(args, { input, signal, stage });
-    const response = parseHTTPOutput(output.stdout);
+    const response = parseHTTPOutput(output.stdout, { metadata });
     if (raw) return response.body;
     if (!response.body.trim()) return null;
-    try { return JSON.parse(response.body); }
+    try { const data = JSON.parse(response.body); return metadata ? { data, workflowScope: response.workflowScope } : data; }
     catch { throw new GitHubError('INVALID_RESPONSE', 'GitHub 返回的数据无法解析。', stage); }
   }
 
   async whoami({ signal } = {}) {
-    const user = await this._api('user', { signal, stage: 'identity' });
-    if (!user || !LOGIN_RE.test(user.login || '')) throw new GitHubError('INVALID_IDENTITY', '未能确认当前 GitHub 账号。', 'identity');
-    return { login: user.login, name: cleanText(user.name, 80), avatarUrl: typeof user.avatar_url === 'string' && /^https:\/\/avatars\.githubusercontent\.com\//.test(user.avatar_url) ? user.avatar_url : '' };
+    const response = await this._api('user', { signal, stage: 'identity', metadata: true });
+    const user = response?.data;
+    if (!user || !LOGIN_RE.test(user.login || '') || !Number.isSafeInteger(user.id) || user.id <= 0) throw new GitHubError('INVALID_IDENTITY', '未能确认当前 GitHub 账号。', 'identity');
+    return { login: user.login, id: user.id, workflowScope: response.workflowScope === true ? true : response.workflowScope === false ? false : null, name: cleanText(user.name, 80), avatarUrl: typeof user.avatar_url === 'string' && /^https:\/\/avatars\.githubusercontent\.com\//.test(user.avatar_url) ? user.avatar_url : '' };
   }
 
-  async login({ signal } = {}) {
+  async login({ signal, refresh = false } = {}) {
     if (this._busy) throw new GitHubError('BUSY', '已有操作正在进行，请等待完成。', 'login');
     this._busy = true;
     try {
+      const previous = refresh ? await this.whoami({ signal }) : null;
       this._progress('login', '请在浏览器中完成 GitHub 官方授权。');
       let buffer = '';
       let opened = false;
       let code;
       let url;
-      await this._runGh(['auth', 'login', '--hostname', 'github.com', '--web', '--skip-ssh-key', '--clipboard=false', '--scopes', 'workflow'], {
+      const args = refresh
+        ? ['auth', 'refresh', '--hostname', 'github.com', '--scopes', 'workflow', '--clipboard=false']
+        : ['auth', 'login', '--hostname', 'github.com', '--web', '--skip-ssh-key', '--clipboard=false', '--scopes', 'workflow'];
+      await this._runGh(args, {
         signal, stage: 'login', timeoutMs: 16 * 60 * 1000,
         onStderr: chunk => {
           buffer = (buffer + chunk).replace(/\x1b\[[0-9;]*m/g, '').slice(-32768);
@@ -279,6 +326,8 @@ class GitHubClient {
         },
       });
       const user = await this.whoami({ signal });
+      if (previous && (user.id !== previous.id || user.login.toLowerCase() !== previous.login.toLowerCase())) throw new GitHubError('WRONG_ACCOUNT', '请使用原 GitHub 账号完成权限补充。', 'identity');
+      if (user.workflowScope === false) throw new GitHubError('WORKFLOW_AUTH_REQUIRED', 'GitHub 尚未授予工作流权限，请完成当前账号的官方授权。', 'identity');
       this._emit({ type: 'auth-complete', login: user.login });
       return user;
     } finally { this._busy = false; }
@@ -320,7 +369,7 @@ class GitHubClient {
     return commit.sha;
   }
 
-  async _ensureRepository(login, repoName, signal) {
+  async _ensureRepository(login, repoName, signal, onCreated) {
     const base = repoName || 'glados-quick-deploy';
     if (!REPO_RE.test(base) || ['.', '..'].includes(base)) throw new GitHubError('INVALID_REPOSITORY_NAME', '仓库名称只能包含英文字母、数字、点、横线和下划线。', 'repository');
     for (let suffix = 1; suffix <= 30; suffix++) {
@@ -339,6 +388,8 @@ class GitHubClient {
           if (error.code === 'VALIDATION_FAILED') continue;
           throw error;
         }
+        if (!Number.isSafeInteger(repo?.id) || repo.id <= 0 || repo.full_name?.toLowerCase() !== fullName.toLowerCase() || typeof repo.default_branch !== 'string' || !repo.default_branch) throw new GitHubError('INVALID_REPOSITORY', 'GitHub 未返回可恢复的新建仓库身份。', 'repository');
+        if (onCreated) await onCreated({ repository: fullName, repositoryId: repo.id, branch: repo.default_branch, createdRepository: true });
       }
       if (created) {
         // Creation responses need not include the computed permission block.
@@ -376,6 +427,43 @@ class GitHubClient {
       return { repository: fullName, branch, id: repo.id, head, marker, created };
     }
     throw new GitHubError('REPOSITORY_NAME_UNAVAILABLE', '无法选出可用的专用仓库名称，请更换名称。', 'repository');
+  }
+
+  async _resumeRepository(checkpoint, user, signal) {
+    const { repository, repositoryId, branch } = checkpoint;
+    const repo = await this._api(`repos/${repository}`, { signal, stage: 'repository' });
+    if (repo?.id !== repositoryId || repo?.full_name?.toLowerCase() !== repository.toLowerCase() || repo?.owner?.login?.toLowerCase() !== user.login.toLowerCase() || repo?.owner?.id !== user.id) throw new GitHubError('REPOSITORY_IDENTITY_CHANGED', '原部署仓库的身份发生变化，已停止续做。', 'recovery');
+    if (!repo?.permissions?.admin || repo.archived || repo.disabled || repo.private || repo.default_branch !== branch) throw new GitHubError('INVALID_REPOSITORY', '原部署仓库的权限或默认分支已改变，请检查后继续。', 'recovery');
+    let head;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      try { head = await this._head(repository, branch, signal); break; }
+      catch (error) {
+        if (!checkpoint.createdRepository || !['NOT_FOUND', 'REPOSITORY_NOT_READY', 'CONFLICT'].includes(error.code) || attempt === 11) throw error;
+        await this._sleep(Math.min(1000 * (attempt + 1), 5000), signal);
+      }
+    }
+    let marker;
+    let markerMissing = false;
+    try { marker = await this._readFile(repository, MARKER_PATH, head.sha, signal); }
+    catch (error) { if (error.code === 'NOT_FOUND') markerMissing = true; else throw error; }
+    if (markerMissing && checkpoint.createdRepository && !checkpoint.secretStored && !checkpoint.configured) {
+      marker = { appId: APP_ID, schemaVersion: 1, repositoryId, createdAt: new Date(this.now()).toISOString(), upstreamRepository: UPSTREAM_REPOSITORY, upstreamSHA: UPSTREAM_SHA };
+      await this._commitFiles(repository, branch, head, { [MARKER_PATH]: JSON.stringify(marker, null, 2) + '\n' }, 'Initialize GLaDOS Quick Deploy', signal);
+      head = await this._head(repository, branch, signal);
+    }
+    if (!marker || marker.appId !== APP_ID || marker.schemaVersion !== 1 || marker.repositoryId !== repositoryId) throw new GitHubError('UNMANAGED_REPOSITORY', '原部署仓库的归属标记不符，已停止续做。', 'recovery');
+    return { repository, branch, id: repositoryId, head, marker, created: false };
+  }
+
+  async _filesMatch(repository, files, ref, signal) {
+    for (const [path, expected] of Object.entries(files)) {
+      let file;
+      try { file = await this._api(`repos/${repository}/contents/${path}?ref=${encodeURIComponent(ref)}`, { signal, stage: 'configuration' }); }
+      catch (error) { if (error.code === 'NOT_FOUND') return false; throw error; }
+      if (file?.type !== 'file' || file.encoding !== 'base64' || typeof file.content !== 'string' || file.size > 256 * 1024) return false;
+      if (Buffer.from(file.content.replace(/\s/g, ''), 'base64').toString('utf8') !== expected) return false;
+    }
+    return true;
   }
 
   async _ownedRepository(repository, signal) {
@@ -432,16 +520,27 @@ class GitHubClient {
     return matches[0] || null;
   }
 
-  async _startVerification(repository, branch, signal, accountKey) {
-    const existing = this._pendingDispatches.get(repository);
+  async _startVerification(repository, branch, signal, accountKey, recovery = {}) {
+    if (recovery.dispatch) {
+      const remembered = this._pendingDispatches.get(repository);
+      if (remembered && remembered.nonce !== recovery.dispatch.nonce) throw new GitHubError('AMBIGUOUS_RUN', '同一仓库还有另一条尚未确认的验证请求，请先恢复该请求。', 'verification', { repository });
+      this._pendingDispatches.set(repository, { ...recovery.dispatch });
+    }
+    const existing = recovery.dispatch || this._pendingDispatches.get(repository);
     const nonce = existing?.nonce || randomBytes(16).toString('hex');
     let response;
     if (!existing) {
       // Remember before submitting; a dropped response must never cause a second POST.
-      this._pendingDispatches.set(repository, { nonce, branch, accountKey, submittedAt: this.now() });
+      const intent = { nonce, branch, accountKey, submittedAt: this.now() };
+      if (recovery.onIntent) await recovery.onIntent(intent);
+      checkAbort(signal, 'dispatch');
+      this._pendingDispatches.set(repository, intent);
       try { response = await this._api(`repos/${repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`, { method: 'POST', body: { ref: branch, inputs: { deployment_id: nonce, account_key: accountKey || '' } }, signal, stage: 'dispatch' }); }
       catch (error) {
-        if (!error.retryable && error.code !== 'ABORTED') { this._pendingDispatches.delete(repository); throw error; }
+        if (!error.retryable && error.code !== 'ABORTED') {
+          if (recovery.onRejected) await recovery.onRejected();
+          this._pendingDispatches.delete(repository); throw error;
+        }
         if (error.code === 'ABORTED') throw error;
       }
     }
@@ -455,10 +554,11 @@ class GitHubClient {
       }
     }
     if (!run) throw new GitHubError('DISPATCH_UNCERTAIN', '验证请求已提交，但尚未找到运行记录。请继续刷新；软件不会重复提交。', 'verification', { repository, deploymentId: nonce });
-    this._pendingDispatches.delete(repository);
     const snapshot = this._runSnapshot(repository, run);
+    if (recovery.onRun) await recovery.onRun(snapshot);
+    this._pendingDispatches.delete(repository);
     checkAbort(signal, 'verification');
-    this._emit({ type: 'run', ...snapshot, credentialUpdated: !existing, resumed: Boolean(existing) });
+    this._emit({ type: 'run', ...snapshot, credentialUpdated: recovery.credentialUpdated ?? !existing, resumed: Boolean(existing) });
     return snapshot;
   }
 
@@ -530,20 +630,59 @@ class GitHubClient {
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel); }
   }
 
-  async deploy({ credential, repoName = 'glados-quick-deploy', exchangePlan = 'plan500', time = '09:30', signal } = {}) {
+  async deploy({ credential, repoName = 'glados-quick-deploy', exchangePlan = 'plan500', time = '09:30', signal, checkpoint, onCheckpoint } = {}) {
     if (this._busy) throw new GitHubError('BUSY', '已有操作正在进行，请等待完成。', 'deploy');
-    const captured = validateCredential(credential);
+    let saved = checkpoint == null ? null : copyCheckpoint(checkpoint);
+    const captured = credential == null && saved?.secretStored ? null : validateCredential(credential);
+    if (captured && saved && captured.accountKey !== saved.accountKey) throw new GitHubError('IDENTITY_MISMATCH', '登录会话与原部署账号不一致，未修改任何仓库。', 'credential');
+    if (onCheckpoint !== undefined && typeof onCheckpoint !== 'function') throw new GitHubError('INVALID_CHECKPOINT', '部署断点保存接口无效。', 'recovery');
+    const save = async patch => {
+      const next = copyCheckpoint({ ...saved, ...patch });
+      if (onCheckpoint) {
+        try { await onCheckpoint(copyCheckpoint(next)); }
+        catch { throw new GitHubError('CHECKPOINT_SAVE_FAILED', '部署断点未能保存，已停止下一步操作。请检查存储后继续。', 'recovery', { repository: next.repository }); }
+      }
+      saved = next;
+      checkAbort(signal, 'recovery');
+    };
     try { validatePlan(exchangePlan); scheduleToCron(time); }
     catch { throw new GitHubError('INVALID_SETTINGS', '签到时间或积分兑换设置无效。', 'configuration'); }
     this._busy = true;
     try {
       this._progress('identity', '正在确认 GitHub 授权和部署账号。');
       const user = await this.whoami({ signal });
-      const target = await this._ensureRepository(user.login, repoName, signal);
+      if (saved && (saved.githubLogin.toLowerCase() !== user.login.toLowerCase() || saved.githubId != null && saved.githubId !== user.id)) throw new GitHubError('WRONG_ACCOUNT', '请连接原部署绑定的 GitHub 账号后继续。', 'identity');
+      if (user.workflowScope === false && !saved?.configured) throw new GitHubError('WORKFLOW_AUTH_REQUIRED', 'GitHub 授权缺少管理工作流的权限，请补充当前账号的官方授权。', 'identity');
+      await save({ schemaVersion: 1, githubLogin: user.login, githubId: user.id, accountKey: saved?.accountKey || captured.accountKey });
+      const target = saved.repository
+        ? await this._resumeRepository(saved, user, signal)
+        : await this._ensureRepository(user.login, repoName, signal, created => save(created));
+      await save({ repository: target.repository, repositoryId: target.id, branch: target.branch, createdRepository: false });
+      const accountKey = saved.accountKey;
+      const finishRun = async snapshot => {
+        const completed = await this._waitForRun(snapshot, signal);
+        if (completed.status === 'completed' && !completed.result?.accounts?.some(account => account.accountKey === accountKey)) {
+          completed.result = { ...completed.result, status: 'unverified', requestedAccountMissing: true };
+        }
+        await save({ run: completed });
+        return { ...completed, accountKey, credentialUpdated: true, checkpoint: copyCheckpoint(saved) };
+      };
+      // Already submitted work needs no credentials, scope expansion, configuration writes or POST.
+      if (saved.run) return await finishRun(saved.run);
+      const verificationRecovery = {
+        dispatch: saved.dispatch, credentialUpdated: true,
+        onIntent: dispatch => save({ dispatch }),
+        onRejected: () => save({ dispatch: undefined }),
+        onRun: run => save({ run }),
+      };
+      if (saved.dispatch) {
+        const snapshot = await this._startVerification(target.repository, target.branch, signal, accountKey, verificationRecovery);
+        return await finishRun(snapshot);
+      }
       // A previous request with an unknown response is resolved before any new submission.
       if (this._pendingDispatches.has(target.repository)) {
         const previous = await this._startVerification(target.repository, target.branch, signal);
-        return { ...(await this._waitForRun(previous, signal)), accountKey: captured.accountKey, resumed: true, credentialUpdated: false, deploymentPending: true };
+        return { ...(await this._waitForRun(previous, signal)), accountKey, resumed: true, credentialUpdated: false, deploymentPending: true, checkpoint: copyCheckpoint(saved) };
       }
       if (!target.created) {
         let runs;
@@ -554,28 +693,41 @@ class GitHubClient {
           const snapshot = this._runSnapshot(target.repository, active);
           this._emit({ type: 'run', ...snapshot, resumed: true, credentialUpdated: false });
           this._progress('verification', '已有签到任务正在运行；待完成后再提交新的登录信息。');
-          return { ...snapshot, accountKey: captured.accountKey, resumed: true, credentialUpdated: false, deploymentPending: true, result: { status: 'pending', accounts: [] } };
+          return { ...snapshot, accountKey, resumed: true, credentialUpdated: false, deploymentPending: true, result: { status: 'pending', accounts: [] }, checkpoint: copyCheckpoint(saved) };
         }
       }
       const manifest = this._validateManifest(await this._readFile(target.repository, MANIFEST_PATH, target.head.sha, signal, true));
       const accounts = manifest.accounts.map(a => ({ accountKey: a.accountKey }));
-      if (!accounts.some(a => a.accountKey === captured.accountKey)) accounts.push({ accountKey: captured.accountKey });
+      if (!accounts.some(a => a.accountKey === accountKey)) accounts.push({ accountKey });
       if (accounts.length > 100) throw new GitHubError('ACCOUNT_LIMIT', '单个部署最多支持 100 个账号。', 'configuration');
-      this._progress('secrets', '正在加密保存此账号的登录会话。');
-      await this._putCredential(target.repository, captured, signal);
+      if (!saved.secretStored) {
+        this._progress('secrets', '正在加密保存此账号的登录会话。');
+        await this._putCredential(target.repository, captured, signal);
+        await save({ secretStored: true });
+      } else {
+        // This API returns only name/timestamps, never the secret value.
+        let secret;
+        try { secret = await this._api(`repos/${target.repository}/actions/secrets/GLADOS_ACCOUNT_${accountKey}`, { signal, stage: 'secrets' }); }
+        catch (error) { if (error.code === 'NOT_FOUND') throw new GitHubError('STORED_CREDENTIAL_MISSING', '原部署的登录信息已被移除，请为此账号重新登录。', 'secrets'); throw error; }
+        if (secret?.name !== `GLADOS_ACCOUNT_${accountKey}`) throw new GitHubError('STORED_CREDENTIAL_MISSING', '无法确认原部署的登录信息，请为此账号重新登录。', 'secrets');
+      }
       const nextManifest = { schemaVersion: 1, accounts, exchangePlan, time, timezone: 'Asia/Taipei', upstreamRepository: UPSTREAM_REPOSITORY, upstreamSHA: UPSTREAM_SHA };
       this._progress('configuration', '正在配置串行签到和每月保活任务。');
-      await this._commitFiles(target.repository, target.branch, target.head, {
+      const files = {
         [MANIFEST_PATH]: JSON.stringify(nextManifest, null, 2) + '\n',
         [WORKFLOW_PATH]: renderWorkflow({ accounts, exchangePlan, time }),
         [KEEPALIVE_PATH]: renderKeepAliveWorkflow(),
-      }, 'Configure GLaDOS Quick Deploy', signal);
+      };
+      const matches = await this._filesMatch(target.repository, files, target.head.sha, signal);
+      if (saved.configured && !matches) throw new GitHubError('CONFIGURATION_CHANGED', '已完成的部署配置发生变化，未覆盖远端内容。请核对设置后选择是否重新部署。', 'configuration', { repository: target.repository });
+      let configSha = target.head.sha;
+      if (!matches) configSha = await this._commitFiles(target.repository, target.branch, target.head, files, 'Configure GLaDOS Quick Deploy', signal);
+      await save({ configured: true, configSha });
       await this._enableWorkflows(target.repository, signal);
       this._progress('verification', '部署已就绪，正在启动一次真实签到验证。');
-      const snapshot = await this._startVerification(target.repository, target.branch, signal, captured.accountKey);
-      const completed = await this._waitForRun(snapshot, signal);
-      return { ...completed, accountKey: captured.accountKey, credentialUpdated: true };
-    } finally { captured.cookie = ''; captured.userAgent = ''; this._busy = false; }
+      const snapshot = await this._startVerification(target.repository, target.branch, signal, accountKey, verificationRecovery);
+      return await finishRun(snapshot);
+    } finally { if (captured) { captured.cookie = ''; captured.userAgent = ''; } this._busy = false; }
   }
 
   async refresh({ repository, runId, accountKey, signal } = {}) {
