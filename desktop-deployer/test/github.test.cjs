@@ -1,0 +1,484 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const {
+  GitHubClient, GitHubError, accountKeyFor, validateCredential, parseResults,
+  parseHTTPOutput, renderWorkflow, renderRunner, scheduleToCron, WORKFLOW_FILE,
+  WORKFLOW_PATH, KEEPALIVE_PATH, MANIFEST_PATH, MARKER_PATH, UPSTREAM_SHA,
+} = require('../src/github.cjs');
+
+function credential(email = 'first@example.test', extra = {}) {
+  const record = { cookie: 'gld:sess=fake-session-one; gld:sess.sig=fake-signature', userAgent: 'Mozilla/5.0 Test Browser', origin: 'https://glados.cloud', email, capturedAt: new Date().toISOString(), ...extra };
+  record.accountKey = accountKeyFor(record);
+  return record;
+}
+function http(body, status = 200) { return `HTTP/2.0 ${status} OK\r\nContent-Type: application/json\r\n\r\n${body === null ? '' : JSON.stringify(body)}`; }
+function fakeSpawn(handler) {
+  const calls = [];
+  const spawnImpl = (executable, args, options) => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = new EventEmitter();
+    const call = { executable, args, options, input: undefined, killed: false };
+    calls.push(call);
+    child.kill = () => { call.killed = true; queueMicrotask(() => child.emit('close', 143)); };
+    child.stdin.end = input => { call.input = input === undefined ? undefined : Buffer.from(input).toString('utf8'); queueMicrotask(() => handler(child, call)); };
+    return child;
+  };
+  return { spawnImpl, calls };
+}
+
+class MemoryGitHub extends GitHubClient {
+  constructor() {
+    const events = [];
+    super({ ghPath: '/fake/gh', onEvent: event => events.push(event), waitTimeoutMs: 0, sleepImpl: async () => {}, spawnImpl: () => { throw new Error('Real processes are forbidden in this mock.'); } });
+    this.events = events;
+    this.repositories = new Map();
+    this.secrets = new Map();
+    this.calls = [];
+    this.runs = new Map();
+    this.dispatchCount = 0;
+    this.version = 0;
+    this.dispatchResponse = 'modern';
+    this.runStatus = 'completed';
+    this.currentLogin = 'tester';
+  }
+  sha() { return (++this.version).toString(16).padStart(40, '0'); }
+  addRepo(name, managed = false) {
+    const full = `tester/${name}`;
+    const record = { id: this.repositories.size + 1, full_name: full, owner: { login: 'tester' }, permissions: { admin: true }, default_branch: 'main', private: false, files: new Map(), head: this.sha(), tree: this.sha(), trees: new Map(), commits: new Map() };
+    record.commits.set(record.head, { tree: { sha: record.tree }, parents: [] });
+    if (managed) record.files.set(MARKER_PATH, JSON.stringify({ appId: 'glados-quick-deploy', schemaVersion: 1, repositoryId: record.id }));
+    this.repositories.set(full, record);
+    return record;
+  }
+  async _runGh(args, { input, stage } = {}) {
+    assert.equal(args[0], 'secret');
+    assert.equal(args[1], 'set');
+    assert.equal(stage, 'secrets');
+    const value = Buffer.from(input).toString('utf8');
+    this.secrets.set(`${args[4]}/${args[2]}`, value);
+    this.calls.push({ kind: 'secret', args: [...args] });
+    return { stdout: '', stderr: '' };
+  }
+  async _api(endpoint, options = {}) {
+    this.calls.push({ endpoint, method: options.method || 'GET', body: options.body, raw: options.raw });
+    if (endpoint === 'user') return { login: this.currentLogin, name: 'Tester', avatar_url: 'https://avatars.githubusercontent.com/u/1' };
+    if (endpoint === 'user/repos') {
+      const repo = this.addRepo(options.body.name);
+      // Deliberately omit permissions, as creation is verified with a subsequent GET.
+      return { id: repo.id, full_name: repo.full_name, default_branch: 'main' };
+    }
+    const match = endpoint.match(/^repos\/([^/]+\/[^/]+)(?:\/(.*))?$/);
+    assert.ok(match, `Unexpected endpoint: ${endpoint}`);
+    const full = match[1];
+    const route = match[2] || '';
+    const repo = this.repositories.get(full);
+    if (!repo) throw new GitHubError('NOT_FOUND', 'not found', 'repository', { httpStatus: 404 });
+    if (!route) return repo;
+    if (route.startsWith('contents/')) {
+      const filename = route.slice('contents/'.length).split('?')[0];
+      const content = repo.files.get(filename);
+      if (content === undefined) throw new GitHubError('NOT_FOUND', 'not found', 'configuration', { httpStatus: 404 });
+      return { type: 'file', encoding: 'base64', content: Buffer.from(content).toString('base64'), size: Buffer.byteLength(content) };
+    }
+    if (route.startsWith('git/ref/heads/')) return { object: { sha: repo.head } };
+    if (route.startsWith('git/commits/')) return repo.commits.get(route.slice('git/commits/'.length));
+    if (route === 'git/trees') {
+      const sha = this.sha();
+      const files = new Map(repo.files);
+      for (const entry of options.body.tree) files.set(entry.path, entry.content);
+      repo.trees.set(sha, files);
+      return { sha };
+    }
+    if (route === 'git/commits') {
+      const sha = this.sha();
+      repo.commits.set(sha, { tree: { sha: options.body.tree }, parents: options.body.parents });
+      return { sha };
+    }
+    if (route.startsWith('git/refs/heads/')) {
+      assert.equal(options.body.force, false);
+      const commit = repo.commits.get(options.body.sha);
+      if (commit.parents[0] !== repo.head) throw new GitHubError('CONFLICT', 'conflict', 'configuration', { httpStatus: 409 });
+      repo.head = options.body.sha;
+      repo.tree = commit.tree.sha;
+      repo.files = repo.trees.get(repo.tree);
+      return { object: { sha: repo.head } };
+    }
+    if (route === 'actions/permissions') return { enabled: true, allowed_actions: 'selected' };
+    if (/actions\/workflows\/[^/]+\/(enable|disable)$/.test(route)) return null;
+    if (route === `actions/workflows/${WORKFLOW_FILE}/dispatches`) {
+      this.dispatchCount++;
+      const id = 1000 + this.dispatchCount;
+      const keys = options.body.inputs.account_key ? [options.body.inputs.account_key] : JSON.parse(repo.files.get(MANIFEST_PATH)).accounts.map(a => a.accountKey);
+      this.runs.set(id, { id, repository: full, path: WORKFLOW_PATH, head_sha: repo.head, event: 'workflow_dispatch', display_title: `GLaDOS Quick Deploy · ${options.body.inputs.deployment_id} · ${options.body.inputs.account_key || 'all'}`, status: this.runStatus, conclusion: this.runStatus === 'completed' ? 'success' : null, run_attempt: 1, keys });
+      if (this.dispatchResponse === 'lost') throw new GitHubError('NETWORK_ERROR', 'network failure', 'dispatch', { retryable: true });
+      return this.dispatchResponse === 'modern' ? { workflow_run_id: id } : null;
+    }
+    if (route.startsWith(`actions/workflows/${WORKFLOW_FILE}/runs?`)) return { workflow_runs: [...this.runs.values()].filter(r => r.repository === full).reverse() };
+    const jobMatch = route.match(/^actions\/jobs\/(\d+)\/logs$/);
+    if (jobMatch) {
+      const id = Number(jobMatch[1]);
+      const run = this.runs.get(Math.floor(id / 100));
+      const key = run.keys[id % 100 - 1];
+      assert.equal(options.raw, true);
+      return `upstream private diagnostics are never forwarded\n2026-01-01 QUICK_DEPLOY_RESULT=${JSON.stringify({ accountKey: key, outcome: 'checked', pointsAdded: 2, message: 'raw server text MUST NOT REACH UI', exchange: 'not_needed' })}\n`;
+    }
+    const runMatch = route.match(/^actions\/runs\/(\d+)(\/jobs\?per_page=100(?:&page=\d+)?)?$/);
+    if (runMatch) {
+      const run = this.runs.get(Number(runMatch[1]));
+      if (!run) throw new GitHubError('NOT_FOUND', 'not found', 'verification');
+      const jobs = [{ id: run.id * 100, name: 'prepare', status: 'completed' }, ...run.keys.map((key, index) => ({ id: run.id * 100 + index + 1, name: `Account ${key}`, status: 'completed' }))];
+      const page = Number(route.match(/[?&]page=(\d+)/)?.[1] || 1);
+      return runMatch[2] ? { jobs: jobs.slice((page - 1) * 100, page * 100), total_count: jobs.length } : run;
+    }
+    throw new Error(`Unexpected mock endpoint: ${endpoint}`);
+  }
+}
+
+test('verified identity is stable across cookie and browser changes and rejects missing identity', () => {
+  const one = credential();
+  const two = credential('FIRST@EXAMPLE.TEST', { cookie: 'gld:sess=updated; gld:sess.sig=updated-sig', userAgent: 'Other Browser' });
+  assert.equal(one.accountKey, two.accountKey);
+  assert.equal(validateCredential(two).accountKey, one.accountKey);
+  assert.throws(() => accountKeyFor({}), { code: 'IDENTITY_REQUIRED' });
+  assert.throws(() => validateCredential({ ...one, accountKey: '0'.repeat(16) }), { code: 'IDENTITY_MISMATCH' });
+  assert.throws(() => validateCredential({ ...one, cookie: one.cookie + '\nInjected: yes' }), { code: 'INVALID_CREDENTIAL' });
+  assert.throws(() => validateCredential({ ...one, origin: 'https://glados.rocks' }), { code: 'INVALID_CREDENTIAL' });
+  assert.throws(() => validateCredential({ ...one, cookie: 'koa:sess=old; koa:sess.sig=old' }), { code: 'SESSION_INCOMPLETE' });
+});
+
+test('Taipei schedule crosses UTC day correctly and invalid schedule cannot enter YAML', () => {
+  assert.equal(scheduleToCron('09:30'), '30 1 * * *');
+  assert.equal(scheduleToCron('00:05'), '5 16 * * *');
+  assert.equal(scheduleToCron('23:59'), '59 15 * * *');
+  assert.throws(() => scheduleToCron('24:00'));
+  assert.throws(() => scheduleToCron("09:30'\nrun: dangerous"));
+  const rendered = renderWorkflow({ accounts: [credential().accountKey] });
+  assert.ok(rendered.includes(UPSTREAM_SHA));
+  assert.match(rendered, /max-parallel: 1/);
+  assert.match(rendered, /account_key:/);
+  assert.match(rendered, /matrix: \$\{\{ fromJSON\(needs\.prepare\.outputs\.matrix\) \}\}/);
+  assert.match(rendered, /persist-credentials: false/);
+});
+
+test('official gh non-TTY login opens exactly the verified device URL without stdin Enter', async () => {
+  const emitted = [];
+  const opened = [];
+  const fake = fakeSpawn((child, call) => {
+    if (call.args[0] === 'auth') {
+      child.stderr.emit('data', Buffer.from('! First copy your one-time co'));
+      child.stderr.emit('data', Buffer.from('de: ABCD-1234\nOpen this URL to continue in your web browser: https://github.com/login/device\n'));
+      child.stderr.emit('data', Buffer.from('Authentication complete.\n'));
+    } else child.stdout.emit('data', Buffer.from(http({ login: 'tester', name: 'Test', avatar_url: 'https://avatars.githubusercontent.com/u/1' })));
+    child.emit('close', 0);
+  });
+  const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl, onEvent: e => emitted.push(e), openExternal: async url => opened.push(url) });
+  const user = await client.login();
+  assert.equal(user.login, 'tester');
+  assert.deepEqual(opened, ['https://github.com/login/device']);
+  assert.equal(fake.calls[0].input, undefined);
+  assert.equal(fake.calls[0].options.stdio[0], 'pipe');
+  assert.equal(fake.calls[0].options.env.GH_PROMPT_DISABLED, '1');
+  assert.equal(fake.calls[0].args.includes('--insecure-storage'), false);
+  assert.equal(fake.calls.some(c => c.args.includes('logout')), false);
+  assert.equal(emitted.filter(e => e.type === 'auth-code').length, 1);
+});
+
+test('credential JSON is sent on stdin as one secret and never in argv or events', async () => {
+  const fake = fakeSpawn(child => child.emit('close', 0));
+  const events = [];
+  const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl, onEvent: e => events.push(e) });
+  const captured = validateCredential(credential());
+  await client._putCredential('tester/glados-quick-deploy', captured);
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls[0].args[2], `GLADOS_ACCOUNT_${captured.accountKey}`);
+  assert.equal(JSON.parse(fake.calls[0].input).cookie, captured.cookie);
+  assert.equal(fake.calls[0].args.join(' ').includes(captured.cookie), false);
+  assert.equal(JSON.stringify(events).includes(captured.cookie), false);
+  assert.equal(Object.hasOwn(JSON.parse(fake.calls[0].input), 'email'), false);
+});
+
+test('abort kills the child and raw GitHub failures never cross the error boundary', async () => {
+  const fake = fakeSpawn(() => {});
+  const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl });
+  const controller = new AbortController();
+  const pending = client._runGh(['api', 'user'], { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, { code: 'ABORTED' });
+  assert.equal(fake.calls[0].killed, true);
+  const rejection = fakeSpawn(child => {
+    child.stderr.emit('data', Buffer.from('cookie=gld:sess=VERY_PRIVATE (HTTP 401)'));
+    child.emit('close', 1);
+  });
+  const rejected = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: rejection.spawnImpl });
+  await assert.rejects(rejected.whoami(), error => error.code === 'AUTH_REQUIRED' && !JSON.stringify(error).includes('VERY_PRIVATE') && !error.message.includes('VERY_PRIVATE'));
+});
+
+test('modern and legacy HTTP output parse without relying on a 204-only dispatch', () => {
+  assert.deepEqual(parseHTTPOutput(http(null, 204)), { status: 204, body: '' });
+  assert.equal(JSON.parse(parseHTTPOutput(http({ workflow_run_id: 123 })).body).workflow_run_id, 123);
+});
+
+test('deployment creates an isolated repository, uses atomic non-force commit and verifies only selected account', async () => {
+  const client = new MemoryGitHub();
+  const unrelated = client.addRepo('glados-quick-deploy');
+  unrelated.files.set('important.txt', 'Do not touch');
+  const first = credential();
+  const outcome = await client.deploy({ credential: first });
+  assert.equal(outcome.repository, 'tester/glados-quick-deploy-2');
+  assert.equal(outcome.result.status, 'points_increased');
+  assert.equal(outcome.result.accounts[0].accountKey, first.accountKey);
+  assert.equal(outcome.result.accounts[0].pointsAdded, 2);
+  assert.equal(client.dispatchCount, 1);
+  assert.equal(unrelated.files.size, 1);
+  const managed = client.repositories.get(outcome.repository);
+  assert.ok(managed.files.has(WORKFLOW_PATH));
+  assert.ok(managed.files.has(KEEPALIVE_PATH));
+  assert.equal(managed.files.has('checkin.py'), false);
+  assert.equal([...managed.files.values()].join('\n').includes(first.cookie), false);
+  assert.equal([...managed.files.values()].join('\n').includes(first.email), false);
+  assert.equal(JSON.stringify(outcome).includes('raw server text'), false);
+  const beforeRun = client.calls.findIndex(call => call.endpoint?.endsWith('/dispatches'));
+  const secretWrite = client.calls.findIndex(call => call.kind === 'secret');
+  assert.ok(secretWrite > 0 && secretWrite < beforeRun);
+  assert.ok(client.calls.filter(call => call.endpoint?.includes('/git/refs/heads/')).every(call => call.body.force === false));
+  const second = credential('second@example.test');
+  const next = await client.deploy({ credential: second });
+  assert.equal(next.repository, outcome.repository);
+  assert.equal(client.dispatchCount, 2);
+  assert.deepEqual(next.result.accounts.map(a => a.accountKey), [second.accountKey]);
+  const manifest = JSON.parse(managed.files.get(MANIFEST_PATH));
+  assert.deepEqual(manifest.accounts.map(a => a.accountKey), [first.accountKey, second.accountKey]);
+  assert.equal(client.calls.filter(call => call.endpoint?.endsWith('/dispatches')).at(-1).body.inputs.account_key, second.accountKey);
+  assert.equal(client.events.filter(e => e.type === 'run' && e.runId === next.runId).length >= 1, true);
+});
+
+test('legacy 204 or a lost dispatch response is matched by nonce without re-dispatch', async () => {
+  for (const mode of ['legacy', 'lost']) {
+    const client = new MemoryGitHub();
+    client.dispatchResponse = mode;
+    const result = await client.deploy({ credential: credential() });
+    assert.equal(result.runId, 1001);
+    assert.equal(result.result.status, 'points_increased');
+    assert.equal(client.dispatchCount, 1);
+  }
+});
+
+test('a running workflow blocks replacement credentials and a second verification dispatch', async () => {
+  const client = new MemoryGitHub();
+  client.runStatus = 'in_progress';
+  const first = credential();
+  const initial = await client.deploy({ credential: first });
+  assert.equal(initial.status, 'in_progress');
+  const secretWrites = client.calls.filter(c => c.kind === 'secret').length;
+  const again = await client.deploy({ credential: credential('second@example.test') });
+  assert.equal(again.runId, initial.runId);
+  assert.equal(again.credentialUpdated, false);
+  assert.equal(again.deploymentPending, true);
+  assert.equal(client.dispatchCount, 1);
+  assert.equal(client.calls.filter(c => c.kind === 'secret').length, secretWrites);
+});
+
+test('a ref conflict never forces or silently overwrites an intervening commit', async () => {
+  const client = new MemoryGitHub();
+  const repo = client.addRepo('glados-quick-deploy', true);
+  const oldHead = { sha: repo.head, tree: repo.tree };
+  repo.head = client.sha();
+  await assert.rejects(client._commitFiles(repo.full_name, 'main', oldHead, { 'ours.txt': 'ours' }, 'configure', undefined), { code: 'REPOSITORY_CHANGED' });
+  assert.equal(repo.files.has('ours.txt'), false);
+  const writes = client.calls.filter(c => c.endpoint?.includes('/git/refs/heads/'));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].body.force, false);
+});
+
+test('result parsing discards untrusted messages and rejects forged identifiers or outcomes', () => {
+  const key = credential().accountKey;
+  const parsed = parseResults(`noise SECRET\nQUICK_DEPLOY_RESULT=${JSON.stringify({ accountKey: key, outcome: 'checked', pointsAdded: 1, message: 'SECRET_COOKIE', cookie: 'SECRET_COOKIE', exchange: 'not_needed' })}\nQUICK_DEPLOY_RESULT={"accountKey":"../../outside","outcome":"checked"}\n`);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].pointsAdded, 1);
+  assert.equal(JSON.stringify(parsed).includes('SECRET'), false);
+  assert.equal(parseResults(`QUICK_DEPLOY_RESULT=${JSON.stringify({ accountKey: key, outcome: 'pretend_success' })}`).length, 0);
+});
+
+const FAKE_UPSTREAM = `import json, os
+DOMAINS = ['https://untrusted.invalid']
+def log(*args): print(*args)
+class GLaDOS:
+    def __init__(self, cookie):
+        assert DOMAINS == ['https://glados.cloud']
+        assert os.environ['GLADOS_USER_AGENT'] == 'Mozilla/5.0 Test Browser'
+        self.cookie = cookie
+        self.points = '?'
+        self.reads = 0
+    def get_points(self):
+        self.reads += 1
+        print('HIDDEN_COOKIE ' + self.cookie)
+        self.points = '100' if self.reads == 1 else '102'
+        return True
+    def checkin(self):
+        with open('calls.txt', 'a') as out: out.write('checkin\\n')
+        if os.environ.get('FAKE_MODE') == 'exception':
+            raise ValueError('HIDDEN_COOKIE ' + self.cookie)
+        return json.loads(os.environ['FAKE_RESPONSE'])
+def is_normal_checkin_result(value):
+    return isinstance(value, dict) and (value.get('code') == 0 or 'checkin repeats' in value.get('message', '').lower())
+def auto_exchange(client, plan):
+    with open('exchange.txt', 'a') as out: out.write(plan + '\\n')
+    return '🎁 兑换成功 +100天'
+`;
+
+function runAdapter(t, response, { mode = '', plan = 'plan500' } = {}) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'glados-adapter-test-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(directory, 'upstream'));
+  fs.writeFileSync(path.join(directory, 'upstream', 'checkin.py'), FAKE_UPSTREAM);
+  fs.writeFileSync(path.join(directory, 'runner.py'), renderRunner());
+  const captured = credential();
+  const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const output = spawnSync(python, ['runner.py'], { cwd: directory, encoding: 'utf8', timeout: 10000,
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8', GLADOS_ACCOUNT_KEY: captured.accountKey, GLADOS_ACCOUNT_JSON: JSON.stringify({ cookie: captured.cookie, userAgent: captured.userAgent, origin: captured.origin }), EXCHANGE_PLAN: plan, FAKE_RESPONSE: JSON.stringify(response), FAKE_MODE: mode },
+  });
+  assert.ifError(output.error);
+  assert.equal(output.stderr, '');
+  assert.equal(output.stdout.includes(captured.cookie), false);
+  assert.equal(output.stdout.includes('HIDDEN_COOKIE'), false);
+  assert.equal(output.stdout.trim().split('\n').length, 1);
+  const result = JSON.parse(output.stdout.trim().slice('QUICK_DEPLOY_RESULT='.length));
+  return { output, result, directory };
+}
+
+test('adapter attempts once, stops device/permission rejection, and never exchanges on failure', t => {
+  const { output, result, directory } = runAdapter(t, { code: -2, reason: 'device-mismatch', message: 'Automated check-in detected. HIDDEN_COOKIE' });
+  assert.equal(output.status, 1);
+  assert.equal(result.outcome, 'authentication_required');
+  assert.equal(result.errorKind, 'authentication');
+  assert.equal(fs.readFileSync(path.join(directory, 'calls.txt'), 'utf8'), 'checkin\n');
+  assert.equal(fs.existsSync(path.join(directory, 'exchange.txt')), false);
+  assert.equal(Object.hasOwn(result, 'pointsAdded'), false);
+});
+
+test('adapter measures credit before redemption and accepts already-checked without claiming a new check-in', t => {
+  const accepted = runAdapter(t, { code: 0, message: 'Checkin! Got 2 points.' });
+  assert.equal(accepted.output.status, 0);
+  assert.equal(accepted.result.outcome, 'checked');
+  assert.equal(accepted.result.pointsAdded, 2);
+  assert.equal(accepted.result.exchange, 'completed');
+  assert.equal(fs.readFileSync(path.join(accepted.directory, 'exchange.txt'), 'utf8'), 'plan500\n');
+  const repeated = runAdapter(t, { code: 1, message: 'Checkin repeats! Please try tomorrow' }, { plan: 'off' });
+  assert.equal(repeated.output.status, 0);
+  assert.equal(repeated.result.outcome, 'already_checked');
+  assert.equal(repeated.result.exchange, 'disabled');
+  assert.equal(fs.existsSync(path.join(repeated.directory, 'exchange.txt')), false);
+});
+
+test('upstream exceptions stay private and cannot turn a failed job green', t => {
+  const { output, result } = runAdapter(t, { code: 0 }, { mode: 'exception' });
+  assert.equal(output.status, 1);
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.errorKind, 'execution');
+});
+
+test('wrong GitHub identity cannot pause another account deployment', async () => {
+  const client = new MemoryGitHub();
+  client.addRepo('glados-quick-deploy', true);
+  client.currentLogin = 'someone-else';
+  await assert.rejects(client.pause({ repository: 'tester/glados-quick-deploy', paused: true }), { code: 'WRONG_ACCOUNT' });
+  assert.equal(client.calls.some(c => c.endpoint?.endsWith('/disable')), false);
+});
+
+test('account refresh selects that account run and a mismatched pinned run stays unverified', async () => {
+  const client = new MemoryGitHub();
+  const first = credential();
+  const second = credential('second@example.test');
+  const initial = await client.deploy({ credential: first });
+  const later = await client.deploy({ credential: second });
+  const eventCount = client.events.filter(e => e.type === 'run').length;
+  const refreshed = await client.refresh({ repository: initial.repository, accountKey: first.accountKey });
+  assert.equal(refreshed.runId, initial.runId);
+  assert.equal(refreshed.result.status, 'points_increased');
+  const wrong = await client.refresh({ repository: initial.repository, accountKey: first.accountKey, runId: later.runId });
+  assert.equal(wrong.result.status, 'unverified');
+  assert.equal(wrong.result.requestedAccountMissing, true);
+  assert.equal(client.events.filter(e => e.type === 'run').length, eventCount);
+});
+
+test('results paginate 100 accounts plus prepare and never treat missing records as verified', async () => {
+  const client = new GitHubClient({ ghPath: '/fake/gh' });
+  const keys = Array.from({ length: 100 }, (_, i) => accountKeyFor({ email: `account${i}@example.test` }));
+  const jobs = [{ id: 1, name: 'prepare', status: 'completed' }, ...keys.map((key, i) => ({ id: i + 2, name: `Account ${key}`, status: 'completed' }))];
+  const pages = [];
+  client._api = async (endpoint) => {
+    if (endpoint.includes('/jobs?')) {
+      const page = Number(endpoint.match(/page=(\d+)$/)[1]);
+      pages.push(page);
+      return { total_count: 101, jobs: jobs.slice((page - 1) * 100, page * 100) };
+    }
+    if (endpoint.endsWith('/logs')) {
+      const id = Number(endpoint.match(/jobs\/(\d+)/)[1]);
+      return 'QUICK_DEPLOY_RESULT=' + JSON.stringify({ accountKey: keys[id - 2], outcome: 'checked', pointsAdded: 0, exchange: 'disabled' });
+    }
+    return { id: 1, status: 'completed', conclusion: 'success', path: WORKFLOW_PATH };
+  };
+  const complete = await client._readRun('tester/glados-quick-deploy', 1);
+  assert.deepEqual(pages, [1, 2]);
+  assert.equal(complete.result.accounts.length, 100);
+  assert.equal(complete.result.accounts.at(-1).accountKey, keys.at(-1));
+  assert.equal(complete.result.status, 'checked');
+  client._completedResults.clear();
+  const originalApi = client._api;
+  client._api = async endpoint => endpoint.includes('/jobs/101/logs') ? 'No structured result' : originalApi(endpoint);
+  const incomplete = await client._readRun('tester/glados-quick-deploy', 1);
+  assert.equal(incomplete.conclusion, 'success');
+  assert.equal(incomplete.result.status, 'unverified');
+  assert.equal(incomplete.result.readError, 'INCOMPLETE_RESULTS');
+});
+
+test('resolving a previous uncertain dispatch never marks current credentials as deployed', async () => {
+  const events = [];
+  const client = new GitHubClient({ ghPath: '/fake/gh', onEvent: e => events.push(e) });
+  const record = credential();
+  client._pendingDispatches.set('tester/glados-quick-deploy', { nonce: 'previous-nonce', branch: 'main', accountKey: record.accountKey });
+  client._api = async (endpoint, options) => {
+    assert.equal(options.method, undefined);
+    assert.ok(endpoint.includes('/runs?'));
+    return { workflow_runs: [{ id: 23, event: 'workflow_dispatch', status: 'in_progress', display_title: `GLaDOS Quick Deploy · previous-nonce · ${record.accountKey}` }] };
+  };
+  const snapshot = await client._startVerification('tester/glados-quick-deploy', 'main');
+  assert.equal(snapshot.runId, 23);
+  assert.equal(events[0].credentialUpdated, false);
+  assert.equal(events[0].resumed, true);
+});
+
+test('initial auto-init 409 is bounded and retryable only for the newly created repository', async () => {
+  const client = new MemoryGitHub();
+  const originalHead = client._head.bind(client);
+  let calls = 0;
+  client._head = async (...args) => {
+    if (++calls === 1) throw new GitHubError('CONFLICT', 'initializing', 'configuration', { httpStatus: 409 });
+    return originalHead(...args);
+  };
+  const outcome = await client.deploy({ credential: credential() });
+  assert.equal(outcome.result.status, 'points_increased');
+  assert.ok(calls >= 2);
+});
+
+test('verification deadline returns the known queued run and cancels an outstanding request', async () => {
+  const client = new GitHubClient({ ghPath: '/fake/gh', waitTimeoutMs: 15 });
+  let requestAborted = false;
+  client._readRun = async (_repository, _id, signal) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => { requestAborted = true; reject(new GitHubError('ABORTED', 'cancelled')); }, { once: true });
+  });
+  const snapshot = { repository: 'tester/glados-quick-deploy', runId: 999, status: 'queued', conclusion: null };
+  const outcome = await client._waitForRun(snapshot);
+  assert.equal(outcome.runId, 999);
+  assert.equal(outcome.status, 'queued');
+  assert.equal(requestAborted, true);
+});
