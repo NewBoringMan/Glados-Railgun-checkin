@@ -180,12 +180,15 @@ class ResumeStore {
       const info = directoryExists ? await this._fileInfo() : null;
       exists = Boolean(info);
       if (info && (info.size < 1 || info.size > MAX_BYTES)) throw problem('damaged');
+      // Even checking provider availability can initialize Keychain access.
+      // An empty recovery state needs no key; a later nonempty save still
+      // verifies the provider before reporting credentials as durable.
+      if (!exists) { this._blocked = false; return { tasks: [], warning: '', durable: true }; }
       const provider = await this._provider();
       if (!provider) {
         this._blocked = exists;
         return { tasks: [], warning: WARNINGS.unavailable, durable: false };
       }
-      if (!exists) { this._blocked = false; return { tasks: [], warning: '', durable: true }; }
       const decoded = await provider.decrypt(await this._read());
       const tasks = decode(decoded.result);
       this._blocked = false;

@@ -1,10 +1,16 @@
 # GLaDOS Quick Deploy
 
-**版本 1.1.1 · Windows 10/11 x64 / macOS 13+ Apple Silicon / macOS 13+ Intel**
+**版本 1.1.2 · Windows 10/11 x64 / macOS 13+ Apple Silicon / macOS 13+ Intel**
 
 GLaDOS Quick Deploy 是一个桌面部署向导：用户在需要时完成 GitHub 官方设备授权与 GLaDOS 网页登录，应用自动建立专用部署仓库、保存 Actions Secrets、配置计划任务并读取首次运行结果。普通用户直接使用安装包，操作说明见 [中文使用指南](USER-GUIDE.zh-CN.md)。
 
 本软件不是 GLaDOS 官方客户端。软件构建、逻辑测试与原生窗口烟雾检查，都不能代替真实账号的端到端签到验收；本说明不宣称已使用真实账号完成登录、部署、签到及兑换的全流程验证。最终结果以用户首次运行时 GLaDOS 的响应和 GitHub Actions 的实际记录为准。
+
+## 1.1.2 启动恢复修复
+
+没有本地加密恢复文件时，恢复模块直接返回空状态，不再初始化系统安全存储，避免无待恢复会话却出现 Safe Storage 钥匙串提示。实际保存或恢复加密会话时，仍使用正常的系统凭据保护。
+
+升级时覆盖原安装位置的应用，保留数据目录；新版验证通过后清理旧应用副本与安装临时文件，不长期保留多个应用版本。
 
 ## 1.1.1 结果核实修复
 
@@ -143,6 +149,8 @@ node scripts/smoke.cjs "dist/mac-arm64/GLaDOS Quick Deploy.app/Contents/MacOS/GL
 [原生构建工作流](quick-deploy-desktop.yml)的方式是：生成统一依赖锁文件，分别在 Windows x64、macOS ARM64 与 macOS Intel 运行逻辑检查、校验官方 `gh`、打包、启动真实产物，再生成摘要和上传构建产物。工作流定义本身不代表构建已经成功；请核对对应提交的 Actions 运行和产物记录。
 
 CI 的临时机器还会用非秘密标记检查系统加密存储的写入、重新打开恢复和删除。此检查仅在 CI 的明确标志开启时执行；本机隐藏烟雾检查不访问系统钥匙串。系统存储不可用时，报告会单独记录这一状态及禁止明文回退的结果。
+
+1.1.2 在 CI 开关之前增加空恢复检查：使用任何属性访问都会失败的替代存储对象，验证没有加密文件时完全不访问安全存储。报告中的 `emptyRestoreDoesNotAccessKeychain` 记录这项结果；本机不会因此调用真实钥匙串。
 
 ## 结果与限制
 

@@ -59,6 +59,44 @@ async function fixture(t, options = {}) {
   return { directory, safeStorage, store, file: path.join(directory, FILE_NAME) };
 }
 
+test('absent recovery data does not access any safeStorage method or getter', async t => {
+  for (const missingDirectory of [false, true]) await t.test(missingDirectory ? 'directory is absent' : 'file is absent', async t => {
+    let propertyReads = 0;
+    const storage = new Proxy({}, { get() { propertyReads++; throw new Error('OS key provider must remain untouched'); } });
+    const f = await fixture(t, { safeStorage: storage });
+    const directory = missingDirectory ? path.join(f.directory, 'not-created') : f.directory;
+    const store = new ResumeStore({ directory, safeStorage: storage, now: () => NOW });
+    assert.deepEqual(await store.load(), { tasks: [], warning: '', durable: true });
+    assert.equal(propertyReads, 0);
+    assert.deepEqual(await fsp.readdir(f.directory), []);
+  });
+});
+
+test('after an empty load, real saves and existing encrypted loads still verify the system provider', async t => {
+  const storage = mockStorage();
+  let available = false;
+  let availabilityChecks = 0;
+  storage.isAsyncEncryptionAvailable = async () => { availabilityChecks++; return available; };
+  const f = await fixture(t, { safeStorage: storage });
+  assert.deepEqual(await f.store.load(), { tasks: [], warning: '', durable: true });
+  assert.equal(availabilityChecks, 0);
+  const unavailable = await f.store.save([task()]);
+  assert.equal(unavailable.durable, false); assert.match(unavailable.warning, /系统安全存储暂不可用/);
+  assert.equal(availabilityChecks, 1); assert.equal(storage.calls.encrypt, 0); assert.equal(storage.calls.synchronous, 0);
+  assert.deepEqual(await fsp.readdir(f.directory), []);
+
+  available = true;
+  assert.deepEqual(await f.store.save([task()]), { durable: true, warning: '' });
+  assert.equal(availabilityChecks, 2); assert.equal(storage.calls.encrypt, 1);
+  const original = await fsp.readFile(f.file);
+  assert.equal(original.includes(Buffer.from(PRIVATE_COOKIE)), false);
+  const restarted = new ResumeStore({ directory: f.directory, safeStorage: storage, now: () => NOW });
+  const recovered = await restarted.load();
+  assert.equal(recovered.durable, true); assert.deepEqual(recovered.tasks, [task()]);
+  assert.equal(availabilityChecks, 3); assert.equal(storage.calls.decrypt, 1); assert.equal(storage.calls.synchronous, 0);
+  assert.deepEqual(await fsp.readFile(f.file), original);
+});
+
 test('encrypted round trip uses async safeStorage and never writes plaintext', async t => {
   const f = await fixture(t);
   const tasks = [task()];

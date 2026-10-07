@@ -6,10 +6,26 @@ const path = require('node:path');
 const { ResumeStore } = require('./resume-store.cjs');
 
 async function runStorageRegression({ directory, safeStorage }) {
+  if (!process.argv.includes('--smoke-test')) return { checked: false, reason: 'Storage fixtures run only in smoke-test mode.' };
+  // Exercise an empty restart without ever exposing the real native provider.
+  // Even reading a provider method would fail this fixture, so it is safe on
+  // the user's computer and runs before the CI-only native encryption branch.
+  const emptyDirectory = path.join(directory, 'empty-storage-fixture');
+  fs.mkdirSync(emptyDirectory, { recursive: true });
+  assert.ok(!fs.existsSync(path.join(emptyDirectory, 'pending-deployments.enc')), 'Empty restore fixture must not contain an encrypted session');
+  let providerReads = 0;
+  const forbiddenProvider = new Proxy(Object.create(null), {
+    get() { providerReads += 1; throw new Error('An empty restore must not access the native key provider'); },
+  });
+  const empty = await new ResumeStore({ directory: emptyDirectory, safeStorage: forbiddenProvider }).load();
+  assert.equal(providerReads, 0, 'An empty restore must not inspect or initialize any safeStorage method');
+  assert.deepEqual(empty, { tasks: [], warning: '', durable: true }, 'An empty restore must return a clean empty state');
+  const emptyResult = { emptyRestoreDoesNotAccessKeychain: true };
+
   // Native key-provider initialization is exercised only on ephemeral CI VMs.
   // A smoke check on the user's computer never requests Keychain access.
-  if (!process.argv.includes('--smoke-test') || process.env.CI !== 'true' || process.env.GQD_VALIDATE_NATIVE_STORAGE !== '1') {
-    return { checked: false, reason: 'Native key-provider fixture runs only in CI.' };
+  if (process.env.CI !== 'true' || process.env.GQD_VALIDATE_NATIVE_STORAGE !== '1') {
+    return { ...emptyResult, checked: false, reason: 'Native key-provider fixture runs only in CI.' };
   }
   let deadline;
   const fixtureDirectory = path.join(directory, 'native-storage-fixture');
@@ -27,7 +43,7 @@ async function runStorageRegression({ directory, safeStorage }) {
         const file = path.join(fixtureDirectory, 'pending-deployments.enc');
         if (!saved.durable) {
           assert.ok(!fs.existsSync(file), 'Unavailable native storage must never write a plaintext fallback');
-          return { checked: true, encryptionAvailable: false, plaintextFallbackBlocked: true };
+          return { ...emptyResult, checked: true, encryptionAvailable: false, plaintextFallbackBlocked: true };
         }
         const bytes = fs.readFileSync(file);
         assert.ok(bytes.length && !bytes.includes(Buffer.from(marker)), 'Native fixture must be encrypted at rest');
@@ -37,7 +53,7 @@ async function runStorageRegression({ directory, safeStorage }) {
         assert.equal(restored.tasks[0]?.credential?.cookie, marker, 'A fresh store must recover the original fixture');
         assert.equal((await reopened.save([])).durable, true, 'Native encrypted fixture must be removable');
         assert.ok(!fs.existsSync(file));
-        return { checked: true, encryptionAvailable: true, encryptedRoundTrip: true, explicitRemoval: true };
+        return { ...emptyResult, checked: true, encryptionAvailable: true, encryptedRoundTrip: true, explicitRemoval: true };
       })(),
       new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('Native storage fixture timed out')), 12000); }),
     ]);
