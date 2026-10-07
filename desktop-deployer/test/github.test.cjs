@@ -360,7 +360,7 @@ test('adapter attempts once, stops device/permission rejection, and never exchan
   assert.equal(output.status, 1);
   assert.equal(result.outcome, 'authentication_required');
   assert.equal(result.errorKind, 'authentication');
-  assert.equal(fs.readFileSync(path.join(directory, 'calls.txt'), 'utf8'), 'checkin\n');
+  assert.equal(fs.readFileSync(path.join(directory, 'calls.txt'), 'utf8').replace(/\r\n/g, '\n'), 'checkin\n');
   assert.equal(fs.existsSync(path.join(directory, 'exchange.txt')), false);
   assert.equal(Object.hasOwn(result, 'pointsAdded'), false);
 });
@@ -371,7 +371,7 @@ test('adapter measures credit before redemption and accepts already-checked with
   assert.equal(accepted.result.outcome, 'checked');
   assert.equal(accepted.result.pointsAdded, 2);
   assert.equal(accepted.result.exchange, 'completed');
-  assert.equal(fs.readFileSync(path.join(accepted.directory, 'exchange.txt'), 'utf8'), 'plan500\n');
+  assert.equal(fs.readFileSync(path.join(accepted.directory, 'exchange.txt'), 'utf8').replace(/\r\n/g, '\n'), 'plan500\n');
   const repeated = runAdapter(t, { code: 1, message: 'Checkin repeats! Please try tomorrow' }, { plan: 'off' });
   assert.equal(repeated.output.status, 0);
   assert.equal(repeated.result.outcome, 'already_checked');

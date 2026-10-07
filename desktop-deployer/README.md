@@ -1,6 +1,6 @@
 # GLaDOS Quick Deploy
 
-**版本 1.0.0 · Windows x64 / macOS 13+ Apple Silicon / macOS 13+ Intel**
+**版本 1.0.0 · Windows 10/11 x64 / macOS 13+ Apple Silicon / macOS 13+ Intel**
 
 GLaDOS Quick Deploy 是一个桌面部署向导：用户在需要时完成 GitHub 官方设备授权与 GLaDOS 网页登录，应用自动建立专用部署仓库、保存 Actions Secrets、配置计划任务并读取首次运行结果。普通用户直接使用安装包，操作说明见 [中文使用指南](USER-GUIDE.zh-CN.md)。
 

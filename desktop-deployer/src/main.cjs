@@ -85,6 +85,7 @@ async function smokeCheck() {
   if (!inspection.hasBridge || !inspection.nodeBlocked || inspection.buttons < 2 || inspection.horizontalOverflow || !inspection.text.includes('GLaDOS')) throw new Error('Desktop smoke inspection did not pass');
   const stateFromBridge = await window.webContents.executeJavaScript('window.quickDeploy.getState()');
   if (stateFromBridge.version !== app.getVersion()) throw new Error('IPC state bridge failed');
+  const screenshot = (await window.webContents.capturePage()).toPNG();
   await window.webContents.executeJavaScript("location.hash = 'deploy-heading'");
   const stateWithFragment = await window.webContents.executeJavaScript('window.quickDeploy.getState()');
   if (stateWithFragment.version !== app.getVersion()) throw new Error('IPC bridge failed after local accessibility navigation');
@@ -97,7 +98,7 @@ async function smokeCheck() {
   if (smokeDirectory) {
     fs.mkdirSync(smokeDirectory, { recursive: true });
     fs.writeFileSync(path.join(smokeDirectory, 'desktop-smoke.json'), JSON.stringify(report, null, 2));
-    fs.writeFileSync(path.join(smokeDirectory, 'desktop-smoke.png'), (await window.webContents.capturePage()).toPNG());
+    fs.writeFileSync(path.join(smokeDirectory, 'desktop-smoke.png'), screenshot);
   }
   console.log('QUICK_DEPLOY_SMOKE=' + JSON.stringify(report));
 }
