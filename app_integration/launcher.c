@@ -6,8 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "browser_process_info.h"
 
 int main(int argc, char *argv[]) {
+    // Read-only kernel metadata; do not load the UI or its menu plugin.
+    if (argc == 4 && strcmp(argv[1], "--browser-process-info") == 0)
+        return glados_browser_process_info(argv[2], argv[3]);
+    if (argc > 1 && strcmp(argv[1], "--browser-process-info") == 0) return 2;
     char executablePath[PATH_MAX];
     uint32_t size = sizeof(executablePath);
     if (_NSGetExecutablePath(executablePath, &size) != 0) {

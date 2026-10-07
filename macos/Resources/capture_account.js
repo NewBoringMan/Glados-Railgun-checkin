@@ -35,6 +35,7 @@ const {
   webdriverCapabilities,
 } = require('./browser_support');
 const { bidiUnavailableError, captureFirefoxSession, extractBidiWebSocketUrl } = require('./firefox_bidi_support');
+const { connectControlledBrowser, connectionError, validateCDPWebSocket } = require('./browser_connection');
 
 const APP_TITLE = 'GLaDOS Account Center';
 const DEFAULT_REPO = 'NewBoringMan/Glados-Railgun-checkin';
@@ -69,18 +70,33 @@ function browserProfileDirectory(browserId, env = process.env) {
     : path.join(SUPPORT_DIR, 'BrowserProfiles', browserId);
 }
 
-function captureFailureCode(error) {
+function captureFailureCode(error, stage = '') {
   if (error?.code === 'GLADOS_COOKIE_SCOPE_MISMATCH') return 'cookie_scope_mismatch';
   if (error?.code === 'GLADOS_COOKIE_SCOPE_UNAVAILABLE') return 'cookie_scope_unavailable';
   if (error?.code === 'INCOMPLETE_API_IDENTITY') return 'missing_identity';
   if (error?.code === 'GLADOS_BROWSER_CONNECTION') return 'browser_connection';
+  if (error?.code === 'GLADOS_CAPTURE_DIALOG_FAILED') return 'dialog_failed';
+  if (error?.code === 'GLADOS_CAPTURE_CANCELLED') return 'cancelled';
   const message = String(error?.message || '');
   if (/账号.*不一致|身份不一致|相互冲突|原账号绑定的域名不一致|原域名不一致/.test(message)) return 'identity_mismatch';
   if (/Safari.*扩展.*缺失|桥接组件缺失/.test(message)) return 'safari_extension_unavailable';
   if (/拒绝.*认证|拒绝当前登录设备|缺少.*Cookie|缺少完整的.*登录会话/.test(message)) return 'verification_required';
   if (/Native Messaging 桥接|浏览器调试接口|浏览器驱动/.test(message)) return 'browser_connection';
   if (/取消/.test(message)) return 'cancelled';
+  if (stage === 'waiting_confirmation') return 'dialog_failed';
+  if (stage === 'reading_browser') return 'page_read_failed';
+  if (stage === 'verifying_session') return 'verification_failed';
   return 'invalid_capture';
+}
+
+function captureFailureLine(error, stage = '') {
+  return `GLADOS_CAPTURE_ERROR_CODE=${captureFailureCode(error, stage)}\n`;
+}
+
+function dialogFailure() {
+  const error = new Error('macOS 对话框未能正常完成。');
+  error.code = 'GLADOS_CAPTURE_DIALOG_FAILED';
+  return error;
 }
 
 function run(command, args, options = {}) {
@@ -93,15 +109,19 @@ function run(command, args, options = {}) {
   });
 }
 
-function appleScript(lines, argv = []) {
+function appleScript(lines, argv = [], execute = run) {
+  const isDialog = lines.some((line) => /\b(?:display dialog|choose from list)\b/.test(line));
+  const failure = () => isDialog ? dialogFailure() : new Error('macOS 浏览器操作未能正常完成。');
   const args = [];
   for (const line of lines) args.push('-e', line);
   args.push('--', ...argv.map(String));
-  const result = run('/usr/bin/osascript', args, { timeout: 3600000 });
+  let result;
+  try { result = execute('/usr/bin/osascript', args, { timeout: 3600000 }); }
+  catch { throw failure(); }
   if (result.status !== 0) {
     const errorText = `${result.stderr || ''}`.trim();
     if (/User canceled|(-128)/i.test(errorText)) return null;
-    throw new Error(errorText || 'macOS 对话框执行失败。');
+    throw failure();
   }
   return String(result.stdout || '').trim();
 }
@@ -114,14 +134,16 @@ function alert(message, icon = 'note') {
   ], [message]);
 }
 
-function confirm(message, okLabel = '继续') {
-  const result = appleScript([
+function confirm(message, okLabel = '继续', showDialog = appleScript) {
+  const result = showDialog([
     'on run argv',
     'set answer to display dialog (item 1 of argv) with title "GLaDOS Account Center" buttons {"取消", item 2 of argv} default button (item 2 of argv) cancel button "取消" with icon caution',
     'return button returned of answer',
     'end run',
   ], [message, okLabel]);
-  return result === okLabel;
+  if (result === null || result === '取消') return false;
+  if (result === okLabel) return true;
+  throw dialogFailure();
 }
 
 function choose(items, prompt, title = APP_TITLE) {
@@ -169,10 +191,26 @@ function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
-function launchControlledBrowser(browser, port) {
+function prepareBrowserProfile(profileDir) {
+  const root = path.join(SUPPORT_DIR, 'BrowserProfiles');
+  const relative = path.relative(root, profileDir);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw connectionError();
   ensureDir(SUPPORT_DIR);
-  const profileDir = browserProfileDirectory(browser.id);
-  ensureDir(profileDir);
+  ensureDir(root);
+  let current = root;
+  for (const component of relative.split(path.sep)) {
+    current = path.join(current, component);
+    try {
+      const metadata = fs.lstatSync(current);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory() || metadata.uid !== process.getuid()) throw connectionError();
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      fs.mkdirSync(current, { mode: 0o700 });
+    }
+  }
+}
+
+function launchControlledBrowser(browser, port, profileDir) {
   const executable = firstExistingPath(browser.paths);
   if (!executable) throw new Error('所选浏览器当前不可用。');
   const appPath = executable.split('/Contents/MacOS/')[0];
@@ -194,18 +232,24 @@ function httpJson(url, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const request = http.get(url, { timeout: timeoutMs }, (response) => {
       const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
+      let bytes = 0;
+      response.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 2 * 1024 * 1024) { request.destroy(connectionError()); return; }
+        chunks.push(chunk);
+      });
       response.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`调试接口返回 HTTP ${response.statusCode}`));
+          reject(connectionError());
           return;
         }
-        try { resolve(JSON.parse(body)); } catch { reject(new Error('调试接口返回了无法解析的数据。')); }
+        try { resolve(JSON.parse(body)); } catch { reject(connectionError()); }
       });
+      response.on('error', () => reject(connectionError()));
     });
-    request.on('timeout', () => request.destroy(new Error('连接浏览器调试接口超时。')));
-    request.on('error', reject);
+    request.on('timeout', () => request.destroy(connectionError()));
+    request.on('error', () => reject(connectionError()));
   });
 }
 
@@ -555,20 +599,22 @@ function openSafariExtensionSetup() {
 async function startBrowserSession(browser) {
   if (browser.kind === 'safari-extension') return startSafariExtensionSession(browser);
   if (browser.kind === 'cdp') {
-    const port = await allocateLocalBrowserPort();
-    launchControlledBrowser(browser, port);
-    try { await waitForCDP(port, 45000); }
-    catch {
-      const error = new Error('浏览器连接失败。请自行退出该账号的专用浏览器实例，再手动重新读取登录信息；账号登录状态尚未验证。');
-      error.code = 'GLADOS_BROWSER_CONNECTION';
-      throw error;
+    const profileDir = browserProfileDirectory(browser.id);
+    const executable = firstExistingPath(browser.paths);
+    if (!executable) throw connectionError();
+    try {
+      prepareBrowserProfile(profileDir);
+      const connection = await connectControlledBrowser({
+        executable, profileDir,
+        allocatePort: allocateLocalBrowserPort,
+        launchBrowser: (port, selectedProfile) => launchControlledBrowser(browser, port, selectedProfile),
+        getVersion: (port) => httpJson(`http://127.0.0.1:${port}/json/version`, 3000),
+      });
+      return { kind: 'cdp', browser, ...connection };
     }
-    return {
-      kind: 'cdp',
-      browser,
-      port,
-      close: async () => {},
-    };
+    catch {
+      throw connectionError();
+    }
   }
   if (browser.kind === 'webdriver') return startWebDriverBrowser(browser);
   throw new Error(`不支持的浏览器连接方式：${browser.kind}`);
@@ -587,21 +633,6 @@ function allocateLocalBrowserPort() {
       probe.close((error) => error ? reject(error) : resolve(port));
     });
   });
-}
-
-async function waitForCDP(port, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const version = await httpJson(`http://127.0.0.1:${port}/json/version`, 3000);
-      if (version.webSocketDebuggerUrl) return version;
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 600));
-  }
-  throw new Error(`未能连接浏览器调试接口。${lastError ? ` ${lastError.message}` : ''}`);
 }
 
 class MinimalWebSocket {
@@ -771,8 +802,11 @@ async function listTabs(port) {
 }
 
 async function acquireCookieFromCDP(session) {
-  await waitForCDP(session.port);
+  // A human may leave the confirmation open for a long time. Never attach to
+  // a replacement process that happens to acquire the original port.
+  await session.verifyConnection();
   const tabs = await listTabs(session.port);
+  session.verifyOwnership();
   const gladosTabs = tabs.filter((tab) => {
     try { validatePinnedPage(tab.url, expectedCaptureIdentity().host); return true; } catch { return false; }
   });
@@ -783,8 +817,15 @@ async function acquireCookieFromCDP(session) {
   const selectedIndex = labels.indexOf(selectedLabel);
   const selectedTab = gladosTabs[selectedIndex];
   const page = validatePinnedPage(selectedTab.url, expectedCaptureIdentity().host);
+  const websocket = validateCDPWebSocket(selectedTab.webSocketDebuggerUrl, session.port, 'page');
+  const checkedCall = async (url, method, params) => {
+    session.verifyOwnership();
+    const result = await cdpCall(validateCDPWebSocket(url, session.port, 'page'), method, params);
+    session.verifyOwnership();
+    return result;
+  };
   const readContext = async () => {
-    const response = await cdpCall(selectedTab.webSocketDebuggerUrl, 'Runtime.evaluate', {
+    const response = await checkedCall(websocket, 'Runtime.evaluate', {
       expression: '({userAgent:navigator.userAgent,pageUrl:location.href})',
       returnByValue: true,
     });
@@ -792,7 +833,7 @@ async function acquireCookieFromCDP(session) {
     return normalizeBrowserContext(response.result?.value, page.host);
   };
   const before = await readContext();
-  const parts = await readCDPSessionCookies(page.pageUrl, selectedTab.webSocketDebuggerUrl);
+  const parts = await readCDPSessionCookies(page.pageUrl, websocket, checkedCall);
   const after = await readContext();
   assertSameBrowserContext(before, after);
   const cookieHeader = composeCookieHeader(parts);
@@ -1164,10 +1205,55 @@ function browserChoiceLabel(browser) {
   return `${browser.label}（专用资料窗口）`;
 }
 
+// The native App and standalone helper use the same ordered read-only phase.
+// Dependencies let offline fixtures verify that a failed/cancelled step never
+// reaches later browser reads, identity requests or result publication.
+async function capturePreparedBrowser(browser, browserSession, options = {}) {
+  const setStage = options.onStage || (() => {});
+  const persistenceNote = browser.loginPersistence === 'normal-profile'
+    ? '这是普通 Safari 窗口。应用会让你选择已打开的 GLaDOS 页面；未登录时也可以正常登录。只有你点击 Safari 扩展里的“发送当前账号”后才会读取。'
+    : browser.loginPersistence === 'profile'
+      ? '此专用资料窗口会保留 GLaDOS 登录状态，后续通常无需重新登录。'
+      : '这是隔离自动化窗口；Firefox 可能需要每次重新登录。';
+  const windowDescription = browser.id === 'safari' ? '普通 GLaDOS 窗口' : '受控 GLaDOS 窗口';
+  const openingNote = browserSession.reused ? `已连接 ${browser.label} 中原来打开的专用 GLaDOS 窗口。` : `已打开 ${browser.label} 的${windowDescription}。`;
+  setStage('waiting_confirmation');
+  const ready = await (options.confirm || confirm)(`${openingNote}\n\n请确认当前是需要新增或更新的账号，保持会员签到页面打开并等待加载完成。\n\n${persistenceNote}\n\n完成后点击“读取账号”。`, '读取账号');
+  if (!ready) return null;
+
+  setStage('reading_browser');
+  const acquired = await (options.acquireCookie || acquireCookie)(browserSession);
+  // Register acquired parts with main before verification can throw so its
+  // existing finally block still clears them and closes the browser session.
+  if (options.onAcquired) options.onAcquired(acquired);
+  setStage('verifying_session');
+  const expected = (options.expectedCaptureIdentity || expectedCaptureIdentity)();
+  const verified = await (options.verifyCookie || verifyCookie)(acquired.host, acquired.cookieHeader, acquired.userAgent, acquired.parts, {
+    expectedAccountKey: expected.accountKey, expectedHost: expected.host,
+  });
+  setStage('validating_capture');
+  const capturePayload = (options.buildCapturePayload || buildCapturePayload)(acquired, verified, browser.label);
+  return { acquired, verified, capturePayload };
+}
+
+let activeCaptureStage = 'preparing_browser';
+
+function handleUnhandledCaptureError(error, options = {}) {
+  const captureOnly = options.captureOnly ?? (process.env.GLADOS_CAPTURE_ONLY === '1');
+  if (captureOnly) {
+    (options.write || ((line) => process.stderr.write(line)))(captureFailureLine(error, options.stage ?? activeCaptureStage));
+    (options.setExitCode || ((code) => { process.exitCode = code; }))(1);
+    return;
+  }
+  (options.alert || alert)(`程序异常：\n\n${redact(error && error.message ? error.message : String(error))}`, 'stop');
+}
+
 async function main() {
   let cookieHeader = null;
   let cookieParts = null;
   let browserSession = null;
+  let captureStage = 'preparing_browser';
+  const setCaptureStage = (stage) => { captureStage = stage; activeCaptureStage = stage; };
   try {
     ensureDir(SUPPORT_DIR);
     const installed = installedBrowsers();
@@ -1203,24 +1289,15 @@ async function main() {
       throw error;
     }
 
-    const persistenceNote = browser.loginPersistence === 'normal-profile'
-      ? '这是普通 Safari 窗口。应用会让你选择已打开的 GLaDOS 页面；未登录时也可以正常登录。只有你点击 Safari 扩展里的“发送当前账号”后才会读取。'
-      : browser.loginPersistence === 'profile'
-        ? '此专用资料窗口会保留 GLaDOS 登录状态，后续通常无需重新登录。'
-        : '这是隔离自动化窗口；Firefox 可能需要每次重新登录。';
-    const windowDescription = browser.id === 'safari' ? '普通 GLaDOS 窗口' : '受控 GLaDOS 窗口';
-    const ready = confirm(`已打开 ${browser.label} 的${windowDescription}。\n\n请确认当前是需要新增或更新的账号，保持会员签到页面打开并等待加载完成。\n\n${persistenceNote}\n\n完成后点击“读取账号”。`, '读取账号');
-    if (!ready) {
-      if (process.env.GLADOS_CAPTURE_ONLY === '1') throw new Error('已取消读取账号。');
-      return;
-    }
-
-    let acquired;
+    let captured;
     try {
-      acquired = await acquireCookie(browserSession);
+      captured = await capturePreparedBrowser(browser, browserSession, {
+        onStage: setCaptureStage,
+        onAcquired: (acquired) => { cookieHeader = acquired.cookieHeader; cookieParts = acquired.parts; },
+      });
     } catch (error) {
       if (process.env.GLADOS_CAPTURE_ONLY === '1') throw error;
-      if (browser.id === 'safari' && /Safari|Native Messaging|Bridge|扩展|桥接/i.test(String(error.message))) {
+      if (captureStage === 'reading_browser' && browser.id === 'safari' && /Safari|Native Messaging|Bridge|扩展|桥接/i.test(String(error.message))) {
         const setup = confirm(`${error.message}
 
 是否打开 Safari 扩展安装文件夹和设置说明？`, '打开扩展设置');
@@ -1229,15 +1306,17 @@ async function main() {
       }
       throw error;
     }
-    cookieHeader = acquired.cookieHeader;
-    cookieParts = acquired.parts;
-    const expected = expectedCaptureIdentity();
-    const verified = await verifyCookie(acquired.host, cookieHeader, acquired.userAgent, cookieParts, {
-      expectedAccountKey: expected.accountKey, expectedHost: expected.host,
-    });
+    if (!captured) {
+      if (process.env.GLADOS_CAPTURE_ONLY === '1') {
+        const error = new Error('已取消读取账号。');
+        error.code = 'GLADOS_CAPTURE_CANCELLED';
+        throw error;
+      }
+      return;
+    }
+    const { acquired, verified, capturePayload } = captured;
     const accountSecret = verified.secretName;
     const accountKey = verified.accountKey;
-    const capturePayload = buildCapturePayload(acquired, verified, browser.label);
     const remainingDisplay = verified.leftDays === null ? '接口未提供' : `${verified.leftDays} 天`;
     const accountDisplay = verified.accountEmail ? `\n账户：${verified.accountEmail}` : '';
     if (process.env.GLADOS_CAPTURE_ONLY === '1') {
@@ -1336,7 +1415,7 @@ async function main() {
     }
   } catch (error) {
     if (process.env.GLADOS_CAPTURE_ONLY === '1') {
-      process.stderr.write(`GLADOS_CAPTURE_ERROR_CODE=${captureFailureCode(error)}\n`);
+      process.stderr.write(captureFailureLine(error, captureStage));
       process.exitCode = 1;
       return;
     }
@@ -1363,9 +1442,9 @@ async function main() {
 }
 
 if (require.main === module) {
-  process.on('uncaughtException', (error) => alert(`程序异常：\n\n${redact(error.message)}`, 'stop'));
-  process.on('unhandledRejection', (error) => alert(`程序异常：\n\n${redact(error && error.message ? error.message : String(error))}`, 'stop'));
+  process.on('uncaughtException', (error) => handleUnhandledCaptureError(error));
+  process.on('unhandledRejection', (error) => handleUnhandledCaptureError(error));
   main();
 }
 
-module.exports = { assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, expectedCaptureIdentity, normalizeBrowserContext, readCDPSessionCookies, verifyCookie };
+module.exports = { appleScript, assertSameBrowserContext, browserProfileDirectory, buildCapturePayload, captureFailureCode, captureFailureLine, capturePreparedBrowser, confirm, expectedCaptureIdentity, handleUnhandledCaptureError, normalizeBrowserContext, readCDPSessionCookies, verifyCookie };

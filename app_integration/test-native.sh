@@ -9,6 +9,12 @@ cleanup_native_tests() {
 trap cleanup_native_tests EXIT
 
 NATIVE_TEST_ARCH="$(uname -m)"
+/usr/bin/xcrun clang -std=c11 -Wall -Wextra -Werror -pedantic \
+    "$ROOT/app_integration/browser_process_info.c" \
+    "$ROOT/macos/Tests/browser_process_info_native.c" \
+    -lproc -o "$NATIVE_TEST_DIR/browser-process-tests"
+"$NATIVE_TEST_DIR/browser-process-tests"
+
 /usr/bin/xcrun swiftc -parse-as-library \
     -target "${NATIVE_TEST_ARCH}-apple-macos13.0" \
     -module-cache-path "$NATIVE_TEST_DIR/ModuleCache" \
