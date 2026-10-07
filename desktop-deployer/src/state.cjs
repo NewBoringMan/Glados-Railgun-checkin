@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const DEFAULT_SETTINGS = Object.freeze({ repoName: 'glados-quick-deploy', exchangePlan: 'plan500', time: '09:30' });
-const ACCOUNT_FIELDS = ['accountKey', 'email', 'browser', 'repository', 'runId', 'runUrl', 'conclusion', 'updatedAt', 'pointsAdded', 'message', 'paused', 'status', 'pendingTaskId', 'deploymentStatus', 'githubLogin', 'lastRefreshError'];
+const ACCOUNT_FIELDS = ['accountKey', 'email', 'browser', 'repository', 'runId', 'runUrl', 'conclusion', 'updatedAt', 'pointsAdded', 'message', 'paused', 'status', 'pendingTaskId', 'deploymentStatus', 'githubLogin', 'lastRefreshError', 'resultReadError'];
+const RESULT_READ_ERRORS = new Set(['', 'INCOMPLETE_RESULTS', 'ACCOUNT_RESULT_MISSING', 'NETWORK_ERROR', 'TIMEOUT', 'GITHUB_UNAVAILABLE', 'RATE_LIMITED', 'PERMISSION_DENIED', 'AUTH_REQUIRED', 'NOT_FOUND', 'INVALID_RESPONSE', 'RESULTS_UNAVAILABLE']);
 const TASK_ID = /^[a-f0-9]{32}$/;
 const ACCOUNT_KEY = /^[A-F0-9]{16}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -83,6 +84,7 @@ function cleanAccount(raw) {
   if (out.repository && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(out.repository)) return null;
   if (out.runUrl && !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+$/.test(out.runUrl)) delete out.runUrl;
   if (out.pendingTaskId && !TASK_ID.test(out.pendingTaskId)) delete out.pendingTaskId;
+  if (out.resultReadError !== undefined && !RESULT_READ_ERRORS.has(out.resultReadError)) out.resultReadError = 'RESULTS_UNAVAILABLE';
   if (raw.settings && typeof raw.settings === 'object') out.settings = cleanSettings(raw.settings);
   return out;
 }

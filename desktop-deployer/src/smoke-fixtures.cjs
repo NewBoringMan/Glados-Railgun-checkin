@@ -218,6 +218,61 @@ async function runRendererRegression({ window, controller, uiFile, actions, outp
     await waitFor(() => evaluate(() => document.getElementById('accounts-section').getBoundingClientRect().top < innerHeight - 200), 'account screenshot position');
     await screenshot('multi-account-smoke.png');
 
+    // One completed workflow can still lack the selected account's result. Push
+    // each full snapshot once, then inspect the real renderer after that update.
+    const readReason = '工作流已结束，但暂未读到该账号完整的签到结果。将自动补读原运行结果，也可点击“刷新结果”；无需重新登录 GLaDOS。';
+    const verificationAccount = {
+      ...fixture.accounts[2], conclusion: 'unverified', pointsAdded: null,
+      resultReadError: 'INCOMPLETE_RESULTS', lastRefreshError: '', message: readReason,
+    };
+    controller.state = {
+      ...controller.state, busy: false, stage: 'complete', activeTaskId: '', resumeTasks: [],
+      error: '', errorInfo: null, message: readReason,
+      accounts: [verificationAccount],
+      currentRun: { accountKey: deployedKey, repository: verificationAccount.repository, runId: 300,
+        runUrl: verificationAccount.runUrl, status: 'completed', conclusion: 'unverified', pointsAdded: null, message: readReason },
+      progress: { completed: [0, 1, 2], current: 3 },
+    };
+    controller.changed();
+    await waitFor(() => evaluate(() => document.getElementById('current-run-title').textContent.includes('待核实')), 'account result remains unverified');
+    const unverified = await evaluate(key => {
+      const card = document.querySelector('.account-card[data-account-key="' + key + '"]');
+      const step = document.querySelector('#progress-steps [data-step="3"]');
+      return {
+        title: document.getElementById('progress-title').textContent,
+        badge: document.getElementById('overview-text').textContent,
+        count: document.getElementById('progress-count').textContent,
+        stepDone: step.classList.contains('is-done'), stepText: step.querySelector('.step-state').textContent,
+        status: card.querySelector('.account-status').textContent,
+        detail: card.querySelector('.account-detail').textContent,
+      };
+    }, deployedKey);
+    check(unverified.title.includes('待核实') && unverified.badge === '待核实' && unverified.count === '3 / 4' && !unverified.stepDone && unverified.stepText === '待核实', 'An unverified account keeps the final step open even after the workflow completed');
+    check(unverified.status.includes('结果待核实') && unverified.detail === readReason, 'The unverified account shows its concrete read reason and how to refresh the original result');
+
+    const checkedMessage = '已确认签到成功，本次新增积分为 0。';
+    controller.state = {
+      ...controller.state, message: checkedMessage,
+      accounts: [{ ...verificationAccount, conclusion: 'checkin_success', pointsAdded: 0, resultReadError: '', message: checkedMessage }],
+      currentRun: { ...controller.state.currentRun, conclusion: 'checkin_success', pointsAdded: 0, message: checkedMessage },
+      progress: { completed: [0, 1, 2, 3], current: 3 },
+    };
+    controller.changed();
+    await waitFor(() => evaluate(() => document.getElementById('current-run-title').textContent === '签到成功'), 'verified account result applied');
+    const checked = await evaluate(key => {
+      const card = document.querySelector('.account-card[data-account-key="' + key + '"]');
+      return {
+        badge: document.getElementById('overview-text').textContent,
+        count: document.getElementById('progress-count').textContent,
+        done: [...document.getElementById('progress-steps').children].filter(step => step.classList.contains('is-done')).map(step => Number(step.dataset.step)),
+        currentRun: document.getElementById('current-run-title').textContent,
+        accountStatus: card.querySelector('.account-status').textContent,
+        accountSuccess: card.querySelector('.account-status').classList.contains('is-success'),
+        detail: card.querySelector('.account-detail').textContent,
+      };
+    }, deployedKey);
+    check(checked.badge === '已完成' && checked.count === '4 / 4' && JSON.stringify(checked.done) === '[0,1,2,3]' && checked.currentRun === '签到成功' && checked.accountStatus === '签到成功' && checked.accountSuccess && checked.detail === checkedMessage, 'One state update resolves the zero-point successful account, current run and all four progress steps');
+
     return {
       ok: true, checks, elapsedMs: Date.now() - started, viewport: accountInspection.viewport,
       fixtureAccounts: 3, fixturePendingTasks: 2, screenshots,

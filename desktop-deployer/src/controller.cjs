@@ -6,6 +6,21 @@ const { DEFAULT_SETTINGS, cleanSettings, cleanAccount, cleanCheckpoint, cleanPen
 
 const PENDING = new Set(['queued', 'pending', 'requested', 'waiting', 'in_progress']);
 const FAILED = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
+const RESULT_READ_LIMIT = 5;
+const RESULT_READ_INTERVAL = 30000;
+const RESULT_READ_MESSAGES = Object.freeze({
+  INCOMPLETE_RESULTS: '工作流已结束，但暂未读到该账号完整的签到结果。',
+  ACCOUNT_RESULT_MISSING: '本次运行暂未返回该账号可核实的签到结果。',
+  NETWORK_ERROR: '读取签到结果时无法连接 GitHub。',
+  TIMEOUT: '读取 GitHub 签到结果超时。',
+  GITHUB_UNAVAILABLE: 'GitHub 暂时无法提供签到结果。',
+  RATE_LIMITED: 'GitHub 暂时限制了结果查询频率。',
+  PERMISSION_DENIED: 'GitHub 拒绝读取运行日志，请检查仓库的 Actions 访问权限。',
+  AUTH_REQUIRED: '读取运行结果需要重新连接 GitHub；无需重新登录 GLaDOS。',
+  NOT_FOUND: 'GitHub 运行日志暂未就绪、已移除或当前授权无法读取。',
+  INVALID_RESPONSE: 'GitHub 返回的运行日志格式暂时无法识别。',
+  RESULTS_UNAVAILABLE: '工作流已结束，但签到结果暂时无法读取。',
+});
 const LOGIN_ERRORS = new Set(['INVALID_CREDENTIAL', 'SESSION_INCOMPLETE', 'SESSION_REJECTED', 'AUTOMATION_REJECTED', 'IDENTITY_MISMATCH', 'ACCOUNT_MISMATCH', 'LOGIN_REQUIRED', 'STORED_CREDENTIAL_MISSING']);
 
 function operationError(code, message, stage = 'deploying') { return Object.assign(new Error(message), { code, stage }); }
@@ -56,8 +71,36 @@ function pauseFor(ms, signal) {
 }
 
 function evidenceFor(result) {
-  return result.result?.accounts?.find(account => account.accountKey === result.accountKey) || result.result || {};
+  if (Array.isArray(result.result?.accounts)) return result.result.accounts.find(account => account.accountKey === result.accountKey) || {};
+  return result.result || {};
 }
+
+function resultReadCode(value) { return Object.hasOwn(RESULT_READ_MESSAGES, value || '') ? value : 'RESULTS_UNAVAILABLE'; }
+
+function accountConclusion(result) {
+  const evidence = evidenceFor(result);
+  const status = result.status || '';
+  if (PENDING.has(status)) return status;
+  if (status === 'not_started') return 'not_started';
+  if (evidence.outcome === 'authentication_required') return 'authentication_required';
+  if (evidence.outcome === 'failed' || evidence.exchange === 'failed') return 'failure';
+  // Cancellation and other whole-run interruptions remain visible even when an
+  // account checked in before the interruption. Another account's failure does
+  // not erase this account's own accepted result.
+  if (FAILED.has(result.conclusion) && result.conclusion !== 'failure') return result.conclusion;
+  if (['already', 'already_checked'].includes(evidence.outcome)) return 'already_checked_in';
+  if (evidence.outcome === 'checked') return 'checkin_success';
+  if (FAILED.has(result.conclusion)) return result.conclusion;
+  if (result.result?.status === 'unverified' || Array.isArray(result.result?.accounts) || result.conclusion === 'success') {
+    // Retain compatibility with pre-structured adapters that reported a numeric
+    // credit result, but never borrow another account's aggregate evidence.
+    if (!Array.isArray(result.result?.accounts) && evidence.pointsAdded > 0) return 'checkin_success';
+    return 'unverified';
+  }
+  return result.conclusion || status || 'queued';
+}
+
+function accountFailed(conclusion) { return FAILED.has(conclusion) || conclusion === 'authentication_required'; }
 
 class Controller extends EventEmitter {
   constructor(options) {
@@ -72,6 +115,8 @@ class Controller extends EventEmitter {
     this.activity = 0;
     this.backgroundAbort = null;
     this.backgroundTask = null;
+    this.resultReadAttempts = new Map();
+    this.now = options.now || Date.now;
     this.operationDone = Promise.resolve();
     this.initializeAbort = null;
     this.initializeTask = null;
@@ -80,7 +125,7 @@ class Controller extends EventEmitter {
     this.tasks = new Map((restored.pendingDeployments || []).map(task => cleanPendingTask(task)).filter(Boolean).map(task => [task.id, task]));
     this.activeTask = null;
     this.state = {
-      version: options.version || '1.1.0', platform: options.platform || process.platform,
+      version: options.version || '1.1.1', platform: options.platform || process.platform,
       dataDirectory: options.dataDirectory || '', busy: false, stage: 'idle',
       message: '完成登录后，软件会自动部署到你的 GitHub。', error: '', github: null,
       browsers: [], selectedBrowser: restored.selectedBrowser || '',
@@ -100,7 +145,7 @@ class Controller extends EventEmitter {
     if (task?.githubLogin) completed.push(0);
     if (task && (task.credential || task.checkpoint?.secretStored || task.checkpoint?.run || task.checkpoint?.dispatch)) completed.push(1);
     if (task?.checkpoint?.configured || task?.checkpoint?.run || task?.checkpoint?.dispatch) completed.push(2);
-    if (task?.checkpoint?.run?.status === 'completed') completed.push(3);
+    // A workflow completing does not by itself verify the account result.
     const current = Math.min(3, ['github_auth', 'browser_login', 'deploying', 'verifying'].indexOf(task?.phase || 'github_auth'));
     return { completed, current };
   }
@@ -221,6 +266,7 @@ class Controller extends EventEmitter {
         this.state.selectedBrowser = this.state.browsers.find(b => b.available && b.id !== 'embedded')?.id || 'embedded';
       }
       await this.restoreTasks();
+      for (const account of this.state.accounts) if (account.conclusion === 'unverified' || account.lastRefreshError) this.scheduleResultRead(account);
       if (signal.aborted) return;
       try { this.state.github = await this.github.whoami({ signal }); } catch { this.state.github = null; }
       if (!this.closing) this.changed();
@@ -461,17 +507,17 @@ class Controller extends EventEmitter {
       await pauseFor(15000, signal); result = await deploy();
     }
     if (result.checkpoint) task.checkpoint = cleanCheckpoint(result.checkpoint);
-    this.recordResult({ ...task.account, ...result, settings: task.settings, githubLogin: task.githubLogin, deploymentStatus: 'deployed', pendingTaskId: '' });
+    const account = this.recordResult({ ...task.account, ...result, settings: task.settings, githubLogin: task.githubLogin, deploymentStatus: 'deployed', pendingTaskId: '' });
     this.tasks.delete(task.id); this.activeTask = null; await this.saveTasks();
-    const failed = FAILED.has(result.conclusion);
+    const failed = accountFailed(account.conclusion);
     this.state.stage = failed ? 'error' : 'complete';
-    this.state.progress = { completed: result.status && PENDING.has(result.status) ? [0, 1, 2] : [0, 1, 2, 3], current: 3 };
+    this.state.progress = { completed: account.conclusion === 'unverified' || PENDING.has(account.conclusion) || failed ? [0, 1, 2] : [0, 1, 2, 3], current: 3 };
     if (failed) {
       const evidence = evidenceFor({ ...task.account, ...result });
       this.setError(operationError(evidence.outcome === 'authentication_required' ? 'LOGIN_REQUIRED' : 'RUN_FAILED', this.resultMessage({ ...task.account, ...result }), 'verifying'), null,
         { action: evidence.outcome === 'authentication_required' ? 'reloginAccount' : 'refreshRun', actionLabel: evidence.outcome === 'authentication_required' ? '更新此账号登录' : '刷新此账号结果', accountKey: task.account.accountKey });
     }
-    this.note(this.resultMessage({ ...task.account, ...result }), failed ? 'error' : 'info');
+    this.note(this.resultMessage({ ...task.account, ...result }), failed ? 'error' : account.conclusion === 'unverified' ? 'warning' : 'info');
   }
 
   async reloginAccount(payload = {}) {
@@ -507,21 +553,57 @@ class Controller extends EventEmitter {
   resultMessage(result) {
     const status = result.status || result.conclusion || '';
     const evidence = evidenceFor(result);
-    if (FAILED.has(result.conclusion)) return safeMessage(evidence.message || result.message || '部署已建立，但运行未通过，请查看具体结果。', this.secrets);
-    if (result.result?.status === 'unverified') return '部署已建立，工作流已结束，但尚未取得该账号可核实的签到结果。请刷新或查看运行记录。';
+    const conclusion = accountConclusion(result);
+    if (accountFailed(conclusion)) return safeMessage(evidence.message || result.message || '部署已建立，但运行未通过，请查看具体结果。', this.secrets);
+    if (conclusion === 'unverified') return this.unverifiedMessage(result);
     if (evidence.pointsAdded > 0) return `部署完成，首次签到已增加 ${evidence.pointsAdded} 积分。以后由 GitHub 定时运行。`;
-    if (['already', 'already_checked'].includes(evidence.outcome) || result.conclusion === 'already_checked_in') return '部署完成，已确认今天签过到。以后由 GitHub 定时运行。';
+    if (conclusion === 'already_checked_in') return '部署完成，已确认今天签过到。以后由 GitHub 定时运行。';
     if (PENDING.has(status)) return '部署配置已完成，验证任务仍在排队或运行。软件会继续刷新结果。';
-    if (result.conclusion === 'success') return '工作流运行成功。账号卡片会显示可核实的签到结果。';
+    if (conclusion === 'checkin_success') return '部署完成，已确认服务端接受该账号签到。新增积分以账号卡片中的实际结果为准。';
     return safeMessage(evidence.message || result.message || '部署已建立，但首次验证未通过；请查看账号卡片中的具体结果。', this.secrets);
   }
 
-  recordResult(result) {
+  resultReadKey(account) { return `${account.repository || ''}/${account.accountKey || ''}/${account.runId || ''}`; }
+
+  resetResultReads(account) {
+    const prefix = `${account.repository || ''}/${account.accountKey || ''}/`;
+    for (const key of this.resultReadAttempts.keys()) if (key.startsWith(prefix)) this.resultReadAttempts.delete(key);
+  }
+
+  scheduleResultRead(account) {
+    const key = this.resultReadKey(account);
+    if (!this.resultReadAttempts.has(key)) this.resultReadAttempts.set(key, { attempts: 0, nextAt: this.now() + RESULT_READ_INTERVAL });
+    return this.resultReadAttempts.get(key);
+  }
+
+  unverifiedMessage(result) {
+    const code = resultReadCode(result.result?.readError || result.resultReadError || (result.result?.requestedAccountMissing ? 'ACCOUNT_RESULT_MISSING' : 'INCOMPLETE_RESULTS'));
+    const exhausted = this.resultReadAttempts.get(this.resultReadKey(result))?.attempts >= RESULT_READ_LIMIT;
+    return RESULT_READ_MESSAGES[code] + (exhausted ? ' 已暂停自动补读，可点击“刷新结果”重新查询；无需重新登录 GLaDOS。' : ' 将自动补读原运行结果，也可点击“刷新结果”；无需重新登录 GLaDOS。');
+  }
+
+  recordResult(result, { background = false } = {}) {
     const evidence = evidenceFor(result);
-    const repeated = ['already', 'already_checked'].includes(evidence.outcome);
-    const conclusion = evidence.outcome === 'authentication_required' ? 'authentication_required' : FAILED.has(result.conclusion) ? result.conclusion : result.result?.status === 'unverified' ? 'unverified' : repeated && result.conclusion === 'success' ? 'already_checked_in' : evidence.outcome === 'checked' && result.conclusion === 'success' ? 'checkin_success' : result.conclusion || result.status || 'queued';
-    this.upsert({ ...result, status: result.status || 'completed', lastRefreshError: '', pointsAdded: Number.isFinite(evidence.pointsAdded) ? evidence.pointsAdded : null, message: safeMessage(evidence.message || result.message || '', this.secrets), conclusion });
-    this.state.currentRun = { repository: result.repository, runId: result.runId, runUrl: result.runUrl, status: result.status || 'completed', conclusion: result.conclusion || null };
+    const conclusion = accountConclusion(result);
+    const unverified = conclusion === 'unverified';
+    if (unverified) this.scheduleResultRead(result);
+    else this.resetResultReads(result);
+    const resultReadError = unverified ? resultReadCode(result.result?.readError || (result.result?.requestedAccountMissing ? 'ACCOUNT_RESULT_MISSING' : 'INCOMPLETE_RESULTS')) : '';
+    const record = { ...result, status: result.status || 'completed', lastRefreshError: '', resultReadError,
+      pointsAdded: Number.isFinite(evidence.pointsAdded) ? evidence.pointsAdded : null,
+      message: unverified ? this.unverifiedMessage({ ...result, resultReadError }) : safeMessage(evidence.message || result.message || '', this.secrets), conclusion };
+    const current = this.state.currentRun;
+    const updateOverview = !background || (!this.tasks.has(this.state.activeTaskId) && (!current || current.accountKey === record.accountKey || (!current.accountKey && current.runId === record.runId && current.repository === record.repository)));
+    if (updateOverview) {
+      this.state.currentRun = { accountKey: record.accountKey, repository: record.repository, runId: record.runId, runUrl: record.runUrl, status: record.status, conclusion, pointsAdded: record.pointsAdded, message: record.message };
+      this.state.progress = { completed: unverified || PENDING.has(conclusion) || conclusion === 'not_started' || accountFailed(conclusion) ? [0, 1, 2] : [0, 1, 2, 3], current: 3 };
+      if (background) {
+        this.state.stage = accountFailed(conclusion) ? 'error' : 'complete';
+        this.state.message = this.resultMessage({ ...result, resultReadError });
+      }
+    }
+    this.upsert(record);
+    return this.findAccount(record.accountKey);
   }
 
   findAccount(key) {
@@ -532,7 +614,11 @@ class Controller extends EventEmitter {
 
   async refreshAccount(account, signal, latest = false) {
     if (!account.repository) throw operationError('DEPLOYMENT_PENDING', '该账号尚未完成部署，请先继续未完成任务。');
-    const result = await this.github.refresh({ repository: account.repository, accountKey: account.accountKey, ...(latest ? {} : { runId: account.runId }), signal });
+    this.resetResultReads(account);
+    if (account.conclusion === 'unverified') this.scheduleResultRead(account);
+    // An unverified result belongs to a particular run. Manual refresh recovers
+    // that run instead of silently switching to a newer account execution.
+    const result = await this.github.refresh({ repository: account.repository, accountKey: account.accountKey, ...(latest && account.conclusion !== 'unverified' ? {} : { runId: account.runId }), signal });
     if (signal?.aborted || this.closing) return;
     this.recordResult({ ...account, ...result });
     return result;
@@ -545,15 +631,30 @@ class Controller extends EventEmitter {
     const backgroundAbort = new AbortController();
     this.backgroundAbort = backgroundAbort;
     const signal = backgroundAbort.signal;
-    const accounts = this.state.accounts.filter(a => PENDING.has(a.conclusion) || PENDING.has(a.status)).map(a => ({ ...a }));
+    const accounts = this.state.accounts.filter(a => PENDING.has(a.conclusion) || PENDING.has(a.status) || a.conclusion === 'unverified').map(a => ({ ...a }));
     this.backgroundTask = (async () => {
       for (const account of accounts) {
         if (signal.aborted || this.closing || this.state.busy || activity !== this.activity) return;
+        const bounded = account.conclusion === 'unverified' || Boolean(account.lastRefreshError);
+        let retry = this.resultReadAttempts.get(this.resultReadKey(account));
+        if (bounded) {
+          retry = retry || this.scheduleResultRead(account);
+          if (retry.attempts >= RESULT_READ_LIMIT || this.now() < retry.nextAt) continue;
+          retry.attempts++; retry.nextAt = this.now() + RESULT_READ_INTERVAL;
+        }
         try {
           const result = await this.github.refresh({ repository: account.repository, accountKey: account.accountKey, runId: account.runId, signal });
           if (signal.aborted || this.closing || this.state.busy || activity !== this.activity) return;
-          this.recordResult({ ...account, ...result });
-        } catch { /* A later read may recover; never re-dispatch. */ }
+          this.recordResult({ ...account, ...result }, { background: true });
+        } catch (error) {
+          if (signal.aborted || this.closing || this.state.busy || activity !== this.activity) return;
+          if (!bounded) {
+            retry = this.scheduleResultRead(account);
+            retry.attempts++; retry.nextAt = this.now() + RESULT_READ_INTERVAL;
+          }
+          const message = RESULT_READ_MESSAGES[resultReadCode(error?.code)] + (retry.attempts >= RESULT_READ_LIMIT ? ' 已暂停自动补读，可点击“刷新结果”重新查询。' : ' 稍后会自动重试，也可点击“刷新结果”。');
+          this.upsert({ ...account, lastRefreshError: message });
+        }
       }
     })().finally(() => {
       if (this.backgroundAbort === backgroundAbort) { this.backgroundAbort = null; this.backgroundTask = null; }
@@ -607,14 +708,15 @@ class Controller extends EventEmitter {
     });
     if (name === 'refreshRun') return this.exclusive(async signal => {
       const result = await this.refreshAccount(this.findAccount(payload.accountKey), signal, true);
-      const failed = FAILED.has(result?.conclusion);
+      const account = this.findAccount(payload.accountKey);
+      const failed = accountFailed(account.conclusion);
       this.state.stage = failed ? 'error' : 'complete';
       if (failed) {
         const authentication = evidenceFor({ ...this.findAccount(payload.accountKey), ...result }).outcome === 'authentication_required';
         this.setError(operationError(authentication ? 'LOGIN_REQUIRED' : 'RUN_FAILED', this.resultMessage({ ...this.findAccount(payload.accountKey), ...result }), 'verifying'), null,
           { action: authentication ? 'reloginAccount' : 'refreshRun', actionLabel: authentication ? '更新此账号登录' : '刷新此账号结果', accountKey: payload.accountKey });
       }
-      this.note(failed ? this.state.error : '已读取 GitHub 上最近一次适用的运行结果。', failed ? 'error' : 'info');
+      this.note(failed ? this.state.error : this.resultMessage({ ...account, ...result }), failed ? 'error' : account.conclusion === 'unverified' ? 'warning' : 'info');
     });
     if (name === 'pause') return this.exclusive(async signal => {
       const account = this.findAccount(payload.accountKey);

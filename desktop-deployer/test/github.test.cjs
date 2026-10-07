@@ -379,6 +379,103 @@ test('result parsing discards untrusted messages and rejects forged identifiers 
   assert.equal(parseResults(`QUICK_DEPLOY_RESULT=${JSON.stringify({ accountKey: key, outcome: 'pretend_success' })}`).length, 0);
 });
 
+test('result parsing strips console formatting and still accepts only complete safe JSON records', () => {
+  const key = credential().accountKey;
+  const payload = JSON.stringify({ accountKey: key, outcome: 'already_checked', pointsAdded: 0, message: 'PRIVATE_SERVER_TEXT' });
+  const parsed = parseResults(`\u001b[36m2026-10-07T12:59:34Z\u001b[0m QUICK_DEPLOY_RESULT=\u001b[32m${payload}\u001b[0m\n`);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].outcome, 'already_checked');
+  assert.equal(parsed[0].pointsAdded, 0);
+  assert.equal(JSON.stringify(parsed).includes('PRIVATE_SERVER_TEXT'), false);
+  assert.equal(JSON.stringify(parsed).includes('\u001b'), false);
+  assert.equal(parseResults(`\u001b[31mQUICK_DEPLOY_RESULT={"accountKey":"${key}","outcome":"checked"\u001b[0m`).length, 0);
+});
+
+test('completed account results survive the real gh raw-log escape guard through the child-process boundary', async () => {
+  const key = credential().accountKey;
+  const events = [];
+  const fake = fakeSpawn((child, call) => {
+    const endpoint = call.args.find(arg => arg.startsWith('repos/'));
+    assert.equal(call.args[0], 'api');
+    assert.equal(call.args[call.args.indexOf('--method') + 1], 'GET');
+    assert.deepEqual(call.options.stdio, ['pipe', 'pipe', 'pipe']);
+    assert.equal(call.options.shell, false);
+    if (endpoint === 'repos/tester/glados-quick-deploy/actions/runs/1000') {
+      child.stdout.emit('data', Buffer.from(http({ id: 1000, path: WORKFLOW_PATH, status: 'completed', conclusion: 'success', run_attempt: 1 })));
+    } else if (endpoint === 'repos/tester/glados-quick-deploy/actions/runs/1000/jobs?per_page=100&page=1') {
+      child.stdout.emit('data', Buffer.from(http({ total_count: 2, jobs: [{ id: 100, name: 'prepare', status: 'completed' }, { id: 101, name: `Account ${key}`, status: 'completed' }] })));
+    } else if (endpoint === 'repos/tester/glados-quick-deploy/actions/jobs/101/logs') {
+      child.stdout.emit('data', Buffer.from('HTTP/2 200 OK\r\nContent-Type: text/plain\r\n\r\n'));
+      if (!call.args.includes('--allow-escape-sequences')) {
+        // gh 2.102 stops copying at terminal escape sequences and exits nonzero,
+        // before the structured record near the end of a real Actions job log.
+        child.stdout.emit('data', Buffer.from('Set up job\n'));
+        child.stderr.emit('data', Buffer.from('the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway\n'));
+        child.emit('close', 1);
+        return;
+      }
+      child.stdout.emit('data', Buffer.from('\u001b[36;1mRun Python\u001b[0m\nPRIVATE_RAW_LOG\n'));
+      child.stdout.emit('data', Buffer.from(`2026-10-07T12:59:34.1515834Z QUICK_DEPLOY_RESULT=\u001b[32m${JSON.stringify({ accountKey: key, outcome: 'checked', exchange: 'not_needed', pointsAdded: 0, message: 'PRIVATE_SERVER_TEXT', cookie: 'PRIVATE_COOKIE' })}\u001b[0m\n`));
+    } else assert.fail(`Unexpected endpoint: ${endpoint}`);
+    child.emit('close', 0);
+  });
+  const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl, onEvent: event => events.push(event) });
+  const result = await client._readRun('tester/glados-quick-deploy', 1000);
+  assert.equal(result.conclusion, 'success');
+  assert.equal(result.result.status, 'checked');
+  assert.equal(result.result.accounts[0].pointsAdded, 0);
+  assert.equal(result.result.readError, undefined);
+  assert.equal(result.result.accounts[0].message, '服务端已接受签到；本次未核实新增积分。');
+  assert.equal(JSON.stringify({ result, events }).includes('PRIVATE_'), false);
+  assert.equal(fake.calls.filter(call => call.args.includes('--allow-escape-sequences')).length, 1);
+  assert.equal(client._completedResults.size, 1);
+});
+
+test('raw escape output is enabled only for GET requests to exact job-log endpoints', async () => {
+  const fake = fakeSpawn(child => {
+    child.stdout.emit('data', Buffer.from(http({ ok: true })));
+    child.emit('close', 0);
+  });
+  const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl });
+  const scenarios = [
+    ['user', {}, false],
+    ['user', { raw: true }, false],
+    ['repos/tester/project/actions/jobs/123/logs', {}, false],
+    ['repos/tester/project/actions/jobs/123/logs', { raw: true }, true],
+    ['repos/tester/project/actions/jobs/123/logs', { raw: true, method: 'POST' }, false],
+    ['repos/tester/project/actions/runs/123/logs', { raw: true }, false],
+    ['repos/tester/project/actions/jobs/123/logs?extra=true', { raw: true }, false],
+  ];
+  for (const [endpoint, options, expected] of scenarios) {
+    await client._api(endpoint, options);
+    assert.equal(fake.calls.at(-1).args.includes('--allow-escape-sequences'), expected, endpoint);
+  }
+});
+
+test('an account job cannot supply a missing result for another account job', async () => {
+  const first = credential().accountKey;
+  const second = credential('second@example.test').accountKey;
+  const fake = fakeSpawn((child, call) => {
+    const endpoint = call.args.find(arg => arg.startsWith('repos/'));
+    if (endpoint.endsWith('/jobs?per_page=100&page=1')) {
+      child.stdout.emit('data', Buffer.from(http({ total_count: 2, jobs: [{ id: 101, name: `Account ${first}`, status: 'completed' }, { id: 102, name: `Account ${second}`, status: 'completed' }] })));
+    } else if (endpoint.endsWith('/jobs/101/logs')) {
+      child.stdout.emit('data', Buffer.from(`HTTP/2 200 OK\r\nContent-Type: text/plain\r\n\r\nQUICK_DEPLOY_RESULT=${JSON.stringify({ accountKey: first, outcome: 'checked' })}\nQUICK_DEPLOY_RESULT=${JSON.stringify({ accountKey: second, outcome: 'checked' })}\n`));
+    } else if (endpoint.endsWith('/jobs/102/logs')) {
+      child.stdout.emit('data', Buffer.from('HTTP/2 200 OK\r\nContent-Type: text/plain\r\n\r\nNo account result was produced.\n'));
+    } else if (endpoint.endsWith('/actions/runs/1000')) {
+      child.stdout.emit('data', Buffer.from(http({ id: 1000, path: WORKFLOW_PATH, status: 'completed', conclusion: 'success' })));
+    } else assert.fail(`Unexpected endpoint: ${endpoint}`);
+    child.emit('close', 0);
+  });
+  const client = new GitHubClient({ ghPath: '/bundled/gh', spawnImpl: fake.spawnImpl });
+  const result = await client._readRun('tester/glados-quick-deploy', 1000);
+  assert.equal(result.result.status, 'unverified');
+  assert.equal(result.result.readError, 'INCOMPLETE_RESULTS');
+  assert.deepEqual(result.result.accounts.map(account => account.accountKey), [first]);
+  assert.equal(client._completedResults.size, 0);
+});
+
 const FAKE_UPSTREAM = `import json, os
 DOMAINS = ['https://untrusted.invalid']
 def log(*args): print(*args)

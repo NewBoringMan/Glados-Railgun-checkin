@@ -2,6 +2,7 @@
 
 const { spawn } = require('node:child_process');
 const { createHash, randomBytes } = require('node:crypto');
+const { stripVTControlCharacters } = require('node:util');
 const {
   APP_ID, UPSTREAM_REPOSITORY, UPSTREAM_SHA, WORKFLOW_FILE, WORKFLOW_PATH,
   KEEPALIVE_FILE, KEEPALIVE_PATH, MANIFEST_PATH, MARKER_PATH, ACCOUNT_KEY_RE,
@@ -179,7 +180,8 @@ function safeResult(payload) {
 
 function parseResults(logText) {
   const results = new Map();
-  for (const match of String(logText).matchAll(/QUICK_DEPLOY_RESULT=(\{[^\r\n]*\})/g)) {
+  const plainText = stripVTControlCharacters(String(logText));
+  for (const match of plainText.matchAll(/QUICK_DEPLOY_RESULT=(\{[^\r\n]*\})/g)) {
     try {
       const result = safeResult(JSON.parse(match[1]));
       if (result) results.set(result.accountKey, result);
@@ -282,6 +284,10 @@ class GitHubClient {
   async _api(endpoint, { method = 'GET', body, signal, stage = 'github', raw = false, metadata = false } = {}) {
     if (typeof endpoint !== 'string' || !/^(?:user(?:\/repos)?|repos\/[A-Za-z0-9_.%\/-]+(?:\?.*)?)$/.test(endpoint)) throw new GitHubError('INVALID_ENDPOINT', 'GitHub 请求地址无效。', stage);
     const args = ['api', '--hostname', 'github.com', '--include', '-H', 'Accept: application/vnd.github+json', '-H', `X-GitHub-Api-Version: ${API_VERSION}`, '--method', method, endpoint];
+    // gh 2.102 guards non-JSON output even when stdout is a pipe. Actions logs
+    // contain ANSI formatting; allow it only here, then parse sanitized records.
+    // _runGh always captures this output in pipes and never displays raw logs.
+    if (raw && method === 'GET' && /^repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/jobs\/[1-9]\d*\/logs$/.test(endpoint)) args.push('--allow-escape-sequences');
     let input;
     if (body !== undefined) { args.push('--input', '-'); input = Buffer.from(JSON.stringify(body), 'utf8'); }
     const output = await this._runGh(args, { input, signal, stage });
@@ -588,7 +594,7 @@ class GitHubClient {
         const batch = await Promise.all(allJobs.slice(offset, offset + 3).map(async job => {
           if (!Number.isSafeInteger(job.id) || job.id <= 0 || job.status !== 'completed') return [];
           const text = await this._api(`repos/${repository}/actions/jobs/${job.id}/logs`, { signal, stage: 'results', raw: true });
-          return parseResults(text);
+          return parseResults(text).filter(record => record.accountKey === job.name.slice('Account '.length));
         }));
         records.push(...batch.flat());
       }

@@ -15,8 +15,8 @@ function fixture(overrides = {}) {
   const github = {
     whoami: async () => ({ login: 'example' }),
     login: async () => { calls.push('login'); return { login: 'example' }; },
-    deploy: async args => { calls.push(['deploy', args.credential]); return { repository: 'example/glados-quick-deploy', accountKey, runId: 42, runUrl: 'https://github.com/example/glados-quick-deploy/actions/runs/42', conclusion: 'success', result: { pointsAdded: 12 } }; },
-    refresh: async () => ({ repository: 'example/glados-quick-deploy', runId: 42, conclusion: 'success', result: { outcome: 'already' } }),
+    deploy: async args => { calls.push(['deploy', args.credential]); return { repository: 'example/glados-quick-deploy', accountKey, runId: 42, runUrl: 'https://github.com/example/glados-quick-deploy/actions/runs/42', status: 'completed', conclusion: 'success', result: { status: 'points_increased', accounts: [{ accountKey, outcome: 'checked', pointsAdded: 12 }] } }; },
+    refresh: async () => ({ repository: 'example/glados-quick-deploy', runId: 42, status: 'completed', conclusion: 'success', result: { status: 'already_checked', accounts: [{ accountKey, outcome: 'already_checked' }] } }),
     pause: async () => {}, ...overrides.github,
   };
   const controller = new Controller({ github, discoverBrowsers: async () => [{ id: 'embedded', available: true }], captureLogin: async () => ({ ...credential }), save: state => { saved = JSON.parse(JSON.stringify(state)); }, openExternal: async () => {}, ...overrides, github });
@@ -125,7 +125,7 @@ test('a delayed background read is cancelled and cannot overwrite a new foregrou
   const foreground = f.controller.action('startDeploy', { browserId: 'embedded' });
   release(); await background; await foreground;
   assert.equal(f.controller.state.currentRun.runId, 42);
-  assert.equal(f.controller.state.accounts[0].conclusion, 'success');
+  assert.equal(f.controller.state.accounts[0].conclusion, 'checkin_success');
 });
 test('an old running task does not mark a newly logged-in account as deployed', () => {
   const f = fixture(); f.controller.pendingAccount = { accountKey, email: 'person@example.com' };
@@ -142,4 +142,97 @@ test('shutdown waits for asynchronous login cleanup after cancellation', async (
   await new Promise(resolve => setImmediate(resolve));
   await f.controller.shutdown(); await action;
   assert.equal(cleaned, true); assert.equal(f.controller.secrets.length, 0);
+});
+
+function unverifiedRun(readError = 'INCOMPLETE_RESULTS') {
+  return { accountKey, repository: 'example/glados-quick-deploy', runId: 42,
+    runUrl: 'https://github.com/example/glados-quick-deploy/actions/runs/42', status: 'completed', conclusion: 'success',
+    result: { status: 'unverified', readError, accounts: [] } };
+}
+
+test('missing result keeps deployment usable and one read of the original run completes every status with zero points', async () => {
+  let now = 0; let captures = 0; let deploys = 0;
+  const reads = [];
+  const f = fixture({ now: () => now, captureLogin: async () => { captures++; return { ...credential }; }, github: {
+    deploy: async () => { deploys++; return unverifiedRun(); },
+    refresh: async args => {
+      reads.push(args);
+      return { ...unverifiedRun(), result: { status: 'checked', accounts: [{ accountKey, outcome: 'checked', pointsAdded: 0, exchange: 'not_needed' }] } };
+    },
+  } });
+  await f.controller.initialize();
+  const pending = await f.controller.action('startDeploy', { browserId: 'embedded' });
+  assert.equal(pending.resumeTasks.length, 0);
+  assert.equal(pending.accounts[0].deploymentStatus, 'deployed');
+  assert.equal(pending.accounts[0].conclusion, 'unverified');
+  assert.equal(pending.accounts[0].resultReadError, 'INCOMPLETE_RESULTS');
+  assert.match(pending.accounts[0].message, /暂未读到该账号完整/);
+  assert.equal(pending.currentRun.conclusion, 'unverified');
+  assert.deepEqual(pending.progress.completed, [0, 1, 2]);
+  await f.controller.refreshPending(); assert.equal(reads.length, 0);
+  now += 30000; await f.controller.refreshPending();
+  const completed = f.controller.snapshot();
+  assert.equal(reads.length, 1); assert.equal(reads[0].runId, 42); assert.equal(reads[0].accountKey, accountKey);
+  assert.equal(captures, 1); assert.equal(deploys, 1);
+  assert.equal(completed.accounts[0].conclusion, 'checkin_success');
+  assert.equal(completed.accounts[0].pointsAdded, 0);
+  assert.equal(completed.accounts[0].resultReadError, ''); assert.equal(completed.accounts[0].lastRefreshError, '');
+  assert.equal(completed.currentRun.conclusion, 'checkin_success'); assert.equal(completed.currentRun.accountKey, accountKey);
+  assert.deepEqual(completed.progress.completed, [0, 1, 2, 3]);
+  assert.equal(completed.stage, 'complete'); assert.doesNotMatch(completed.message, /待核实|暂未读到/);
+});
+
+test('unverified background reads stop after five attempts and manual refresh starts a new bounded round', async () => {
+  let now = 0;
+  const reads = [];
+  const f = fixture({ now: () => now, github: { refresh: async args => { reads.push(args); return unverifiedRun(); } } });
+  f.controller.recordResult({ ...unverifiedRun(), deploymentStatus: 'deployed' });
+  for (let i = 0; i < 8; i++) { now += 30000; await f.controller.refreshPending(); }
+  assert.equal(reads.length, 5);
+  assert.match(f.controller.state.accounts[0].message, /已暂停自动补读/);
+  assert.equal(f.controller.state.currentRun.conclusion, 'unverified');
+  assert.deepEqual(f.controller.state.progress.completed, [0, 1, 2]);
+  await f.controller.action('refreshRun', { accountKey });
+  assert.equal(reads.length, 6); assert.equal(reads[5].runId, 42);
+  assert.doesNotMatch(f.controller.state.accounts[0].message, /已暂停自动补读/);
+  now += 30000; await f.controller.refreshPending();
+  assert.equal(reads.length, 7); assert.ok(reads.every(args => args.runId === 42));
+});
+
+test('background network failures are bounded and expose only controlled result-read messages', async () => {
+  let now = 0; let reads = 0;
+  const f = fixture({ now: () => now, github: { refresh: async () => {
+    reads++; throw Object.assign(new Error('PRIVATE_RAW_LOG_SHOULD_NOT_APPEAR'), { code: 'NETWORK_ERROR' });
+  } } });
+  f.controller.recordResult({ ...unverifiedRun(), deploymentStatus: 'deployed' });
+  for (let i = 0; i < 8; i++) { now += 30000; await f.controller.refreshPending(); }
+  assert.equal(reads, 5);
+  assert.match(f.controller.state.accounts[0].lastRefreshError, /无法连接 GitHub/);
+  assert.match(f.controller.state.accounts[0].lastRefreshError, /已暂停自动补读/);
+  assert.doesNotMatch(JSON.stringify(f.controller.snapshot()), /PRIVATE_RAW_LOG/);
+});
+
+test('another account failure or incomplete log cannot replace this account accepted result', async () => {
+  const otherKey = '0000000000000000';
+  const result = { ...unverifiedRun(), conclusion: 'failure', result: { status: 'unverified', readError: 'INCOMPLETE_RESULTS', accounts: [
+    { accountKey, outcome: 'checked', pointsAdded: 0, exchange: 'not_needed' },
+    { accountKey: otherKey, outcome: 'failed', errorKind: 'execution' },
+  ] } };
+  const f = fixture({ github: { refresh: async () => result } });
+  f.controller.upsert({ accountKey: otherKey, repository: result.repository, runId: 42, conclusion: 'failure', status: 'completed', message: 'Other account error' });
+  f.controller.upsert({ accountKey, repository: result.repository, runId: 42, conclusion: 'unverified', status: 'completed' });
+  const state = await f.controller.action('refreshRun', { accountKey });
+  const accepted = state.accounts.find(account => account.accountKey === accountKey);
+  assert.equal(accepted.conclusion, 'checkin_success'); assert.equal(accepted.resultReadError, '');
+  assert.equal(state.accounts.find(account => account.accountKey === otherKey).message, 'Other account error');
+  assert.equal(state.currentRun.conclusion, 'checkin_success'); assert.deepEqual(state.progress.completed, [0, 1, 2, 3]);
+  assert.equal(state.stage, 'complete'); assert.equal(state.error, '');
+});
+
+test('unknown remote read-error details are replaced before entering persisted account state', () => {
+  const f = fixture();
+  f.controller.recordResult(unverifiedRun('PRIVATE_RAW_REMOTE_ERROR'));
+  assert.equal(f.saved().accounts[0].resultReadError, 'RESULTS_UNAVAILABLE');
+  assert.match(f.saved().accounts[0].message, /签到结果暂时无法读取/);
+  assert.doesNotMatch(JSON.stringify(f.saved()), /PRIVATE_RAW_REMOTE_ERROR/);
 });

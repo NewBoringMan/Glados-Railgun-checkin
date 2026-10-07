@@ -161,11 +161,12 @@
       : configurations.idle);
     if (stage === 'complete' && state.currentRun) {
       const runResult = resultInfo(state.currentRun);
+      if (state.currentRun.conclusion === 'unverified') result = { title: '账号结果待核实', badge: '待核实', icon: 'clock', kind: 'idle', message: state.currentRun.message || '部署配置已完成，正在补读原运行的账号结果，无需重新登录。' };
       if (runResult.kind === 'pending') result = { title: '部署完成，等待验证', badge: '等待验证', icon: 'clock', kind: 'working', message: '任务已配置，本次运行仍在排队或执行。可在账号卡片刷新结果。' };
       if (runResult.kind === 'error') result = { title: '当前运行未通过', badge: '需要处理', icon: 'alert', kind: 'error', message: '请查看对应账号的结果，处理具体问题后继续。' };
     }
     if (stage === 'idle' && isBusy()) result = configurations.initializing;
-    const completed = new Set(state.progress.completed.filter((step) => Number.isInteger(step) && step >= 0 && step <= 3));
+    const completed = new Set(state.progress.completed.filter((step) => Number.isInteger(step) && step >= 0 && step <= 3 && !(step === 3 && state.currentRun?.conclusion === 'unverified')));
     const current = Number.isInteger(state.progress.current) && state.progress.current >= 0 && state.progress.current <= 3 ? state.progress.current : null;
     return { ...result, step: current, completed, done: completed.size };
   }
@@ -389,7 +390,7 @@
       const indicator = item.querySelector('.step-indicator');
       if (done) { indicator.replaceChildren(makeIcon('check')); }
       else { text(indicator, index + 1); }
-      const status = failed ? '需处理' : done ? '已完成' : current ? stage === 'cancelling' ? '取消中' : waiting ? '待继续' : '进行中' : '';
+      const status = failed ? '需处理' : done ? '已完成' : current ? state.currentRun?.conclusion === 'unverified' ? '待核实' : stage === 'cancelling' ? '取消中' : waiting ? '待继续' : '进行中' : '';
       text(item.querySelector('.step-state'), status);
       item.setAttribute('aria-label', item.querySelector('strong').textContent + '：' + (status || '未开始'));
       if (current) item.setAttribute('aria-current', 'step');
@@ -420,7 +421,7 @@
     if (status === 'in_progress' || conclusion === 'in_progress' || conclusion === 'running') return { kind: 'pending', label: '正在验证', detail: '等待本次运行返回结果' };
     if (['queued', 'pending', 'requested', 'waiting'].includes(status) || ['queued', 'pending', 'requested', 'waiting'].includes(conclusion)) return { kind: 'pending', label: '验证排队', detail: '本次验证尚未完成，请等待实际运行结果' };
     if (status === 'not_started' || conclusion === 'not_started') return { kind: 'neutral', label: '尚未验证', detail: '当前还没有可核验的运行记录' };
-    if (conclusion === 'unverified') return { kind: 'neutral', label: '结果待核实' + creditSuffix, detail: '尚未取得完整签到结果，请刷新或查看运行记录' };
+    if (conclusion === 'unverified') return { kind: 'neutral', label: '结果待核实' + creditSuffix, detail: account.message || '正在补读原运行的账号结果，可刷新查询；无需重新登录' };
     if (added) return { kind: 'success', label: '已加分 +' + points, detail: '本次签到已取得积分' };
     if (['already_checked_in', 'already-checked-in', 'checkin_already_done', 'already_checked', 'already'].includes(conclusion)) return { kind: 'success', label: '今日已签到', detail: '本次验证确认今日已签到' };
     if (['checked', 'checked_in', 'checkin_success', 'points_added', 'accepted'].includes(conclusion)) return { kind: 'success', label: '签到成功', detail: '已确认签到结果' };

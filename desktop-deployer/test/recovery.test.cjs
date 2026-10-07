@@ -104,6 +104,7 @@ function harness(env, overrides = {}) {
   const resumeStore = overrides.resumeStore || new ResumeStore({ directory: env.directory, safeStorage: env.safeStorage });
   const controller = new Controller({
     github, resumeStore, restored: overrides.restored ?? loadState(env.directory),
+    now: overrides.now,
     discoverBrowsers: async () => [{ id: 'embedded', available: true }],
     captureLogin: async args => {
       calls.captures.push({ browserId: args.browserId }); calls.order.push('capture');
@@ -293,6 +294,41 @@ test('refreshAll records one account failure without preventing another account 
   assert.equal(alpha.runId, 911); assert.match(alpha.lastRefreshError, /NETWORK_ERROR/);
   assert.equal(bravo.runId, 992); assert.equal(bravo.conclusion, 'checkin_success');
   assert.equal(bravo.lastRefreshError, ''); assert.equal(result.busy, false);
+});
+
+test('restart restores an unverified deployed account and reopens bounded reads without login or redeployment', async t => {
+  const env = await environment(t);
+  let now = 0; let reads = 0;
+  const unresolved = { ...run(), accountKey: ALPHA.accountKey, email: ALPHA.email, deploymentStatus: 'deployed',
+    result: { status: 'unverified', readError: 'NETWORK_ERROR', accounts: [] } };
+  const initial = harness(env, { now: () => now, github: { refresh: async () => { reads++; return unresolved; } } });
+  await initial.controller.initialize();
+  initial.controller.recordResult(unresolved);
+  for (let i = 0; i < 7; i++) { now += 30000; await initial.controller.refreshPending(); }
+  assert.equal(reads, 5);
+  const stored = loadState(env.directory);
+  assert.equal(stored.pendingDeployments.length, 0);
+  assert.equal(stored.accounts[0].conclusion, 'unverified');
+  assert.equal(stored.accounts[0].resultReadError, 'NETWORK_ERROR');
+  assert.match(stored.accounts[0].message, /已暂停自动补读/);
+  await initial.controller.shutdown();
+
+  const requested = [];
+  const restarted = harness(env, { now: () => now, github: { refresh: async args => {
+    requested.push({ repository: args.repository, accountKey: args.accountKey, runId: args.runId });
+    return { ...run(args.repository, args.runId), result: { status: 'checked', accounts: [{ accountKey: args.accountKey, outcome: 'checked', pointsAdded: 0, exchange: 'not_needed' }] } };
+  } } });
+  await restarted.controller.initialize();
+  await restarted.controller.refreshPending(); assert.equal(requested.length, 0);
+  now += 30000; await restarted.controller.refreshPending();
+  assert.deepEqual(requested, [{ repository: unresolved.repository, accountKey: ALPHA.accountKey, runId: unresolved.runId }]);
+  const state = restarted.controller.snapshot();
+  assert.equal(state.resumeTasks.length, 0); assert.equal(state.accounts[0].conclusion, 'checkin_success');
+  assert.equal(state.accounts[0].resultReadError, ''); assert.equal(state.accounts[0].lastRefreshError, '');
+  assert.equal(state.currentRun.conclusion, 'checkin_success'); assert.equal(state.currentRun.pointsAdded, 0);
+  assert.deepEqual(state.progress.completed, [0, 1, 2, 3]);
+  assert.equal(restarted.calls.captures.length, 0); assert.equal(restarted.calls.deploys.length, 0); assert.equal(restarted.calls.logins.length, 0);
+  assertNoSecrets(loadState(env.directory));
 });
 
 test('reloginAccount refuses a different GLaDOS identity before any credential upload', async t => {
