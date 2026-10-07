@@ -84,7 +84,9 @@ static void path_fixtures(void) {
     snprintf(link, sizeof(link), "%s/BrowserProfiles/edge", temporary);
     assert(glados_browser_safe_profile(link, NULL, resolved_root, resolved_profile));
     strcpy(canonical_root, resolved_root);
-    assert(glados_browser_safe_profile(edge, canonical_root, resolved_root, resolved_profile));
+    /* This branch deliberately omits the BrowserProfiles anchor and therefore
+     * must use the canonical path, including macOS /tmp -> /private/tmp. */
+    assert(glados_browser_safe_profile(resolved_profile, canonical_root, resolved_root, resolved_profile));
     assert(unlink(root) == 0); assert(rmdir(edge) == 0); assert(rmdir(alias) == 0); assert(rmdir(temporary) == 0);
 }
 
