@@ -10,8 +10,8 @@
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>GLaDOS Account Center</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.0.13</string>
-    <key>CFBundleVersion</key><string>20045</string>
+    <key>CFBundleShortVersionString</key><string>2.0.14</string>
+    <key>CFBundleVersion</key><string>20046</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSAppleEventsUsageDescription</key><string>用于在你主动新增或更新 GLaDOS 账号时选择和激活浏览器中的 GLaDOS 页面。</string>

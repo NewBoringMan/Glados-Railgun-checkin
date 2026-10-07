@@ -428,14 +428,17 @@ final class CaptureService: @unchecked Sendable {
         // Display only our own fixed messages for a strict helper-code whitelist;
         // raw browser/HTTP stderr can contain credentials and is never shown.
         switch captureErrorCode(text) {
-        case "browser_connection": return "无法连接到该账号的浏览器读取窗口。请自行退出该账号的专属浏览器实例，再重新读取登录信息。"
+        case "browser_connection": return "未能建立或核实该账号专属浏览器窗口的读取连接。请保留当前窗口并返回 Account Center 重试；此次未保存或同步账号资料。"
+        case "dialog_failed": return "macOS 读取确认或页面选择对话框未能正常完成。此次未保存或同步账号资料，请回到 Account Center 后重试。"
+        case "page_read_failed": return "浏览器已连接，但未能完整读取当前 GLaDOS 页面信息。请保留当前窗口并等待页面加载完成后重试；此次未保存或同步账号资料。"
+        case "verification_failed": return "只读账号身份核验未完成。请保留当前浏览器登录状态，稍后重试；此次未保存或同步账号资料。"
         case "identity_mismatch": return "当前浏览器账号与待更新账号不一致。请切换到该账号正常登录后重新读取。"
         case "cookie_scope_mismatch": return "各接口所需登录 Cookie 不一致，当前保存格式无法安全复用，未保存；请保留原网页登录。"
         case "cookie_scope_unavailable": return "当前 Firefox 或 geckodriver 不支持所需的只读 Cookie 接口，或无法核实浏览器上下文。请升级后重试，或手动使用 Edge / Safari。"
         case "missing_identity": return "网站未返回可核验的账号标识和邮箱，此次读取暂时无法保存。已记录的账号资料保留。"
-        case "verification_required": return "网站要求完成登录验证。请在所选浏览器中正常完成验证，再手动重新读取。"
+        case "verification_required": return "未能确认此次读取的登录授权。请在原浏览器检查该账号状态；此次未保存或同步账号资料。"
         case "safari_extension_unavailable": return "Safari 登录读取扩展尚不可用。请在 Safari 设置中启用配套扩展，并允许访问对应的 GLaDOS 页面。"
-        default: return "手动读取未完成。请确认已正常登录所选账号，并完成网站要求的验证。"
+        default: return "账号读取组件未完成此次操作。已有账号资料保留，请返回 Account Center 后重试。"
         }
     }
 }

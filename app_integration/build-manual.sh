@@ -321,7 +321,8 @@ xcrun swiftc -swift-version 5 -O -parse-as-library \
   -framework SwiftUI -framework AppKit -framework Security -framework CryptoKit \
   -lsqlite3 -o "$MACOS/GLaDOSAccountCenter.real" \
   "$PROJECT_DIR/macos/Sources/"*.swift
-xcrun clang -arch "$GLADOS_ARCH" -o "$MACOS/GLaDOSAccountCenter" "$SCRIPT_DIR/launcher.c"
+xcrun clang -arch "$GLADOS_ARCH" -o "$MACOS/GLaDOSAccountCenter" \
+  "$SCRIPT_DIR/launcher.c" "$SCRIPT_DIR/browser_process_info.c" -lproc
 xcrun swiftc -swift-version 5 -O -parse-as-library -emit-library \
   -module-name GLaDOSPolicyEditor -target "$GLADOS_ARCH-apple-macos13.0" \
   -framework SwiftUI -framework AppKit \

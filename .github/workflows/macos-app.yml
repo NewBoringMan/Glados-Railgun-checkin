@@ -34,9 +34,9 @@ jobs:
       - name: Compile the single App and embedded Safari extension
         run: bash app_integration/build-manual.sh "$RUNNER_TEMP/GLaDOS Account Center.app"
       - name: Package compiled candidate
-        run: ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/GLaDOS Account Center.app" "$RUNNER_TEMP/GLaDOS-Account-Center-2.0.13.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/GLaDOS Account Center.app" "$RUNNER_TEMP/GLaDOS-Account-Center-2.0.14.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: GLaDOS-Account-Center-2.0.13
-          path: ${{ runner.temp }}/GLaDOS-Account-Center-2.0.13.zip
+          name: GLaDOS-Account-Center-2.0.14
+          path: ${{ runner.temp }}/GLaDOS-Account-Center-2.0.14.zip
           retention-days: 14
